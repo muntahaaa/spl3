@@ -1,16 +1,35 @@
 """
 api_routes.py  –  FastAPI routes
 =================================
-Exposes a minimal REST API so the user can inject manually-obtained
-parsed-result data into the live session.
 
-Mount this router in main.py:
-    app.include_router(router, prefix="/api")
+BUG-3 FIX
+──────────
+The /api/insert_parsed_result endpoint now accepts an optional
+`parsed_content_json_url` field alongside the existing path fields.
+
+Two usage patterns are supported:
+
+Pattern A – local files (same as before)
+    POST /api/insert_parsed_result
+    {
+        "labeled_image_path": "./log/..../labeled_step_1.png",
+        "parsed_content_json_path": "/tmp/human_explorer_cloud/ss1.json",
+        "parsed_content_json_url": "https://res.cloudinary.com/.../ss1.json"
+    }
+
+Pattern B – both are local paths (original behaviour, url defaults to path)
+    POST /api/insert_parsed_result
+    {
+        "labeled_image_path": "...",
+        "parsed_content_json_path": "..."
+    }
+    → parsed_content_json_url defaults to parsed_content_json_path
 """
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from pathlib import Path
+from typing import Optional
 
 from data.data_storage import json2db
 from state_manager import session
@@ -25,58 +44,48 @@ router = APIRouter()
 class ParsedResultIn(BaseModel):
     """
     Body for POST /api/insert_parsed_result
-    ----------------------------------------
-    After you run your own parsing tool on a screenshot, call this endpoint
-    with the two file paths it produced.
 
     Fields
-    ------
+    ──────
     labeled_image_path
-        Absolute or relative path to the annotated/labeled PNG produced by
-        your parsing tool.
-        Example: "./log/screenshots/human_exploration/processed/
-                   labeled_human_exploration_step_1_20240101_120000.png"
+        Local path to the annotated/labeled PNG produced by your parsing tool
+        (or downloaded from the cloud).
 
     parsed_content_json_path
-        Absolute or relative path to the elements JSON file produced by
-        your parsing tool.
-        Example: "./log/screenshots/human_exploration/processed/
-                   human_exploration_step_1_20240101_120000.json"
+        Local path to the elements JSON file produced by your parsing tool
+        (or downloaded from the cloud).
 
-    The JSON file must be an array of element objects:
+    parsed_content_json_url   [optional]
+        The original cloud URL of the elements JSON (e.g. Cloudinary URL).
+        If omitted it defaults to `parsed_content_json_path`.
+        This URL is stored as `source_json` in history_steps so that the
+        state JSON is portable across machines.
 
-        [
-          {
-            "ID":      1,
-            "bbox":    [x1_rel, y1_rel, x2_rel, y2_rel],   // 0-1 relative coords
-            "type":    "button",
-            "content": "Login"
-          },
-          ...
-        ]
-
-    bbox values are relative to the screen size (0.0 – 1.0 range).
+    JSON format expected in the elements file:
+        [{"ID": 1, "bbox": [x1, y1, x2, y2], "type": "button", "content": "..."}]
     """
-    labeled_image_path:       str = Field(..., description="Path to labeled/annotated image")
-    parsed_content_json_path: str = Field(..., description="Path to elements JSON file")
+    labeled_image_path:       str            = Field(..., description="Local path to labeled image")
+    parsed_content_json_path: str            = Field(..., description="Local path to elements JSON")
+    parsed_content_json_url:  Optional[str]  = Field(None,  description="Cloud URL of elements JSON (for portability)")
 
 
 class ParsedResultOut(BaseModel):
-    status:         str
-    step:           int
-    screenshot:     str | None
-    previous_json:  str | None
-    new_json:       str
-    labeled_image:  str
+    status:          str
+    step:            int
+    screenshot:      Optional[str]
+    previous_json:   Optional[str]
+    new_json:        str
+    new_json_url:    str
+    labeled_image:   str
 
 
 class SessionStatusOut(BaseModel):
     has_session:         bool
-    step:                int | None
-    device:              str | None
-    task:                str | None
+    step:                Optional[int]
+    device:              Optional[str]
+    task:                Optional[str]
     parsed_result_ready: bool
-    pending_screenshot:  str | None
+    pending_screenshot:  Optional[str]
     history_count:       int
 
 
@@ -85,8 +94,8 @@ class StoreToDbIn(BaseModel):
 
 
 class StoreToDbOut(BaseModel):
-    status: str
-    task_id: str
+    status:    str
+    task_id:   str
     json_path: str
 
 
@@ -101,10 +110,6 @@ class StoreToDbOut(BaseModel):
     tags=["Session"],
 )
 def get_session_status():
-    """
-    Returns whether a session is active, which step it is on, and whether
-    the current screenshot still needs a parsed result.
-    """
     state = session.get_state()
     if state is None:
         return SessionStatusOut(
@@ -133,49 +138,22 @@ def get_session_status():
 )
 def insert_parsed_result(body: ParsedResultIn):
     """
-    ## When to call this
+    Register the parsed output (labeled image + elements JSON) for the most
+    recent screenshot.
 
-    After each screenshot is taken the session waits for you to run your own
-    parsing tool.  Once you have the output files (labeled image + elements
-    JSON), POST their paths here.
-
-    ## Parsed JSON format
-
-    Your `parsed_content_json_path` file must contain a JSON array:
-
-    ```json
-    [
-      {
-        "ID":      1,
-        "bbox":    [0.05, 0.10, 0.90, 0.18],
-        "type":    "text",
-        "content": "Welcome Screen"
-      },
-      {
-        "ID":      2,
-        "bbox":    [0.15, 0.45, 0.85, 0.55],
-        "type":    "button",
-        "content": "Sign In"
-      }
-    ]
-    ```
-
-    ### bbox format
-    `[x1, y1, x2, y2]` as **relative** coordinates (0.0 – 1.0).
-    `x1`/`y1` = top-left corner, `x2`/`y2` = bottom-right corner.
-
-    ### Supported element types (examples)
-    `button`, `text`, `input`, `image`, `icon`, `checkbox`, `list_item`
-
-    ## What happens after this call
-    * `state["current_page_json"]` is updated.
-    * The labeled image is added to the gallery.
-    * You can now perform actions that require element coordinates.
+    After this call:
+    * `state["current_page_json"]`     is set to `parsed_content_json_path`
+    * `state["current_page_json_url"]` is set to `parsed_content_json_url`
+      (falls back to `parsed_content_json_path` if url is omitted)
+    * The labeled image is appended to the gallery.
+    * Element coordinates can now be resolved for the next action.
     """
     try:
         result = session.insert_parsed_result(
             labeled_image_path=body.labeled_image_path,
             parsed_content_json_path=body.parsed_content_json_path,
+            # BUG-3 FIX: pass through cloud URL; defaults to local path if absent
+            parsed_content_json_url=body.parsed_content_json_url or body.parsed_content_json_path,
         )
         return ParsedResultOut(**result)
     except RuntimeError as exc:
@@ -193,9 +171,6 @@ def insert_parsed_result(body: ParsedResultIn):
 def store_to_db(body: StoreToDbIn):
     """
     Pushes a previously saved `state_*.json` file to Neo4j and Pinecone.
-
-    The file should be generated by Step 2 (`state2json`) and include
-    `history_steps` with valid `source_page` and `source_json` paths.
     """
     json_path = body.json_path.strip()
     if not json_path:

@@ -27,7 +27,7 @@ class State(TypedDict):
     # ── page ──────────────────────────────────
     page_history:           List[str]       # labeled image paths (gallery)
     current_page_screenshot: Optional[str]  # raw screenshot path
-    current_page_json:       Optional[str]  # elements JSON path (None = not yet parsed)
+    current_page_json:       Optional[Dict]  # elements JSON (None = not yet parsed)
 
     # ── operation ─────────────────────────────
     recommend_action:  str           # Currently recommended action

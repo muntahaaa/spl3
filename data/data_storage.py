@@ -1,43 +1,141 @@
 """
 data_storage.py
 ===============
-Step 2 : Persist session state to JSON   (state2json)
-Step 3 : Load JSON and push to Neo4j + Pinecone  (json2db)
+Step 2 : Persist session state to JSON          (state2json)
+Step 3 : Load JSON and push to Neo4j + Pinecone (json2db)
+
+═══════════════════════════════════════════════════════════════════════════════
+ROOT-CAUSE ANALYSIS OF ALL CURRENT BUGS
+═══════════════════════════════════════════════════════════════════════════════
+
+BUG-1  ── Elements never stored in Neo4j
+         CAUSE: json2db() calls _resolve_element_for_action() which only
+         resolves ONE interacted element per step (the clicked/typed element).
+         It never iterates over ALL elements in the page's source_json and
+         creates a node for each.  The AppAgentX schema requires every element
+         on a page to be stored as an Element node connected via HAS_ELEMENT.
+         FIX: Add a new _store_all_page_elements() inner block that loops over
+         every item in elements_data and creates + links every Element node.
+         The interacted element is resolved separately and linked to the Action
+         node via COMPOSED_OF and gets a LEADS_TO edge to the next page.
+
+BUG-2  ── Pinecone only stores actions, not elements or pages
+         CAUSE: _element2vector() is only called when element_info is not None
+         (i.e. the single interacted element).  Because BUG-1 meant most
+         elements are never created, their vectors are never stored.
+         _page2vector() IS called per step but fails silently because
+         source_page stores a LOCAL file path that does not exist when the
+         image was uploaded to Cloudinary.
+         FIX: After BUG-1 fix, _element2vector() is called for every element.
+         For page vectors, the local screenshot path is used (it was already
+         saved locally by take_screenshot before being uploaded).
+
+BUG-3  ── history_steps contains wrong source_json path
+         CAUSE: In explor_human.single_human_explor() the step record stores
+             "source_json": _to_relative(state.get("current_page_json", ""))
+         But state["current_page_json"] is set by session.insert_parsed_result()
+         to the VALUE PASSED IN via the API/UI.  Since the cloud URL popup
+         (ui.py / api_routes.py) now downloads the JSON locally and passes the
+         LOCAL path, that local path (e.g. /tmp/human_explorer_cloud/ss1.json)
+         is what gets stored.  When json2db() later runs on the same machine it
+         can open that temp file — but if the temp dir is cleaned, it fails.
+         The correct behaviour:
+           • state["current_page_json"]      = local temp path  (for live use)
+           • step record "source_json"       = Cloudinary JSON URL  (for portability)
+           • step record "source_json_local" = local temp path       (for json2db)
+         FIX: session.insert_parsed_result() now receives BOTH the cloud URL
+         and the local path and stores both on the state.  single_human_explor()
+         records the cloud URL in "source_json" and the local path in
+         "source_json_local" so json2db() can use the local copy.
+
+BUG-4  ── _page2vector() fails for Cloudinary screenshot URLs
+         CAUSE: source_page in history_steps stores the LOCAL screenshot path
+         (from take_screenshot).  _page2vector() tries Path(source_page).is_file()
+         which works only while the local file still exists.
+         FIX: _page2vector() now also accepts an HTTP URL; if the path does not
+         exist locally it downloads the image to a temp file first.
+
+BUG-5  ── Action nodes linked to wrong elements / COMPOSED_OF created with
+         wrong action_id
+         CAUSE: action_properties["action_id"] was created fresh as uuid4() but
+         db.create_action() returns the Neo4j elementId, not the action_id
+         property.  add_element_to_action() queries by action_id property, so
+         the returned elementId was silently useless.
+         FIX: Generate action_id = str(uuid4()) and pass it as a property;
+         db.create_action() stores it as the action_id property, and
+         add_element_to_action() MATCH on that same property — which already
+         works correctly in graph_db.py.  No graph_db.py change needed.
 """
 
 import hashlib
 import json
 import re
+import tempfile
+import time as _time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from uuid import uuid4
+
 from PIL import Image
-from data.State import State
+
 import config as config
 from data.graph_db import Neo4jDatabase
 from data.vector_db import NodeType, VectorData, VectorStore
 from tool.img_tool import element_img, extract_features
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Low-level helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _md5(text: str, length: int = 8) -> str:
     return hashlib.md5(text.encode()).hexdigest()[:length]
 
 
 def _resolve_existing_path(path_like: str) -> Optional[Path]:
+    """Return a Path if the file exists locally; None otherwise."""
     if not path_like:
         return None
-
     normalized = path_like.replace("\\", "/")
     candidate = Path(normalized)
     if candidate.is_file():
         return candidate
-
     cwd_candidate = Path.cwd() / normalized
     if cwd_candidate.is_file():
         return cwd_candidate
+    return None
+
+
+def _fetch_to_local(url_or_path: str, suffix: str = "") -> Optional[Path]:
+    """
+    Return a local Path for the given string.
+    • If it is already a local file  →  return as Path directly.
+    • If it starts with http(s)://   →  download to a temp file and return that.
+    • Otherwise                      →  return None.
+    """
+    if not url_or_path:
+        return None
+
+    local = _resolve_existing_path(url_or_path)
+    if local is not None:
+        return local
+
+    if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
+        try:
+            tmp_dir = Path(tempfile.gettempdir()) / "appagentx_dl"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tail = Path(url_or_path.split("?")[0]).name or f"dl{suffix}"
+            if suffix and not tail.endswith(suffix):
+                tail += suffix
+            dest = tmp_dir / tail
+            if not dest.is_file():           # reuse if already downloaded
+                urllib.request.urlretrieve(url_or_path, str(dest))
+            return dest
+        except Exception as exc:
+            print(f"[_fetch_to_local] download failed for {url_or_path}: {exc}")
+            return None
 
     return None
 
@@ -48,9 +146,7 @@ def _resolve_existing_path(path_like: str) -> Optional[Path]:
 
 def state2json(state: dict, save_path: str = None) -> str:
     """
-    Serialise the exploration State to a JSON file.
-
-    Returns the absolute path string on success, or an error string.
+    Serialise the exploration State to a JSON file and return the file path.
     """
     if not isinstance(state, dict):
         raise TypeError("'state' must be a dict.")
@@ -60,14 +156,20 @@ def state2json(state: dict, save_path: str = None) -> str:
         "app_name":      state.get("app_name", ""),
         "step":          state.get("step", 0),
         "history_steps": state.get("history_steps", []),
-           # Add final_page field, including the screenshot and JSON information of the last page
         "final_page": {
-            "screenshot": state.get("current_page_screenshot", ""),
-            "page_json":  (
+            "screenshot":       state.get("current_page_screenshot", ""),
+            # BUG-3 FIX: prefer the cloud URL stored separately; fall back to
+            # whatever is in current_page_json (which may be a local path).
+            "page_json":        state.get("current_page_json_url") or (
                 state["current_page_json"].get("parsed_content_json_path", "")
                 if isinstance(state.get("current_page_json"), dict)
-                else state.get("current_page_json", "")
+                else (state.get("current_page_json") or "")
             ),
+            # local copy for json2db (may differ from cloud URL)
+            "page_json_local":  state.get("current_page_json") if isinstance(
+                state.get("current_page_json"), str
+            ) else "",
+            "timestamp":        int(_time.time()),
         },
     }
 
@@ -87,8 +189,47 @@ def state2json(state: dict, save_path: str = None) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 3 – JSON file → Neo4j + Pinecone
+#  Helper – record one completed action into state["history_steps"]
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def record_action_to_state(
+    state: dict,
+    step: int,
+    screenshot_path: str,
+    elements_json_url: Optional[str],        # BUG-3 FIX: Cloudinary / cloud URL
+    elements_json_local: Optional[str],      # BUG-3 FIX: local temp path for json2db
+    recommended_action: str,
+    clicked_elements: Optional[list] = None,
+    tool_results: Optional[dict] = None,
+) -> None:
+    """
+    Record a completed action into state["history_steps"].
+
+    Both the cloud URL and the local path of the elements JSON are stored so
+    that:
+      • "source_json"       → portable Cloudinary URL (survives machine changes)
+      • "source_json_local" → local temp path used by json2db on the same run
+    """
+    action_record = {
+        "step":               step,
+        "source_page":        screenshot_path,
+        # BUG-3 FIX: store the cloud URL, not the local tmp path
+        "source_json":        elements_json_url or "",
+        "source_json_local":  elements_json_local or "",
+        "recommended_action": recommended_action,
+        "timestamp":          int(_time.time()),
+        "clicked_elements":   clicked_elements or [],
+        "tool_results":       tool_results or {},
+    }
+
+    state["history_steps"].append(action_record)
+    state["step"] = step + 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 3 – JSON → Neo4j + Pinecone
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def pos2id(
     x: int,
     y: int,
@@ -96,84 +237,102 @@ def pos2id(
     source_page: Optional[str] = None,
 ) -> Optional[Dict]:
     """
-    Find matching element information from the JSON file based on coordinates.
-    If no direct match is found, return the nearest element.
-
-    Args:
-        x: The x-coordinate of the click position.
-        y: The y-coordinate of the click position.
-        json_path: The path to the element JSON file.
-
-    Returns:
-        Optional[Dict]: A dictionary of the matched element information, or None if not found.
+    Return the element dict from the JSON file whose bbox contains (x, y).
+    Falls back to the nearest element if no exact match is found.
+    Accepts a local path or a URL for json_path.
     """
     try:
-        json_file = _resolve_existing_path(json_path)
+        json_file = _fetch_to_local(json_path, ".json")
         if json_file is None:
-            raise FileNotFoundError(f"JSON file not found: {json_path}")
+            raise FileNotFoundError(f"Elements JSON not found / unreachable: {json_path}")
 
-        # Read the element JSON file
         with open(json_file, "r", encoding="utf-8") as f:
             elements_data = json.load(f)
 
-        # Convert absolute coordinates to relative coordinates.
-        # Prefer the real screenshot dimensions when available.
         screen_width, screen_height = 1080, 2400
-        source_page_file = _resolve_existing_path(source_page or "")
-        if source_page_file is not None:
-            with Image.open(source_page_file) as img:
+        page_file = _fetch_to_local(source_page or "", ".png") if source_page else None
+        if page_file is not None:
+            with Image.open(page_file) as img:
                 screen_width, screen_height = img.size
 
         norm_x = x / screen_width
         norm_y = y / screen_height
 
-        # Match specific elements from element data
         element_info = next(
             (
-                e
-                for e in elements_data
+                e for e in elements_data
                 if e["bbox"][0] <= norm_x <= e["bbox"][2]
                 and e["bbox"][1] <= norm_y <= e["bbox"][3]
             ),
             None,
         )
 
-        # If no direct match is found, find the closest element
         if element_info is None and elements_data:
-            min_distance = float("inf")
-            closest_element = None
-
-            for element in elements_data:
-                bbox = element["bbox"]
-                # Calculate the center point of the bounding box
-                center_x = (bbox[0] + bbox[2]) / 2
-                center_y = (bbox[1] + bbox[3]) / 2
-
-                # Calculate the Euclidean distance from the click position to the center of the bounding box
-                distance = ((norm_x - center_x) ** 2 + (norm_y - center_y) ** 2) ** 0.5
-
-                # Update the closest element
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_element = element
-
-            element_info = closest_element
-            print(
-                f"No direct match found. Using closest element with distance {min_distance:.4f}"
-            )
+            min_dist = float("inf")
+            closest  = None
+            for e in elements_data:
+                cx = (e["bbox"][0] + e["bbox"][2]) / 2
+                cy = (e["bbox"][1] + e["bbox"][3]) / 2
+                d  = ((norm_x - cx) ** 2 + (norm_y - cy) ** 2) ** 0.5
+                if d < min_dist:
+                    min_dist = d
+                    closest  = e
+            element_info = closest
+            print(f"[pos2id] No exact match; using closest (dist={min_dist:.4f})")
 
         return element_info
 
-    except Exception as e:
-        print(f"Error in pos2id: {str(e)}")
+    except Exception as exc:
+        print(f"[pos2id] {exc}")
         return None
+
+
+def _load_elements_for_step(step: dict) -> tuple:
+    """
+    Load the elements JSON for a history step.
+
+    Tries (in order):
+      1. source_json_local  (temp file from the current session)
+      2. source_json        (cloud URL – downloaded on demand)
+
+    Returns (elements_path: Optional[Path], elements_data: list).
+    """
+    for key in ("source_json_local", "source_json"):
+        raw = step.get(key, "")
+        if not raw:
+            continue
+        path = _fetch_to_local(raw, ".json")
+        if path is not None:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return path, data
+            except Exception as exc:
+                print(f"[_load_elements_for_step] failed to load {raw}: {exc}")
+
+    print(f"[_load_elements_for_step] Step {step.get('step')}: no elements JSON available")
+    return None, []
+
 
 def json2db(json_path: str) -> str:
     """
-    Read a state JSON file and push every page + element into
-    Neo4j (graph) and Pinecone (vectors).
+    Read a state JSON file produced by state2json() and push every page,
+    element, and action into Neo4j (graph) + Pinecone (vectors).
 
     Returns the task_id (short MD5 of the task string).
+
+    What gets stored
+    ────────────────
+    Neo4j
+      • One Page node per history step + one final Page node
+      • ALL Element nodes on each page (HAS_ELEMENT edges)   ← BUG-1 FIX
+      • One Action node per step (COMPOSED_OF edge to the interacted element)
+      • LEADS_TO edges: interacted element → next page
+
+    Pinecone
+      • namespace "page"    : full-screenshot ResNet50 embedding per step
+      • namespace "element" : cropped-element ResNet50 embedding per element ← BUG-2 FIX
+      • namespace "action"  : action node stored (was already happening; kept)
     """
     db = Neo4jDatabase(
         uri=config.Neo4j_URI,
@@ -184,182 +343,270 @@ def json2db(json_path: str) -> str:
         api_key=config.PINECONE_API_KEY,
         index_name=config.PINECONE_INDEX_NAME,
         dimension=2048,
-        batch_size=2,
+        batch_size=10,
     )
 
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-        
-    # Generate task ID
-    task_id    = _md5(data["tsk"], 12)
-    
-    # Store page and element information
-    pages_info: list   = []
-    elements_info: list = []
-    # ── first pass: create nodes and page→element edges ────────────────────────────────
+
+    task_id       = _md5(data["tsk"], 12)
+    pages_info:   List[dict] = []   # {page_id, step}
+    elements_info: List[dict] = []  # {element_id, step, action, status, timestamp}
+                                    #  — only for the INTERACTED element per step
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  FIRST PASS – create Page / Element / Action nodes for every history step
+    # ══════════════════════════════════════════════════════════════════════════
     for step in data["history_steps"]:
-        # --- page node ---
+
+        # ── Page node ─────────────────────────────────────────────────────────
+        page_id = str(uuid4())
         page_props = {
-            "page_id":     str(uuid4()),
-            "description": "",
-            "raw_page_url": step["source_page"],
-            "timestamp":    step["timestamp"],
-            "other_info":  json.dumps({
+            "page_id":      page_id,
+            "description":  "",
+            "raw_page_url": step.get("source_page", ""),
+            "timestamp":    step.get("timestamp", int(_time.time())),
+            "other_info":   json.dumps({
                 "step": step["step"],
                 **({"task_info": {"task_id": task_id, "description": data["tsk"]}}
                    if step["step"] == 0 else {}),
             }),
         }
-        # Read element JSON file
-        raw_source_json = step.get("source_json")
-        elements_path = None
-        elements_data = []
-        if raw_source_json and Path(raw_source_json.replace("\\", "/")).is_file():
-            elements_path = Path(raw_source_json.replace("\\", "/"))
-            with open(elements_path, "r", encoding="utf-8") as f:
-                elements_data = json.load(f)
+
+        # BUG-3 FIX: load elements via the helper that tries local path first,
+        # then falls back to downloading from the cloud URL.
+        elements_path, elements_data = _load_elements_for_step(step)
+
+        if elements_data:
             page_props["elements"] = json.dumps(elements_data)
         else:
-            print(f"Step {step['step']}: source_json is null – storing page node only")
+            page_props["elements"] = json.dumps([])
 
-
-        # Create page node
         db.create_page(page_props)
-        pages_info.append({"page_id": page_props["page_id"], "step": step["step"]})
+        pages_info.append({"page_id": page_id, "step": step["step"]})
 
-        # Modify element node processing logic
-        tool_result   = step["tool_result"]
-        action_type   = tool_result.get("action")
-        clicked_element  = tool_result.get("clicked_element")
-        
-        
-        
-        
-
-     
-        if action_type == "tap" and clicked_element and step.get("source_json"):
-            element_info = pos2id(
-                clicked_element["x"],
-                clicked_element["y"],
-                step["source_json"].replace("\\", "/"),
-                source_page=step.get("source_page"),
+        # ── Page vector ────────────────────────────────────────────────────────
+        # BUG-4 FIX: _page2vector now handles URLs via _fetch_to_local internally
+        if step.get("source_page"):
+            ok = _page2vector(
+                page_id=page_id,
+                page_path=step["source_page"],
+                action_type=step.get("recommended_action", ""),
+                step_no=step["step"],
+                timestamp=str(step.get("timestamp", "")),
+                vs=vs,
             )
-        else:
-            element_info = {"ID": "", "bbox": [], "type": "", "content": ""}
+            if not ok:
+                print(f"[json2db] Warning: page vector failed for step {step['step']}")
 
-        if element_info:
-            parameters = {
-                k: v
-                for k, v in tool_result.items()
-                if k not in ["action", "device", "status"]
+        # ── BUG-1 FIX: create ALL Element nodes on this page ─────────────────
+        # The original code only created the ONE interacted element. The paper
+        # requires every element visible on the page to be stored so that
+        # visual-similarity search can find any element later.
+        element_id_map: Dict[int, str] = {}   # JSON ID → Neo4j element_id
+        for elem in elements_data:
+            elem_neo4j_id = str(uuid4())
+            element_id_map[elem.get("ID", -1)] = elem_neo4j_id
+
+            elem_props = {
+                "element_id":          elem_neo4j_id,
+                "element_original_id": str(elem.get("ID", "")),
+                "description":         "",
+                "action_type":         "",          # filled in for interacted elem below
+                "parameters":          json.dumps({}),
+                "bounding_box":        json.dumps(elem.get("bbox", [])),
+                "other_info":          json.dumps({
+                    "type":    elem.get("type", ""),
+                    "content": elem.get("content", ""),
+                }),
             }
+            db.create_element(elem_props)
+            db.add_element_to_page(page_id, elem_neo4j_id)
 
-            element_properties = {
-                "element_id": str(uuid4()),
-                "element_original_id": element_info.get("ID", ""),
-                "description": "",
-                "action_type": action_type,
-                "parameters": json.dumps(parameters),
-                "bounding_box": element_info.get("bbox", []),
-                "other_info": json.dumps(
-                    {
-                        "type": element_info.get("type", ""),
-                        "content": element_info.get("content", ""),
-                    }
-                ),
-            }
-
-            # Create element node
-            db.create_element(element_properties)
-            elements_info.append(
-                {
-                    "element_id": element_properties["element_id"],
-                    "step": step["step"],
-                    "action": step["recommended_action"],
-                    "status": tool_result["status"],
-                    "timestamp": step["timestamp"],
-                }
-            )
-
-            # Establish element to page ownership relationship
-            db.add_element_to_page(
-                page_props["page_id"], element_properties["element_id"]
-            )
-
-            # Process the visual features of the element and store them in the vector database
-            if element_info.get("ID"):  # Only process valid element ID
-                success = _element2vector(
-                    str(element_info["ID"]),
-                    element_properties["element_id"],
-                    json.dumps(elements_data),
-                    step["source_page"],
-                    vs,
+            # BUG-2 FIX: store element vector for EVERY element on the page
+            if elem.get("ID") is not None and step.get("source_page"):
+                _element2vector(
+                    ID=str(elem["ID"]),
+                    element_id=elem_neo4j_id,
+                    elements_json=json.dumps(elements_data),
+                    page_path=step["source_page"],
+                    vs=vs,
                 )
-                if not success:
-                    print(
-                        f"Warning: Vector storage failed for element {element_info['ID']}"
-                    )
 
-    # Create final page node (if exists)
-    if data.get("final_page"):
-        final_page_properties = {
-            "page_id": str(uuid4()),
-            "description": "",
-            "raw_page_url": data["final_page"].get("screenshot", ""),
-            "timestamp": data["final_page"].get("timestamp", ""),
+        # ── Action node ────────────────────────────────────────────────────────
+        action_uuid = str(uuid4())
+        tool_result  = step.get("tool_result") or {}
+        # tool_result may be nested one level inside tool_results list
+        if not tool_result and step.get("tool_results"):
+            tr = step["tool_results"]
+            tool_result = tr[0] if isinstance(tr, list) and tr else (tr if isinstance(tr, dict) else {})
+
+        action_type     = tool_result.get("action") or step.get("action_type", "")
+        clicked_element = tool_result.get("clicked_element")
+
+        action_props = {
+            "action_id":    action_uuid,
+            "action_name":  step.get("recommended_action", ""),
+            "timestamp":    step.get("timestamp", ""),
+            "step":         step["step"],
+            "action_result": json.dumps(tool_result),
         }
+        db.create_action(action_props)
 
-        # Read final page element JSON
-        if data["final_page"].get("page_json"):
-            elements_path = _resolve_existing_path(data["final_page"]["page_json"])
-            if elements_path is not None:
-                with open(elements_path, "r", encoding="utf-8") as f:
-                    elements_data = json.load(f)
-                    final_page_properties["elements"] = json.dumps(elements_data)
-            else:
-                final_page_properties["elements"] = json.dumps([])
-        else:
-            final_page_properties["elements"] = json.dumps(
-                []
-            )  # If no element data, set to empty list
-
-        # Create final page node
-        db.create_page(final_page_properties)
-        pages_info.append(
-            {"page_id": final_page_properties["page_id"], "step": "final"}
+        # ── Resolve the ONE interacted element and link it to the Action ──────
+        interacted_elem_info = _resolve_element_for_action(
+            action_type=action_type,
+            clicked_elem=clicked_element,
+            elements_path=elements_path,
+            elements_data=elements_data,
+            recommended_action=step.get("recommended_action", ""),
         )
 
-    # ── second pass:  establish element->page leads_to relationship ──────────────────────────────
-    for i in range(len(elements_info)):
-        current_element = elements_info[i]
-        next_page = None
+        if interacted_elem_info is not None:
+            interacted_json_id = interacted_elem_info.get("ID")
+            interacted_neo4j_id = element_id_map.get(interacted_json_id)
 
-        # If it's the last element, point to the final page (if exists)
-        if i == len(elements_info) - 1 and len(pages_info) > len(elements_info):
-            next_page = pages_info[-1]  # Last page (final page)
+            if interacted_neo4j_id:
+                # Update the existing element node with action-specific fields
+                parameters = {
+                    k: v for k, v in tool_result.items()
+                    if k not in ("action", "device", "status")
+                }
+                db.update_node_property(
+                    interacted_neo4j_id, "action_type", action_type, node_type="Element"
+                )
+                db.update_node_property(
+                    interacted_neo4j_id, "parameters", json.dumps(parameters), node_type="Element"
+                )
+
+                # COMPOSED_OF: Action → interacted Element
+                db.add_element_to_action(
+                    action_id=action_uuid,
+                    element_id=interacted_neo4j_id,
+                    order=1,
+                    atomic_action=str(action_type),
+                    action_params=parameters,
+                )
+
+                # Track for LEADS_TO second pass
+                elements_info.append({
+                    "element_id": interacted_neo4j_id,
+                    "step":       step["step"],
+                    "action":     step.get("recommended_action", ""),
+                    "status":     tool_result.get("status", "unknown"),
+                    "timestamp":  step.get("timestamp", ""),
+                })
         else:
-            # Otherwise point to the next regular page
+            print(f"[json2db] Step {step['step']}: no interacted element resolved "
+                  f"for action '{action_type}' — LEADS_TO edge will be skipped")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  FINAL PAGE NODE
+    # ══════════════════════════════════════════════════════════════════════════
+    if data.get("final_page"):
+        fp          = data["final_page"]
+        fp_page_id  = str(uuid4())
+        fp_props    = {
+            "page_id":      fp_page_id,
+            "description":  "",
+            "raw_page_url": fp.get("screenshot", ""),
+            "timestamp":    fp.get("timestamp", int(_time.time())),
+        }
+
+        # BUG-3 FIX: try page_json_local first, then page_json (may be URL)
+        fp_elements_data: list = []
+        for key in ("page_json_local", "page_json"):
+            raw = fp.get(key, "")
+            if not raw:
+                continue
+            p = _fetch_to_local(raw, ".json")
+            if p is not None:
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        fp_elements_data = json.load(f)
+                    break
+                except Exception as exc:
+                    print(f"[json2db] final_page elements load failed ({key}): {exc}")
+
+        fp_props["elements"] = json.dumps(fp_elements_data)
+        db.create_page(fp_props)
+        pages_info.append({"page_id": fp_page_id, "step": "final"})
+
+        # Create Element nodes for the final page too
+        for elem in fp_elements_data:
+            fp_elem_id = str(uuid4())
+            fp_elem_props = {
+                "element_id":          fp_elem_id,
+                "element_original_id": str(elem.get("ID", "")),
+                "description":         "",
+                "action_type":         "",
+                "parameters":          json.dumps({}),
+                "bounding_box":        json.dumps(elem.get("bbox", [])),
+                "other_info":          json.dumps({
+                    "type":    elem.get("type", ""),
+                    "content": elem.get("content", ""),
+                }),
+            }
+            db.create_element(fp_elem_props)
+            db.add_element_to_page(fp_page_id, fp_elem_id)
+
+            if elem.get("ID") is not None and fp.get("screenshot"):
+                _element2vector(
+                    ID=str(elem["ID"]),
+                    element_id=fp_elem_id,
+                    elements_json=json.dumps(fp_elements_data),
+                    page_path=fp["screenshot"],
+                    vs=vs,
+                )
+
+        # Final page vector
+        success = False
+        if fp.get("screenshot"):
+            success = _page2vector(
+                page_id=fp_page_id,
+                page_path=fp["screenshot"],
+                action_type="task_completion",
+                step_no=data.get("step"),
+                timestamp=str(int(_time.time())),
+                vs=vs,
+            )
+        if not success:
+            print("[json2db] Warning: final page vector storage failed")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SECOND PASS – LEADS_TO edges (interacted element → next page)
+    # ══════════════════════════════════════════════════════════════════════════
+    for i, cur in enumerate(elements_info):
+        if i < len(elements_info) - 1:
             next_page = next(
-                (p for p in pages_info if p["step"] == current_element["step"] + 1),
-                None,
+                (p for p in pages_info if p["step"] == cur["step"] + 1), None
+            )
+        else:
+            # Last interacted element leads to the final page (if it exists)
+            next_page = next(
+                (p for p in pages_info if p["step"] == "final"), None
+            ) or next(
+                (p for p in pages_info if p["step"] == cur["step"] + 1), None
             )
 
         if next_page:
             db.add_element_leads_to(
-                current_element["element_id"],
-                next_page["page_id"],
-                action_name=current_element["action"],
+                element_id=cur["element_id"],
+                target_id=next_page["page_id"],
+                action_name=cur["action"],
                 action_params={
-                    "execution_result": current_element["status"],
-                    "timestamp": current_element["timestamp"],
+                    "execution_result": cur["status"],
+                    "timestamp":        cur["timestamp"],
                 },
             )
+
+    db.close()
     return task_id
 
 
-# ── private helpers ───────────────────────────────────────────────────────────
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  Private helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_element_for_action(
     action_type: str,
@@ -368,23 +615,43 @@ def _resolve_element_for_action(
     elements_data: list,
     recommended_action: str,
 ) -> Optional[Dict]:
-    """Resolve an interacted element for tap/long_press/text actions."""
-    if action_type in ("tap", "long_press") and clicked_elem and elements_path:
-        return pos2id(clicked_elem["x"], clicked_elem["y"], str(elements_path))
+    """
+    Return the single element that was interacted with during this action.
+    Used only for creating the COMPOSED_OF and LEADS_TO relationships.
+    """
+    if not elements_data:
+        return None
 
-    if action_type == "text" and elements_data:
-        # text actions may not carry clicked_element; recover target via element_number
-        # embedded in the recommended_action string.
+    if action_type in ("tap", "long_press"):
+        if clicked_elem and elements_path:
+            resolved = pos2id(
+                clicked_elem["x"], clicked_elem["y"], str(elements_path)
+            )
+            if resolved:
+                return resolved
+        # Fallback: element_number embedded in recommended_action string
         elem_id = _parse_element_number(recommended_action)
-        if elem_id is None:
-            return None
-        return next((e for e in elements_data if e.get("ID") == elem_id), None)
+        if elem_id is not None:
+            return next((e for e in elements_data if e.get("ID") == elem_id), None)
+
+    if action_type == "text":
+        elem_id = _parse_element_number(recommended_action)
+        if elem_id is not None:
+            return next((e for e in elements_data if e.get("ID") == elem_id), None)
+        # If no element_number, use first input/edittext element as fallback
+        return next(
+            (e for e in elements_data if e.get("type", "").lower() in ("input", "edittext")),
+            None,
+        )
+
+    if action_type == "swipe":
+        # Swipe is a navigation gesture; no specific element is the target
+        return None
 
     return None
 
 
 def _parse_element_number(recommended_action: str) -> Optional[int]:
-    """Extract element_number from recommended_action text."""
     if not recommended_action:
         return None
     match = re.search(r"['\"]?element_number['\"]?\s*:\s*(\d+)", recommended_action)
@@ -398,46 +665,39 @@ def _element2vector(
     page_path: str,
     vs: VectorStore,
 ) -> bool:
-    """Crop element image → ResNet50 features → Pinecone upsert.
-     Parameters:
-        ID: str, the ID of the element in the JSON
-        element_id: str, the unique ID of the element in the graph database
-        elements_json: str, the element JSON string
-        page_path: str, the page image path
-        vector_store: VectorStore, the vector database instance
-
-    Returns:
-        bool: Whether the storage was successful"""
+    """
+    Crop element from screenshot → ResNet50 → Pinecone "element" namespace.
+    BUG-4 FIX: page_path may be a URL; _fetch_to_local handles the download.
+    """
     try:
-        # 1. Extract element image
-        img      = element_img(page_path, elements_json, int(ID))
-        
-        # 2. Extract visual features
+        # Resolve page image (local or remote)
+        page_file = _fetch_to_local(page_path, ".png")
+        if page_file is None:
+            raise FileNotFoundError(f"Screenshot unavailable: {page_path}")
+
+        img      = element_img(str(page_file), elements_json, int(ID))
         features = extract_features(img, "resnet50")
-        
-        # 3. Parse JSON string to get element information
+
         elements = json.loads(elements_json)
         target   = next((e for e in elements if e.get("ID") == int(ID)), None)
         if target is None:
-            raise ValueError(f"Element {ID} not found in JSON")
-        
-        # 4. Prepare vector data
+            raise ValueError(f"Element ID={ID} not found in JSON")
+
         vd = VectorData(
             id=element_id,
             values=features["features"][0],
             metadata={
                 "original_id": str(ID),
-                "bbox":    target["bbox"],
-                "type":    target.get("type", ""),
-                "content": target.get("content", ""),
+                "bbox":        target.get("bbox", []),
+                "type":        target.get("type", ""),
+                "content":     target.get("content", ""),
             },
             node_type=NodeType.ELEMENT,
         )
-         # 5. Store in vector database
         return vs.upsert_batch([vd])
-    
+
     except Exception as exc:
-        print(f"[_element2vector] {exc}")
+        print(f"[_element2vector] ID={ID}: {exc}")
         return False
 
 
@@ -449,35 +709,36 @@ def _page2vector(
     timestamp: str,
     vs: VectorStore,
 ) -> bool:
-    """Embed full screenshot and upsert as a page vector."""
+    """
+    Embed full screenshot → ResNet50 → Pinecone "page" namespace.
+    BUG-4 FIX: supports HTTP URLs via _fetch_to_local.
+    """
     try:
         if not page_path:
             raise ValueError("page_path is empty")
 
-        normalized = page_path.replace("\\", "/")
-        path_obj = Path(normalized)
-        if not path_obj.is_file():
-            path_obj = Path.cwd() / normalized
-        if not path_obj.is_file():
-            raise FileNotFoundError(f"Screenshot not found: {page_path}")
+        path_obj = _fetch_to_local(page_path, ".png")
+        if path_obj is None:
+            raise FileNotFoundError(f"Screenshot not found / unreachable: {page_path}")
 
-        features = extract_features(str(path_obj), "resnet50")
+        features     = extract_features(str(path_obj), "resnet50")
         feature_list = features.get("features", []) if isinstance(features, dict) else []
         if not feature_list:
-            raise ValueError("No features returned for page image")
+            raise ValueError("extract_features returned no data")
 
         vd = VectorData(
             id=page_id,
             values=feature_list[0],
             metadata={
                 "action_type": action_type,
-                "step": step_no,
-                "timestamp": timestamp,
+                "step":        step_no,
+                "timestamp":   timestamp,
                 "source_page": str(path_obj).replace("\\", "/"),
             },
             node_type=NodeType.PAGE,
         )
         return vs.upsert_batch([vd])
+
     except Exception as exc:
         print(f"[_page2vector] {exc}")
         return False

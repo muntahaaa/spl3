@@ -29,6 +29,22 @@ class Neo4jDatabase:
             self.driver.close()
 
     # -- generic node creation -------------------------------------------------
+    def create_action(self, properties: Dict[str, Any]) -> Optional[str]:
+        """Create an Action node for high-level task operations."""
+        required_fields = ["action_id"]
+        if not all(field in properties for field in required_fields):
+            raise ValueError(f"Missing required fields: {required_fields}")
+    
+        properties["timestamp"] = properties.get(
+            "timestamp", int(datetime.now().timestamp())
+        )
+    
+        if "action_result" in properties:
+            if isinstance(properties["action_result"], dict):
+                properties["action_result"] = json.dumps(properties["action_result"])
+    
+        return self.create_node("Action", properties)
+    
     def update_node_property(
         self,
         node_id: str,

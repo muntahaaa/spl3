@@ -11,6 +11,7 @@ from pinecone import Pinecone, ServerlessSpec
 class NodeType(Enum):
     PAGE    = "page"
     ELEMENT = "element"
+    ACTION  = "action"
 
 
 @dataclass

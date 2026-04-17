@@ -207,9 +207,11 @@ def screen_action(
         elif action == "swipe":
             if x is None or y is None or direction is None:
                 return json.dumps({**result, "status": "error", "message": "x, y, direction required"})
-            unit = 100  # Swipe base distance
+            unit = 160  # Increased swipe base distance
             dx, dy = 0, 0
-            factor = 2 if dist == "medium" else 3
+            dist_key = (dist or "medium").lower()
+            factor_map = {"short": 2, "medium": 3, "long": 4}
+            factor = factor_map.get(dist_key, 3)
             if direction == "up":    dy = -factor * unit
             elif direction == "down":  dy =  factor * unit
             elif direction == "left":  dx = -factor * unit
