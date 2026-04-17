@@ -1,0 +1,3 @@
+Gradio path: http://127.0.0.1:7860/
+Swagger path: http://localhost:7860/docs#/
+Vector DB: https://app.pinecone.io/organizations/-OLKFDfXJSGsshq9f8W5/projects/23cdbbff-0a89-401b-ad30-f812f9bec6d8/indexes/vectordb/browser

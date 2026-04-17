@@ -26,13 +26,18 @@ class VectorStore:
 
     def __init__(
         self,
-        api_key:    Optional[str] = None,
+        api_key: Optional[str] = None,
         index_name: Optional[str] = None,
-        dimension:  int = 2048,
+        dimension: int = 2048,
         batch_size: int = 100,
     ):
         resolved_api_key = api_key or config.PINECONE_API_KEY
         resolved_index_name = index_name or getattr(config, "PINECONE_INDEX_NAME", "vectordb")
+
+        if not resolved_api_key:
+            raise ValueError(
+                "PINECONE_API_KEY is empty. Set it in .env or your environment variables."
+            )
 
         self.pc         = Pinecone(api_key=resolved_api_key)
         self.index_name = resolved_index_name
@@ -152,6 +157,14 @@ class VectorStore:
     # ── write ─────────────────────────────────
 
     def upsert_batch(self, vectors: List[VectorData]) -> bool:
+        """Batch insert or update vectors
+
+        Args:
+            vectors: List of VectorData objects
+
+        Returns:
+            bool: Whether the operation was successful
+        """
         try:
             by_type: Dict[str, list] = {}
             for vec in vectors:
@@ -183,6 +196,7 @@ class VectorStore:
         top_k:        int = 5,
         filter_dict:  Optional[Dict] = None,
     ) -> Dict:
+        """Query similar vectors and parse JSON strings in the results"""
         try:
             results = self.index.query(
                 namespace=node_type.value,
@@ -207,6 +221,15 @@ class VectorStore:
     # ── delete ────────────────────────────────
 
     def delete_vectors(self, ids: List[str], node_type: NodeType) -> bool:
+        """Delete vectors
+
+        Args:
+            ids: List of vector IDs to delete
+            node_type: Node type (used as namespace)
+
+        Returns:
+            bool: Whether the operation was successful
+        """
         try:
             self.index.delete(ids=ids, namespace=node_type.value)
             return True

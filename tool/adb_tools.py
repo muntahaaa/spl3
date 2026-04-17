@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import config
 from time import sleep
 
 from langchain_core.tools import tool
@@ -148,17 +149,33 @@ def screen_action(
     end:       tuple = None,
 ) -> str:
     """
-    Perform a screen action on an Android device via ADB.
+    Tool name: screen_action
 
-    Supported actions:
-        tap            – tap at (x, y)
-        back           – press the back key
-        text           – type input_str
-        long_press     – long-press at (x, y) for `duration` ms
-        swipe          – directional swipe from (x, y)
-        swipe_precise  – swipe from `start` tuple to `end` tuple
+    Tool function:
+        Perform screen operations on mobile devices (Android emulator or real device), including tap, back, type text, swipe, long press, and drag.
 
-    Returns a JSON string: {"status": "success"|"error", "action": ..., ...}
+    Parameters:
+        - device (str): Specify the target device ID, default is "emulator".
+        - action (str): Specify the type of screen operation to perform. Supports the following operations:
+            - "tap": Tap the specified coordinates on the screen.
+                Requires parameters: x, y
+            - "back": Back key operation.
+                No additional parameters required.
+            - "text": Enter text on the screen.
+                Requires parameter: input_str
+            - "long_press": Long press the specified coordinates on the screen.
+                Requires parameters: x, y, duration (default 1000 milliseconds)
+            - "swipe": Swipe operation, supports four directions ("up", "down", "left", "right").
+                Requires parameters: x, y, direction, dist (default "medium"), quick (default False)
+            - "swipe_precise": Precise swipe, swipe from the specified start point to the specified end point.
+                Requires parameters: start, end, duration (default 400 milliseconds)
+
+    Returns:
+        Returns a JSON string including the following fields:
+        - "status": "success" or "error"
+        - "action": Type of operation performed
+        - "device": Device ID
+        - Other fields appended according to the operation type (e.g., clicked coordinates, input text, swipe start and end points, etc.).
     """
     result: dict = {"action": action, "device": device}
 
@@ -190,7 +207,7 @@ def screen_action(
         elif action == "swipe":
             if x is None or y is None or direction is None:
                 return json.dumps({**result, "status": "error", "message": "x, y, direction required"})
-            unit = 100
+            unit = 100  # Swipe base distance
             dx, dy = 0, 0
             factor = 2 if dist == "medium" else 3
             if direction == "up":    dy = -factor * unit
