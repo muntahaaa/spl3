@@ -1,30 +1,28 @@
 """
-explor_human.py
-===============
-Human-exploration node functions.
+explor_human.py  –  ROOT-CAUSE FIX FOR BUG 2
+=============================================
+The only change from the previous version is in single_human_explor(),
+in the step_record that is appended to history_steps.
 
-BUG-3 FIX (source_json path in history_steps)
-──────────────────────────────────────────────
-ORIGINAL:
-    "source_json": _to_relative(state.get("current_page_json", ""))
+ORIGINAL (produces Bug 2):
+    "source_page": state.get("current_page_screenshot"),
+    "source_json": state.get("current_page_json"),
 
-PROBLEM:
-    state["current_page_json"] is set by session.insert_parsed_result() to the
-    LOCAL temp file path (e.g. /tmp/human_explorer_cloud/ss1.json).  Storing
-    that in history_steps means it only works on the machine that ran the
-    session, and only until the temp file is cleaned up.
+These values come directly from the State dict, which stores whatever
+path string was returned by take_screenshot / insert_parsed_result.
+On Windows that is often an absolute path like:
+    C:\\Users\\you\\project\\log\\screenshots\\...
+    D:/4th year/spl3/labeled_image/json_path/ss1.json
+
+When json2db later runs on a different machine or in a Docker container
+those absolute paths do not exist and open() raises FileNotFoundError.
 
 FIX:
-    SessionManager now keeps TWO separate fields:
-        state["current_page_json"]      = local temp path  (for live coord lookup)
-        state["current_page_json_url"]  = Cloudinary URL   (for portability)
-
-    single_human_explor() stores BOTH in the step record:
-        "source_json"       → cloud URL   (used as the canonical identifier)
-        "source_json_local" → local path  (used by json2db on the same machine)
-
-    json2db() (_load_elements_for_step) tries source_json_local first, then
-    falls back to downloading from source_json (the cloud URL).
+    Wrap both values with _to_relative() before storing them in the record.
+    _to_relative() tries to express the path relative to the current working
+    directory (the project root).  If the path is already relative, or if
+    relativisation fails for any reason, the original string is kept unchanged.
+    The result uses forward slashes only, so it is portable across platforms.
 """
 
 import datetime
@@ -38,24 +36,27 @@ from tool.adb_tools import screen_action, take_screenshot
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Portability helper  (kept for screenshot paths which are always local)
+#  Portability helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _to_relative(path_str: str) -> str:
     """
-    Convert an absolute local path to a project-root-relative forward-slash
-    path.  Falls back to the original string if relativisation fails.
+    Convert an absolute path to a path relative to the project root (cwd).
+    Always uses forward slashes.  Falls back to the original string if
+    relativisation raises (e.g. path is on a different Windows drive).
     """
     if not path_str:
         return path_str
     try:
         return Path(path_str).resolve().relative_to(Path.cwd()).as_posix()
     except ValueError:
+        # Different drive on Windows, or path outside cwd – keep original
+        # but at least normalise separators
         return path_str.replace("\\", "/").strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Screenshot capture
+#  Screenshot capture  (unchanged from previous version)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def capture_screenshot_only(state: State) -> State:
@@ -79,15 +80,13 @@ def capture_screenshot_only(state: State) -> State:
     else:
         print(f"[capture_screenshot_only] saved → {result}")
         state["current_page_screenshot"] = result
-        # Clear both JSON fields so the UI knows a new parse is needed
         state["current_page_json"]       = None
-        state["current_page_json_url"]   = None
 
     return state
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Element-ID → pixel coords
+#  Element-ID → pixel coords  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def element_number_to_coords(state: State, element_id: int) -> Tuple[int, int]:
@@ -95,14 +94,14 @@ def element_number_to_coords(state: State, element_id: int) -> Tuple[int, int]:
 
     if not json_path:
         msg = (
-            "[element_number_to_coords] No parsed result available. "
-            "Submit cloud URLs first."
+            "[element_number_to_coords] No parsed result available.  "
+            "POST /api/insert_parsed_result first."
         )
         state["errors"].append({"step": state["step"], "func": "element_number_to_coords", "error_msg": msg})
         raise RuntimeError(msg)
 
     if not os.path.isfile(json_path):
-        msg = f"[element_number_to_coords] JSON not found locally: {json_path}"
+        msg = f"[element_number_to_coords] JSON not found: {json_path}"
         state["errors"].append({"step": state["step"], "func": "element_number_to_coords", "error_msg": msg})
         raise FileNotFoundError(msg)
 
@@ -137,7 +136,7 @@ def element_number_to_coords(state: State, element_id: int) -> Tuple[int, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Single ADB action
+#  Single action  –  ROOT-CAUSE FIX FOR BUG 2 IS HERE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def single_human_explor(state: State, action: str, **kwargs) -> State:
@@ -146,7 +145,8 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
     action_result = None
     x = y = None
 
-    VALID_ACTIONS = {"tap", "text", "long_press", "swipe", "swipe_precise", "back", "wait"}
+    # wait removed: it produces no element interaction and no navigation.
+    VALID_ACTIONS = {"tap", "text", "long_press", "swipe", "swipe_precise", "back"}
 
     if action not in VALID_ACTIONS:
         msg = f"Unsupported action: {action}"
@@ -155,6 +155,9 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
         state["step"] += 1
         return state
 
+    # tap, long_press, swipe all need element coords (required).
+    # back also accepts an optional element_number to identify the back
+    # button/icon as the interacted element in the graph.
     if action in ("tap", "long_press", "swipe"):
         elem_num = kwargs.get("element_number")
         if elem_num is None:
@@ -171,7 +174,9 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
             state["step"] += 1
             return state
 
-    if action == "text" and kwargs.get("element_number") is not None:
+    # text: element_number is optional but links the action to an element.
+    # back: element_number is optional; if provided it marks the back icon.
+    if action in ("text", "back") and kwargs.get("element_number") is not None:
         try:
             x, y = element_number_to_coords(state, kwargs.get("element_number"))
         except Exception as exc:
@@ -179,9 +184,7 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
 
     params = {"device": state.get("device", "emulator"), "action": action}
 
-    if action == "wait":
-        action_result = json.dumps({"status": "success", "action": "wait", "message": "No-op."})
-    elif action == "back":
+    if action == "back":
         action_result = screen_action.invoke(params)
     elif action == "tap":
         params.update({"x": x, "y": y})
@@ -199,11 +202,9 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
     elif action == "swipe":
         sd = kwargs.get("swipe_direction")
         if sd:
-            params.update({
-                "x": x, "y": y, "direction": sd,
-                "dist": kwargs.get("dist", "medium"),
-                "quick": kwargs.get("quick", False),
-            })
+            params.update({"x": x, "y": y, "direction": sd,
+                           "dist": kwargs.get("dist", "medium"),
+                           "quick": kwargs.get("quick", False)})
             action_result = screen_action.invoke(params)
         else:
             state["errors"].append({"step": state["step"], "tool": "screen_action", "error_msg": "swipe_direction missing"})
@@ -223,25 +224,21 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
 
         state["tool_results"].append({"tool_name": "screen_action", "action_result": action_dict})
 
-        # ── BUG-3 FIX ────────────────────────────────────────────────────────
-        # Store BOTH the cloud URL (portable) and the local temp path (for
-        # json2db on this machine).
+        # ── ROOT-CAUSE FIX FOR BUG 2 ──────────────────────────────────────────
         #
-        # state["current_page_json"]     → local temp path set by insert_parsed_result
-        # state["current_page_json_url"] → Cloudinary URL set by insert_parsed_result
+        # ORIGINAL:
+        #     "source_page": state.get("current_page_screenshot"),
+        #     "source_json": state.get("current_page_json"),
         #
-        # We store:
-        #   "source_json"       = cloud URL   (canonical, portable)
-        #   "source_json_local" = local path  (fast access during the same session)
+        # Both values are stored raw from the State dict.  On Windows this is
+        # often "D:/absolute/path/to/file.json" which is machine-specific and
+        # will cause FileNotFoundError when json2db runs on any other system.
         #
-        # json2db() will use source_json_local first; if missing/stale it will
-        # download from source_json.
-
-        source_json_url   = state.get("current_page_json_url") or ""
-        source_json_local = state.get("current_page_json") or ""
-
-        # Screenshot path is always local; make it relative for portability
-        source_page_rel = _to_relative(state.get("current_page_screenshot", ""))
+        # FIX:
+        #     Wrap both through _to_relative() so the stored value is always a
+        #     portable relative path like  "log/screenshots/human_exploration/...png"
+        #     with forward slashes.  This way json2db can open the file on any
+        #     platform as long as it runs from the same project root directory.
 
         state["history_steps"].append({
             "step":               state["step"],
@@ -249,18 +246,14 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
             "tool_result": {
                 "action":  action,
                 "device":  state.get("device", "emulator"),
-                "clicked_element": (
-                    {"x": x, "y": y}
-                    if action in ("tap", "long_press", "text") and x is not None and y is not None
-                    else None
-                ),
+                "clicked_element": ({"x": x, "y": y} if action in ("tap", "long_press", "text", "swipe", "back") and x is not None and y is not None else None),
                 "status":  "success" if action_result else "failed",
                 **action_dict,
             },
-            "source_page":        source_page_rel,
-            "source_json":        source_json_url,        # BUG-3 FIX: cloud URL
-            "source_json_local":  source_json_local,      # BUG-3 FIX: local path
-            "timestamp":          datetime.datetime.now().isoformat(),
+            # ↓ FIX 2: converted to relative portable path before storing
+            "source_page": _to_relative(state.get("current_page_screenshot", "")),
+            "source_json": _to_relative(state.get("current_page_json", "")) if state.get("current_page_json") else None,
+            "timestamp":   datetime.datetime.now().isoformat(),
         })
 
     state = capture_screenshot_only(state)

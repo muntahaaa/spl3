@@ -41,7 +41,8 @@ def _get_devices():
 
 
 def _action_visibility(action: str):
-    show_elem  = action in ("tap", "text", "long_press", "swipe")
+    # back now shows element_num so the user can optionally mark the back icon.
+    show_elem  = action in ("tap", "text", "long_press", "swipe", "back")
     show_text  = action == "text"
     show_swipe = action == "swipe"
     return (
@@ -158,10 +159,14 @@ def perform_action(action, element_number, text_input, swipe_direction):
     if state is None:
         return "Error: initialize a device first.", [], gr.update(visible=False)
 
+    # element_number is shared across tap/long_press/swipe/back/text.
+    # For back it is optional; single_human_explor handles None gracefully.
+    resolved_elem = int(element_number) if element_number is not None else None
+
     updated = single_human_explor(
         state,
         action,
-        element_number=int(element_number) if element_number is not None else None,
+        element_number=resolved_elem,
         text_input=text_input,
         swipe_direction=swipe_direction,
     )
@@ -324,9 +329,13 @@ def build_ui() -> gr.Blocks:
 
             start_btn    = gr.Button("▶ Start session (take initial screenshot)")
             action_radio = gr.Radio(
-                ["tap", "text", "long_press", "swipe", "back", "wait"], label="Action"
+                ["tap", "text", "long_press", "swipe", "back"], label="Action"
             )
-            element_num = gr.Number(label="Element ID (from parsed JSON)", precision=0, visible=False)
+            element_num = gr.Number(
+                label="Element ID",
+                info="Required for tap / long_press / swipe. Optional for text and back (marks the icon in the graph).",
+                precision=0, visible=False,
+            )
             text_in     = gr.Textbox(label="Text input", visible=False)
             swipe_dir   = gr.Radio(["up", "down", "left", "right"], label="Swipe direction", visible=False)
             perform_btn = gr.Button("⚡ Perform action")
