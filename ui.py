@@ -93,11 +93,14 @@ def refresh_devices():
         return gr.update(choices=["No devices found"]), f"Error: {exc}"
 
 
-def initialize_device(device: str, task_info: str):
+def initialize_device(device: str, task_info: str, app_name: str):
     if not task_info:
         return "Error: task information cannot be empty."
     if not device or device == "No devices found":
         return "Error: select a valid ADB device."
+
+    # Normalise: strip whitespace, fall back to a safe default if left blank
+    app_name = app_name.strip() if app_name and app_name.strip() else "human_exploration"
 
     device_info = get_device_size.invoke({"device": device})
     if "error" in device_info:
@@ -105,7 +108,7 @@ def initialize_device(device: str, task_info: str):
 
     state = State(
         tsk=task_info,
-        app_name="human_exploration",
+        app_name=app_name,
         completed=False,
         step=0,
         history_steps=[],
@@ -126,7 +129,7 @@ def initialize_device(device: str, task_info: str):
     session.set_state(state)
     session.user_log_storage  = []
     session.user_page_storage = []
-    return f"✅ Initialized device '{device}' — task: {task_info}"
+    return f"✅ Initialized device '{device}' — app: {app_name} — task: {task_info}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,6 +289,11 @@ def build_ui() -> gr.Blocks:
             devices_box  = gr.Textbox(label="Connected devices", interactive=False)
             refresh_btn  = gr.Button("🔄 Refresh devices")
             device_radio = gr.Radio(label="Select ADB device", choices=[])
+            app_name_input = gr.Textbox(
+                label="App name",
+                placeholder="e.g. YouTube, Settings, com.example.app",
+                info="Name of the app being explored. Used in page descriptions and screenshot paths.",
+            )
             task_input   = gr.Textbox(
                 label="Task description",
                 placeholder="e.g. Log in and navigate to Settings",
@@ -295,7 +303,12 @@ def build_ui() -> gr.Blocks:
 
             refresh_btn.click(refresh_devices, outputs=[device_radio, devices_box], queue=False)
             demo.load(refresh_devices, outputs=[device_radio, devices_box], queue=False)
-            init_btn.click(initialize_device, inputs=[device_radio, task_input], outputs=[init_status], queue=False)
+            init_btn.click(
+                initialize_device,
+                inputs=[device_radio, task_input, app_name_input],
+                outputs=[init_status],
+                queue=False,
+            )
 
         # ── Tab 2 : Exploration ───────────────────────────────────────────────
         with gr.Tab("② Exploration"):
