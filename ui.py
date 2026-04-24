@@ -3,24 +3,12 @@ ui.py  –  Gradio user interface
 ================================
 Steps covered:
     ① Initialization  → device selection, task entry
-    ② Exploration     → ADB actions + cloud URL popup after every screenshot
+    ② Exploration     → ADB actions + automatic OmniParser parsing after every screenshot
     ③ Save & Export   → state → JSON
     ④ Store to DB     → JSON → Neo4j + Pinecone
-
-BUG-3 FIX
-──────────
-The cloud-URL popup now passes the *original Cloudinary URL* of the JSON file
-to session.insert_parsed_result() as `parsed_content_json_url`.  This URL is
-what ends up stored in history_steps["source_json"] (the canonical portable
-identifier), while the locally downloaded copy is stored in
-history_steps["source_json_local"] for fast access during the same session.
 """
 
 import json
-import os
-import tempfile
-import urllib.request
-from pathlib import Path
 
 import gradio as gr
 
@@ -41,7 +29,8 @@ def _get_devices():
 
 
 def _action_visibility(action: str):
-    show_elem  = action in ("tap", "text", "long_press", "swipe")
+    # back now shows element_num so the user can optionally mark the back icon.
+    show_elem  = action in ("tap", "text", "long_press", "swipe", "back")
     show_text  = action == "text"
     show_swipe = action == "swipe"
     return (
@@ -49,35 +38,6 @@ def _action_visibility(action: str):
         gr.update(visible=show_text),
         gr.update(visible=show_swipe),
     )
-
-
-def _download_url(url: str, suffix: str) -> str:
-    """
-    Download a URL to a local temp file.  Returns the local path.
-    The original URL is returned unchanged if it is already a local file.
-    """
-    url = url.strip()
-    if not url:
-        raise ValueError("URL is empty")
-
-    # Already a local path?
-    if not url.startswith("http://") and not url.startswith("https://"):
-        if Path(url).is_file():
-            return url
-        raise FileNotFoundError(f"Local file not found: {url}")
-
-    tmp_dir = Path(tempfile.gettempdir()) / "human_explorer_cloud"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    tail = Path(url.split("?")[0]).name or f"download{suffix}"
-    if suffix and not tail.endswith(suffix):
-        tail += suffix
-    dest = tmp_dir / tail
-
-    if not dest.is_file():
-        urllib.request.urlretrieve(url, str(dest))
-
-    return str(dest)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,11 +53,14 @@ def refresh_devices():
         return gr.update(choices=["No devices found"]), f"Error: {exc}"
 
 
-def initialize_device(device: str, task_info: str):
+def initialize_device(device: str, task_info: str, app_name: str):
     if not task_info:
         return "Error: task information cannot be empty."
     if not device or device == "No devices found":
         return "Error: select a valid ADB device."
+
+    # Normalise: strip whitespace, fall back to a safe default if left blank
+    app_name = app_name.strip() if app_name and app_name.strip() else "human_exploration"
 
     device_info = get_device_size.invoke({"device": device})
     if "error" in device_info:
@@ -105,14 +68,13 @@ def initialize_device(device: str, task_info: str):
 
     state = State(
         tsk=task_info,
-        app_name="human_exploration",
+        app_name=app_name,
         completed=False,
         step=0,
         history_steps=[],
         page_history=[],
         current_page_screenshot=None,
         current_page_json=None,
-        current_page_json_url=None,          # BUG-3 FIX: new field
         recommend_action="",
         clicked_elements=[],
         action_reflection=[],
@@ -126,7 +88,7 @@ def initialize_device(device: str, task_info: str):
     session.set_state(state)
     session.user_log_storage  = []
     session.user_page_storage = []
-    return f"✅ Initialized device '{device}' — task: {task_info}"
+    return f"✅ Initialized device '{device}' — app: {app_name} — task: {task_info}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,29 +98,38 @@ def initialize_device(device: str, task_info: str):
 def start_session():
     state = session.get_state()
     if state is None:
-        return "Error: initialize a device first.", [], gr.update(visible=False)
+        return "Error: initialize a device first.", []
 
     updated = capture_screenshot_only(state)
     session.set_state(updated)
 
     screenshot = updated.get("current_page_screenshot", "")
+    parsed_json = updated.get("current_page_json", "")
     msg = (
         f"Session started.\n"
         f"📷 Screenshot saved → {screenshot}\n"
-        f"⬇️  Enter cloud URLs below and click Submit."
+        f"📊 Parsed with OmniParser → {parsed_json if parsed_json else '(parsing failed)'}"
     )
-    return msg, session.user_page_storage, gr.update(visible=True)
+    return msg, session.user_page_storage
 
 
 def perform_action(action, element_number, text_input, swipe_direction):
     state = session.get_state()
     if state is None:
-        return "Error: initialize a device first.", [], gr.update(visible=False)
+        return "Error: initialize a device first.", []
+
+    # element_number is shared across tap/long_press/swipe/back/text.
+    # For back it is optional; single_human_explor handles None gracefully.
+    resolved_elem = int(element_number) if element_number is not None else None
+
+    # element_number is shared across tap/long_press/swipe/back/text.
+    # For back it is optional; single_human_explor handles None gracefully.
+    resolved_elem = int(element_number) if element_number is not None else None
 
     updated = single_human_explor(
         state,
         action,
-        element_number=int(element_number) if element_number is not None else None,
+        element_number=resolved_elem,
         text_input=text_input,
         swipe_direction=swipe_direction,
     )
@@ -177,72 +148,14 @@ def perform_action(action, element_number, text_input, swipe_direction):
         if p and p not in session.user_page_storage:
             session.user_page_storage.append(p)
 
+    parsed_json = updated.get("current_page_json", "")
     status = (
         f"Step {updated['step']} done — '{action}' executed.\n"
         f"📷 New screenshot → {updated.get('current_page_screenshot')}\n"
-        f"⬇️  Enter cloud URLs below and click Submit."
+        f"📊 Parsed with OmniParser → {parsed_json if parsed_json else '(parsing failed)'}"
     )
     log_text = "\n".join(session.user_log_storage) + "\n" + status
-    return log_text, session.user_page_storage, gr.update(visible=True)
-
-
-def submit_cloud_urls(image_url: str, json_url: str):
-    """
-    Download both cloud files locally, then call insert_parsed_result()
-    passing the original cloud URL alongside the local path.
-    """
-    state = session.get_state()
-    if state is None:
-        return "Error: no active session.", [], gr.update(visible=True)
-
-    if not image_url.strip() and not json_url.strip():
-        return skip_cloud_urls()
-
-    errors = []
-
-    # ── Download labeled image ────────────────────────────────────────────────
-    try:
-        local_image = _download_url(image_url, ".png")
-    except Exception as exc:
-        errors.append(f"Image download failed: {exc}")
-        local_image = None
-
-    # ── Download elements JSON ────────────────────────────────────────────────
-    try:
-        local_json = _download_url(json_url, ".json")
-    except Exception as exc:
-        errors.append(f"JSON download failed: {exc}")
-        local_json = None
-
-    if errors:
-        msg = "⚠️  " + " | ".join(errors) + "\n(Popup kept open — fix URLs or click Skip)"
-        return "\n".join(session.user_log_storage) + "\n" + msg, session.user_page_storage, gr.update(visible=True)
-
-    # ── BUG-3 FIX: pass BOTH local path AND original cloud URL ───────────────
-    try:
-        result = session.insert_parsed_result(
-            labeled_image_path=local_image,
-            parsed_content_json_path=local_json,
-            parsed_content_json_url=json_url.strip(),   # ← the Cloudinary URL
-        )
-        session.user_log_storage.append(
-            f"✅ Parsed result inserted (step {result['step']}) — "
-            f"json_url: {result['new_json_url']}"
-        )
-        for p in session.get_state().get("page_history", []):
-            if p and p not in session.user_page_storage:
-                session.user_page_storage.append(p)
-    except Exception as exc:
-        session.user_log_storage.append(f"❌ insert_parsed_result error: {exc}")
-
-    return "\n".join(session.user_log_storage), session.user_page_storage, gr.update(visible=False)
-
-
-def skip_cloud_urls():
-    session.user_log_storage.append(
-        "⏭️  Cloud URL step skipped — no parsed result for this screenshot."
-    )
-    return "\n".join(session.user_log_storage), session.user_page_storage, gr.update(visible=False)
+    return log_text, session.user_page_storage
 
 
 def stop_and_save():
@@ -286,6 +199,11 @@ def build_ui() -> gr.Blocks:
             devices_box  = gr.Textbox(label="Connected devices", interactive=False)
             refresh_btn  = gr.Button("🔄 Refresh devices")
             device_radio = gr.Radio(label="Select ADB device", choices=[])
+            app_name_input = gr.Textbox(
+                label="App name",
+                placeholder="e.g. YouTube, Settings, com.example.app",
+                info="Name of the app being explored. Used in page descriptions and screenshot paths.",
+            )
             task_input   = gr.Textbox(
                 label="Task description",
                 placeholder="e.g. Log in and navigate to Settings",
@@ -295,53 +213,39 @@ def build_ui() -> gr.Blocks:
 
             refresh_btn.click(refresh_devices, outputs=[device_radio, devices_box], queue=False)
             demo.load(refresh_devices, outputs=[device_radio, devices_box], queue=False)
-            init_btn.click(initialize_device, inputs=[device_radio, task_input], outputs=[init_status], queue=False)
+            init_btn.click(
+                initialize_device,
+                inputs=[device_radio, task_input, app_name_input],
+                outputs=[init_status],
+                queue=False,
+            )
 
         # ── Tab 2 : Exploration ───────────────────────────────────────────────
         with gr.Tab("② Exploration"):
             gr.Markdown(
                 "### Workflow per step\n"
-                "1. Perform an action → screenshot is saved automatically.\n"
-                "2. The cloud-URL panel appears automatically.\n"
-                "3. Paste your **Cloudinary** (or other CDN) URLs and click **Submit**.\n"
-                "4. The files are downloaded locally.  The JSON URL is stored in the session "
-                "   as `source_json` for portability.\n"
-                "5. Click **Skip** to continue without parsing (LEADS_TO edge will be skipped)."
+                "1. Click **Start session** to take the initial screenshot.\n"
+                "2. The screenshot is automatically parsed with **OmniParser**.\n"
+                "3. Select an action (tap, swipe, text, etc.) and click **Perform action**.\n"
+                "4. Repeat steps 1–3 until task is complete.\n"
+                "5. Click **Stop & save to JSON** to finalize the exploration."
             )
 
             start_btn    = gr.Button("▶ Start session (take initial screenshot)")
             action_radio = gr.Radio(
-                ["tap", "text", "long_press", "swipe", "back", "wait"], label="Action"
+                ["tap", "text", "long_press", "swipe", "back"], label="Action"
             )
-            element_num = gr.Number(label="Element ID (from parsed JSON)", precision=0, visible=False)
+            element_num = gr.Number(
+                label="Element ID",
+                info="Required for tap / long_press / swipe. Optional for text and back (marks the icon in the graph).",
+                precision=0, visible=False,
+            )
             text_in     = gr.Textbox(label="Text input", visible=False)
             swipe_dir   = gr.Radio(["up", "down", "left", "right"], label="Swipe direction", visible=False)
             perform_btn = gr.Button("⚡ Perform action")
             stop_btn    = gr.Button("🛑 Stop & save to JSON")
             logs_box    = gr.TextArea(label="Step log", interactive=False, lines=10)
             gallery     = gr.Gallery(label="Labeled screenshots", height=500)
-
-            # ── Cloud URL popup ───────────────────────────────────────────────
-            with gr.Group(visible=False) as cloud_url_panel:
-                gr.Markdown(
-                    "### ☁️ Provide Cloud URLs for Parsed Result\n"
-                    "Paste the **Cloudinary** (or S3 / GCS) pre-signed URLs for the "
-                    "two files produced by your parsing tool.\n\n"
-                    "The JSON URL will be stored as `source_json` in `history_steps` "
-                    "so the state file is portable.  The files are also downloaded "
-                    "locally for immediate coordinate lookups."
-                )
-                cloud_image_url = gr.Textbox(
-                    label="Labeled image URL (.png)",
-                    placeholder="https://res.cloudinary.com/.../labeled_step_N.png",
-                )
-                cloud_json_url = gr.Textbox(
-                    label="Elements JSON URL (.json)",
-                    placeholder="https://res.cloudinary.com/.../elements_step_N.json",
-                )
-                with gr.Row():
-                    submit_urls_btn = gr.Button("✅ Submit", variant="primary")
-                    skip_urls_btn   = gr.Button("⏭️ Skip")
 
             action_radio.change(
                 _action_visibility,
@@ -351,24 +255,13 @@ def build_ui() -> gr.Blocks:
             )
             start_btn.click(
                 start_session,
-                outputs=[logs_box, gallery, cloud_url_panel],
+                outputs=[logs_box, gallery],
                 queue=False,
             )
             perform_btn.click(
                 perform_action,
                 inputs=[action_radio, element_num, text_in, swipe_dir],
-                outputs=[logs_box, gallery, cloud_url_panel],
-                queue=False,
-            )
-            submit_urls_btn.click(
-                submit_cloud_urls,
-                inputs=[cloud_image_url, cloud_json_url],
-                outputs=[logs_box, gallery, cloud_url_panel],
-                queue=False,
-            )
-            skip_urls_btn.click(
-                skip_cloud_urls,
-                outputs=[logs_box, gallery, cloud_url_panel],
+                outputs=[logs_box, gallery],
                 queue=False,
             )
             stop_btn.click(stop_and_save, outputs=[logs_box], queue=False)
@@ -386,5 +279,47 @@ def build_ui() -> gr.Blocks:
             store_btn    = gr.Button("🚀 Store to databases")
             store_status = gr.Textbox(label="Result", interactive=False)
             store_btn.click(store_to_db, inputs=[json_path_in], outputs=[store_status], queue=False)
+            
+        # ── Tab 4 : Chain Processing ──────────────────────────────────────────
+        with gr.Tab("④ Chain Processing"):
+            gr.Markdown(
+                "Run understanding and evolution on a stored chain.\n"
+                "Requires the chain's data to already be in Neo4j (use Tab ③ first)."
+            )
+            start_page_id_input = gr.Textbox(
+                label="Start Page ID",
+                placeholder="page_abc123"
+            )
+            with gr.Row():
+                understand_btn = gr.Button("🧠 Run chain_understand")
+                evolve_btn     = gr.Button("🚀 Run chain_evolve")
+            chain_status_box = gr.Textbox(label="Result", interactive=False, lines=5)
+
+            def run_chain_understand(page_id):
+                import asyncio
+                from chain_understand import process_and_update_chain
+                if not page_id.strip():
+                    return "Error: provide a start_page_id."
+                try:
+                    triplets = asyncio.run(process_and_update_chain(page_id.strip()))
+                    return f"✅ chain_understand complete. Triplets processed: {len(triplets)}"
+                except Exception as e:
+                    return f"❌ Error: {e}"
+
+            def run_chain_evolve(page_id):
+                import asyncio
+                from chain_evolve import evolve_chain_to_action
+                if not page_id.strip():
+                    return "Error: provide a start_page_id."
+                try:
+                    action_id = asyncio.run(evolve_chain_to_action(page_id.strip()))
+                    if action_id:
+                        return f"✅ chain_evolve complete. Action node ID: {action_id}"
+                    return "⚠️ Chain evaluated as non-templateable — no node created."
+                except Exception as e:
+                    return f"❌ Error: {e}"
+
+            understand_btn.click(run_chain_understand, inputs=[start_page_id_input], outputs=[chain_status_box])
+            evolve_btn.click(run_chain_evolve, inputs=[start_page_id_input], outputs=[chain_status_box])
 
     return demo

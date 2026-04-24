@@ -33,3 +33,7 @@ npm-debug.log*
 # Misc
 .cache/
 *.tmp
+
+
+# Firebase service account key (sensitive)
+OmniParser/omniparser-queue-firebase-adminsdk-fbsvc-f46bd6f7ca.json

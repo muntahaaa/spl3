@@ -102,13 +102,16 @@ page_uuid_3     ...          ./screenshots/step2.png  1700000010   {"step": 2}
 ```cypher
 MATCH (p:Page)
 OPTIONAL MATCH (p)-[:HAS_ELEMENT]->(e:Element)
+WITH 
+  p, 
+  COUNT(e) AS ElementCount, 
+  COLLECT(e.element_id) AS ElementIds
 RETURN 
-  p.page_id as PageId,
-  p.timestamp as Timestamp,         
-  p.description as PageDescription,
-  COUNT(e) as ElementCount,
-  COLLECT(e.element_id) as ElementIds
-ORDER BY Timestamp ASC;              
+  p.page_id AS PageId,
+  p.description AS PageDescription,
+  ElementCount,
+  ElementIds
+ORDER BY p.timestamp ASC;              
 ```
 
 **Expected**:

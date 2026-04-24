@@ -32,3 +32,6 @@ Feature_URI = os.getenv("FEATURE_URI", "http://localhost:8001")
 # ── Screenshot storage ────────────────────────
 SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "./log/screenshots")
 JSON_STATE_DIR = os.getenv("JSON_STATE_DIR", "./log/json_state")
+
+GEMINI_API_KEY =  os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "")

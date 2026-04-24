@@ -85,7 +85,8 @@ class DeploymentState(TypedDict):
 
     # Callback
     callback: Optional[Callable[[Dict[str, Any]], None]]  # Callback function
-
+    chain_job_id: Optional[str] = None      # last triggered chain job
+    chain_status: Optional[str] = None      # "pending" | "running" | "done" | "error"
 
 def create_deployment_state(
     task: str,

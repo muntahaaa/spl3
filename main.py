@@ -18,6 +18,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from api.chain_routes import router as chain_router
 
 # Some Windows environments carry stale SSL_CERT_FILE/SSL_CERT_DIR values.
 # If they point to missing paths, httpx/gradio import can fail immediately.
@@ -31,7 +32,7 @@ if ssl_cert_dir and not Path(ssl_cert_dir).is_dir():
 
 import gradio as gr
 
-from api_routes import router as api_router
+from api.api_routes import router as api_router
 from ui import build_ui
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -53,6 +54,7 @@ app.add_middleware(
 
 # ── API routes ────────────────────────────────────────────────────────────────
 app.include_router(api_router, prefix="/api")
+app.include_router(chain_router, prefix="/api")
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 gradio_app = build_ui()

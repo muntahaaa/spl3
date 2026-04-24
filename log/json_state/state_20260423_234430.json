@@ -1,0 +1,206 @@
+{
+    "tsk": "Create a contact",
+    "app_name": "Contacts",
+    "step": 11,
+    "history_steps": [
+        {
+            "step": 0,
+            "recommended_action": "Executing swipe with params {'element_number': 4, 'text_input': '', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "swipe",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 669,
+                    "y": 1735
+                },
+                "status": "success",
+                "swipe": {
+                    "start": [
+                        669,
+                        1735
+                    ],
+                    "end": [
+                        669,
+                        1255
+                    ],
+                    "duration": 400,
+                    "direction": "up"
+                }
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step1_20260423_233321.png",
+            "source_json": "labeled_image/json_labeled_data/29925136-0884-4220-a60e-e15bc87e0e8b.json",
+            "timestamp": "2026-04-23T23:34:27.057546"
+        },
+        {
+            "step": 1,
+            "recommended_action": "Executing tap with params {'element_number': 11, 'text_input': '', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "tap",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 535,
+                    "y": 153
+                },
+                "status": "success"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step1_20260423_233427.png",
+            "source_json": "labeled_image/json_labeled_data/ffc87ec7-c069-4efc-92b1-a7b40e9fb20f.json",
+            "timestamp": "2026-04-23T23:35:09.763311"
+        },
+        {
+            "step": 2,
+            "recommended_action": "Executing text with params {'element_number': 4, 'text_input': 'Contacts', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "text",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 95,
+                    "y": 2184
+                },
+                "status": "success",
+                "input_str": "Contacts"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step2_20260423_233509.png",
+            "source_json": "labeled_image/json_labeled_data/a8135885-457d-4a88-a3ac-58654a017afa.json",
+            "timestamp": "2026-04-23T23:36:40.043360"
+        },
+        {
+            "step": 3,
+            "recommended_action": "Executing tap with params {'element_number': 16, 'text_input': 'Contacts', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "tap",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 167,
+                    "y": 477
+                },
+                "status": "success"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step3_20260423_233640.png",
+            "source_json": "labeled_image/json_labeled_data/bce1eee3-7938-472d-a60b-4c068dfee9d3.json",
+            "timestamp": "2026-04-23T23:37:37.402425"
+        },
+        {
+            "step": 4,
+            "recommended_action": "Executing tap with params {'element_number': 10, 'text_input': 'Contacts', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "tap",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 796,
+                    "y": 848
+                },
+                "status": "success"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step4_20260423_233737.png",
+            "source_json": "labeled_image/json_labeled_data/011e3931-a304-46a7-b590-d69d10c3f862.json",
+            "timestamp": "2026-04-23T23:38:23.667539"
+        },
+        {
+            "step": 5,
+            "recommended_action": "Executing text with params {'element_number': 4, 'text_input': 'Muntaha', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "text",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 531,
+                    "y": 596
+                },
+                "status": "success",
+                "input_str": "Muntaha"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step5_20260423_233823.png",
+            "source_json": "labeled_image/json_labeled_data/490a4074-9549-4d7b-996d-57838e124e19.json",
+            "timestamp": "2026-04-23T23:39:04.598327"
+        },
+        {
+            "step": 6,
+            "recommended_action": "Executing text with params {'element_number': 2, 'text_input': '0123456789465', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "text",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 536,
+                    "y": 777
+                },
+                "status": "success",
+                "input_str": "0123456789465"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step6_20260423_233904.png",
+            "source_json": "labeled_image/json_labeled_data/0556787e-3de5-4fde-bbdf-c609d15e8f5c.json",
+            "timestamp": "2026-04-23T23:39:47.482579"
+        },
+        {
+            "step": 7,
+            "recommended_action": "Executing text with params {'element_number': 2, 'text_input': '0123456789465', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "text",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 545,
+                    "y": 776
+                },
+                "status": "success",
+                "input_str": "0123456789465"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step7_20260423_233947.png",
+            "source_json": "labeled_image/json_labeled_data/c0666210-d2fe-4683-b8cc-a80dd112c168.json",
+            "timestamp": "2026-04-23T23:40:49.403178"
+        },
+        {
+            "step": 8,
+            "recommended_action": "Executing text with params {'element_number': 4, 'text_input': '0123456789465', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "text",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 541,
+                    "y": 838
+                },
+                "status": "success",
+                "input_str": "0123456789465"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step8_20260423_234049.png",
+            "source_json": "labeled_image/json_labeled_data/73781790-f55d-46dc-a05d-fc91093cb9a1.json",
+            "timestamp": "2026-04-23T23:41:33.545019"
+        },
+        {
+            "step": 9,
+            "recommended_action": "Executing text with params {'element_number': 3, 'text_input': '01234', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "text",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 539,
+                    "y": 1018
+                },
+                "status": "success",
+                "input_str": "01234"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step9_20260423_234133.png",
+            "source_json": "labeled_image/json_labeled_data/3c71bbe7-512e-4ffc-9f9e-457dcdd7bc64.json",
+            "timestamp": "2026-04-23T23:42:33.887071"
+        },
+        {
+            "step": 10,
+            "recommended_action": "Executing tap with params {'element_number': 3, 'text_input': '01234', 'swipe_direction': 'up'}",
+            "tool_result": {
+                "action": "tap",
+                "device": "RF8R916K9MR",
+                "clicked_element": {
+                    "x": 779,
+                    "y": 1337
+                },
+                "status": "success"
+            },
+            "source_page": "log/screenshots/Contacts/Contacts_step10_20260423_234233.png",
+            "source_json": "labeled_image/json_labeled_data/6829fafd-a715-477f-b3e0-b76953ec4713.json",
+            "timestamp": "2026-04-23T23:44:15.133506"
+        }
+    ],
+    "final_page": {
+        "screenshot": "./log/screenshots\\Contacts\\Contacts_step11_20260423_234415.png",
+        "page_json": "D:\\4th year\\spl3\\labeled_image\\json_labeled_data\\bec373e3-cd61-431f-81bb-bbdb782d2d35.json",
+        "timestamp": 1776966270
+    }
+}
