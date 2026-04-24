@@ -35,3 +35,14 @@ JSON_STATE_DIR = os.getenv("JSON_STATE_DIR", "./log/json_state")
 
 GEMINI_API_KEY =  os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "")
+
+# ── LangChain tracing ────────────────────────
+LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
+LANGCHAIN_ENDPOINT = os.getenv("LANGCHAIN_ENDPOINT", "")
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY", "")
+LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "")
+
+# ── LLM settings (OpenAI-compatible endpoint) ─
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-1.5-pro")

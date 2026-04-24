@@ -27,3 +27,5 @@ python-multipart==0.0.9
 
 firebase-admin==6.5.0
 pyautogui==0.9.54
+
+langchain-google-genai

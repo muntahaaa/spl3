@@ -21,6 +21,9 @@ def _ensure_firebase_initialized():
     global _firebase_initialized
     if _firebase_initialized:
         return
+    if firebase_admin._apps:
+        _firebase_initialized = True
+        return
     
     try:
         cred_path = Path(__file__).resolve().parent / "omniparser-queue-firebase-adminsdk-fbsvc-f46bd6f7ca.json"

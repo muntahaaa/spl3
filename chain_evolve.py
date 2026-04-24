@@ -5,25 +5,26 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field, SecretStr
 import config
 from data.graph_db import Neo4jDatabase
 
+for proxy_var in ("OPENAI_PROXY", "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+    os.environ.pop(proxy_var, None)
+
+
+
 # Configure environment variables
-os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
+os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "ChainEvolve"
 
 # Initialize LLM model
-model = ChatOpenAI(
-    openai_api_base=config.LLM_BASE_URL,
-    openai_api_key=SecretStr(config.LLM_API_KEY),
-    model_name=config.LLM_MODEL,
-    request_timeout=config.LLM_REQUEST_TIMEOUT,
-    max_retries=config.LLM_MAX_RETRIES,
-    max_tokens=2000,
+model = ChatGoogleGenerativeAI(
+    model=config.LLM_MODEL,
+    google_api_key=config.LLM_API_KEY,
 )
 
 # Initialize database connection

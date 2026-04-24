@@ -3,25 +3,26 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from pydantic import BaseModel, Field, SecretStr
+from dotenv import load_dotenv
 import json
 import os
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from data.graph_db import Neo4jDatabase
 import config
 
-os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
+load_dotenv()
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
-os.environ["LANGCHAIN_PROJECT"] = "LearnTriplet"  # Keep specific project name
+os.environ["LANGCHAIN_PROJECT"] = "ChainEvolve"  # Keep specific project name
 
-model = ChatOpenAI(
-    openai_api_base=config.LLM_BASE_URL,
-    openai_api_key=SecretStr(config.LLM_API_KEY),
-    model_name=config.LLM_MODEL,
-    request_timeout=config.LLM_REQUEST_TIMEOUT,
-    max_retries=config.LLM_MAX_RETRIES,
-    max_tokens=config.LLM_MAX_TOKEN,
+assert config.LLM_API_KEY, "LLM_API_KEY is not set in config!"
+model = ChatGoogleGenerativeAI(
+    model=config.LLM_MODEL,
+    google_api_key=config.LLM_API_KEY,
 )
+
 
 URI = config.Neo4j_URI
 AUTH = config.Neo4j_AUTH

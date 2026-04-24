@@ -1,21 +1,25 @@
-# Human Explorer
+# Android App Task Explorer
 
-A 3-step pipeline for recording, parsing, and storing human UI-exploration
-sessions on Android devices.
+An end-to-end pipeline for recording, parsing, storing, and reasoning over
+human UI-exploration sessions on Android devices.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  STEP 1  –  Human Exploration  (Gradio UI + ADB)             │
+│  STEP 1  –  Exploration (Gradio UI + ADB + OmniParser)       │
 │  • Initialise device & task                                   │
-│  • Perform actions  →  screenshot saved automatically         │
-│  • Insert parsed result via  POST /api/insert_parsed_result   │
-│  • Repeat until task complete                                 │
+│  • Perform actions → screenshot saved automatically           │
+│  • OmniParser runs automatically per screenshot               │
+│  • Labeled image + elements JSON saved locally                │
 ├──────────────────────────────────────────────────────────────┤
 │  STEP 2  –  Save State  (Gradio "Stop & save" button)         │
 │  • Serialises State → ./log/json_state/state_<ts>.json        │
 ├──────────────────────────────────────────────────────────────┤
 │  STEP 3  –  Push to Databases  (Gradio "Store to DB" tab)     │
-│  • Reads JSON  →  Neo4j (graph) + Pinecone (vectors)          │
+│  • Reads JSON → Neo4j (graph) + Pinecone (vectors)            │
+├──────────────────────────────────────────────────────────────┤
+│  STEP 4  –  Chain Processing  (Gradio tab)                    │
+│  • chain_understand: triplet reasoning + description updates  │
+│  • chain_evolve: optional high-level action synthesis         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -24,24 +28,36 @@ sessions on Android devices.
 ## Project structure
 
 ```
-human_explorer/
-├── main.py              ← entry point (FastAPI + Gradio)
-├── config.py            ← DB credentials, paths
-├── state_manager.py     ← thread-safe shared session state
-├── api_routes.py        ← REST endpoints
-├── ui.py                ← Gradio layout
-├── explor_human.py      ← ADB action + screenshot logic  (Step 1)
+spl3/
+├── main.py                ← entry point (FastAPI + Gradio)
+├── config.py              ← DB credentials, paths
+├── state_manager.py       ← thread-safe shared session state
+├── ui.py                  ← Gradio layout
+├── api/
+│   ├── api_routes.py      ← REST endpoints
+│   └── chain_routes.py    ← chain job endpoints
+├── chain/
+│   ├── chain_models.py    ← job response models
+│   ├── chain_service.py   ← async chain workers
+│   └── task_store.py      ← in-memory job store
+├── OmniParser/
+│   └── client.py          ← Firebase queue client (auto-parse)
+├── explor_human.py        ← ADB action + screenshot logic
+├── explore_auto.py        ← automated exploration
 ├── data/
-│   ├── State.py         ← TypedDict definition
-│   ├── data_storage.py  ← state2json + json2db  (Steps 2 & 3)
-│   ├── graph_db.py      ← Neo4j adapter
-│   └── vector_db.py     ← Pinecone adapter
+│   ├── State.py           ← TypedDict definition
+│   ├── data_storage.py    ← state2json + json2db
+│   ├── graph_db.py        ← Neo4j adapter
+│   └── vector_db.py       ← Pinecone adapter
 ├── tool/
-│   ├── adb_tools.py     ← ADB wrappers (no parsing tool)
-│   └── img_tool.py      ← element crop + feature-extraction client
+│   ├── adb_tools.py       ← ADB wrappers
+│   └── img_tool.py        ← element crop + feature-extraction client
 ├── log/
-│   ├── screenshots/     ← raw + labeled PNGs
-│   └── json_state/      ← serialised session JSON files
+│   ├── screenshots/       ← raw screenshots
+│   └── json_state/        ← serialised session JSON files
+├── labeled_image/
+│   ├── img/               ← OmniParser labeled PNGs
+│   └── json_labeled_data/ ← OmniParser elements JSON
 └── requirements.txt
 ```
 
@@ -100,7 +116,7 @@ This starts **one** Uvicorn server on port **7860** that serves both:
 
 ## Step-by-step usage
 
-### STEP 1 – Human exploration
+### STEP 1 – Exploration (OmniParser auto-parse)
 
 **In the Gradio UI:**
 
@@ -109,57 +125,20 @@ This starts **one** Uvicorn server on port **7860** that serves both:
    - Click **Refresh devices** → select your device
    - Enter a task description → click **Initialize**
 3. Go to **② Exploration** tab
-   - Click **▶ Start session** — the first screenshot is taken and saved
-   - Check the log for the screenshot path
-
-**After each screenshot (including the initial one):**
-
-4. Run your own parsing tool on the screenshot PNG
-5. Call the API to insert the parsed result (see below)
-6. Now choose an action in the UI and click **⚡ Perform action**
-7. Repeat steps 4–6 for every subsequent screenshot
+  - Click **▶ Start session** — the first screenshot is taken and sent to OmniParser
+  - The labeled image + elements JSON are saved automatically
+4. Choose an action and click **⚡ Perform action**
+  - A new screenshot is captured and automatically parsed again
+5. Repeat until the task is complete
 
 ---
 
-### Inserting a parsed result (API)
+### OmniParser outputs
 
-After your parsing tool produces two files, POST them to the API:
+Each screenshot is parsed automatically. Outputs are stored in:
 
-**Endpoint:**  `POST http://localhost:7860/api/insert_parsed_result`
-
-**Request body (JSON):**
-
-```json
-{
-  "labeled_image_path": "./log/screenshots/human_exploration/processed/labeled_human_exploration_step_1_20240101_120000.png",
-  "parsed_content_json_path": "./log/screenshots/human_exploration/processed/human_exploration_step_1_20240101_120000.json"
-}
-```
-
-**curl example:**
-
-```bash
-curl -X POST http://localhost:7860/api/insert_parsed_result \
-     -H "Content-Type: application/json" \
-     -d '{
-       "labeled_image_path": "./log/screenshots/human_exploration/processed/labeled_human_exploration_step_1_20240101_120000.png",
-       "parsed_content_json_path": "./log/screenshots/human_exploration/processed/human_exploration_step_1_20240101_120000.json"
-     }'
-```
-
-**Python example:**
-
-```python
-import requests
-
-requests.post(
-    "http://localhost:7860/api/insert_parsed_result",
-    json={
-        "labeled_image_path": "./log/screenshots/human_exploration/processed/labeled_human_exploration_step_1_20240101_120000.png",
-        "parsed_content_json_path": "./log/screenshots/human_exploration/processed/human_exploration_step_1_20240101_120000.json",
-    },
-)
-```
+- Labeled images: `./labeled_image/img/<task_id>.png`
+- Elements JSON: `./labeled_image/json_labeled_data/<task_id>.json`
 
 ---
 
@@ -224,8 +203,8 @@ Response:
 }
 ```
 
-`parsed_result_ready: false` means you must POST the parsed result before
-performing an element-based action.
+`parsed_result_ready: false` means a parsed result is missing for the last
+captured screenshot.
 
 ---
 
@@ -247,7 +226,17 @@ In the Gradio **③ Store to Neo4j + Pinecone** tab:
 This reads the JSON and creates:
 - **Neo4j nodes:**  `Page`  and  `Element`
 - **Neo4j relationships:**  `(Page)-[:HAS_ELEMENT]->(Element)`  and  `(Element)-[:LEADS_TO]->(Page)`
-- **Pinecone vectors:**  one ResNet50 embedding per tapped element
+- **Pinecone vectors:**  ResNet50 embeddings for pages and elements
+
+### STEP 4 – Chain processing (background jobs)
+
+In the **④ Chain Processing** tab:
+
+1. Provide the start page ID from Neo4j
+2. Click **🧠 Start chain_understand** or **🚀 Start chain_evolve**
+3. Copy the **Job ID** and click **🔄 Poll status** to track progress
+
+Jobs are tracked in an in-memory store and return status + results when done.
 
 ---
 
@@ -256,8 +245,8 @@ This reads the JSON and creates:
 | Problem | Fix |
 |---|---|
 | `No devices found` | Check USB cable, enable USB debugging, run `adb devices` in terminal |
-| `RuntimeError: No active session` | Call **Initialize** in the UI before inserting parsed results |
-| `JSON file not found` | The path in `parsed_content_json_path` must be accessible from the machine running the server |
+| `RuntimeError: No active session` | Call **Initialize** in the UI before starting exploration |
+| `JSON file not found` | Ensure the OmniParser output JSON exists under `./labeled_image/json_labeled_data/` |
 | Neo4j connection error | Ensure Neo4j is running and `Neo4j_URI` / `Neo4j_AUTH` in `config.py` are correct |
 | Pinecone error | Check `PINECONE_API_KEY` in `config.py` |
 | Feature service unreachable | Start your ResNet50 service and update `Feature_URI` in `config.py` |
