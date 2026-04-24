@@ -8,7 +8,6 @@ from neo4j.exceptions import ServiceUnavailable
 
 class Neo4jDatabase:
     """Graph-storage adapter for human-exploration traces."""
-    """Graph-storage adapter for human-exploration traces."""
 
     def __init__(self, uri: str, auth: tuple, database: str = "neo4j"):
         self.driver = None
@@ -94,86 +93,13 @@ class Neo4jDatabase:
             record = result.single()
             return str(record["node_id"]) if record else None
 
-    # ── node writes ───────────────────────────────────────────────────────────
-
-    def create_page(self, properties: Dict[str, Any]) -> Optional[str]:
-        """
-        CAUSE-1 FIX: MERGE on page_id, then SET all other properties.
-        Idempotent — re-running with the same page_id updates rather than
-        duplicates.
-        """
-        required_fields = ["page_id"]
-        if not all(f in properties for f in required_fields):
-            raise ValueError(f"Missing required fields: {required_fields}")
-
-        properties = dict(properties)   # don't mutate caller's dict
-        properties.setdefault("timestamp", int(datetime.now().timestamp()))
-
-        if "visual_embedding_id" in properties:
-            properties["visual_embedding_id"] = str(properties["visual_embedding_id"])
-        if "other_info" in properties:
-            if isinstance(properties["other_info"], dict):
-                properties["other_info"] = json.dumps(properties["other_info"])
-            elif not isinstance(properties["other_info"], str):
-                raise ValueError("other_info must be a dict or JSON string")
-
-        # CAUSE-1 FIX: MERGE on business key, SET the rest
-        query = """
-        MERGE (n:Page {page_id: $page_id})
-        SET n += $props
-        RETURN elementId(n) as node_id
-        """
-        with self.driver.session(database=self.database) as session:
-            result = session.run(query,
-                                 page_id=properties["page_id"],
-                                 props=properties)
-            record = result.single()
-            return str(record["node_id"]) if record else None
-
-    def create_element(self, properties: Dict[str, Any]) -> Optional[str]:
-        """
-        CAUSE-1 FIX: MERGE on element_id, then SET all other properties.
-        """
-        required_fields = ["element_id"]
-        if not all(f in properties for f in required_fields):
-            raise ValueError(f"Missing required fields: {required_fields}")
-
-        properties = dict(properties)
-        if "visual_embedding_id" in properties:
-            properties["visual_embedding_id"] = str(properties["visual_embedding_id"])
-        if "other_info" in properties:
-            if isinstance(properties["other_info"], dict):
-                properties["other_info"] = json.dumps(properties["other_info"])
-            elif not isinstance(properties["other_info"], str):
-                raise ValueError("other_info must be a dict or JSON string")
-
-        # CAUSE-1 FIX: MERGE on business key
-        query = """
-        MERGE (n:Element {element_id: $element_id})
-        SET n += $props
-        RETURN elementId(n) as node_id
-        """
-        with self.driver.session(database=self.database) as session:
-            result = session.run(query,
-                                 element_id=properties["element_id"],
-                                 props=properties)
-            record = result.single()
-            return str(record["node_id"]) if record else None
-
     def create_action(self, properties: Dict[str, Any]) -> Optional[str]:
-        """
-        CAUSE-1 FIX: MERGE on action_id, then SET all other properties.
-        """
         """
         CAUSE-1 FIX: MERGE on action_id, then SET all other properties.
         """
         required_fields = ["action_id"]
         if not all(f in properties for f in required_fields):
-        if not all(f in properties for f in required_fields):
             raise ValueError(f"Missing required fields: {required_fields}")
-
-        properties = dict(properties)
-        properties.setdefault("timestamp", int(datetime.now().timestamp()))
 
         properties = dict(properties)
         properties.setdefault("timestamp", int(datetime.now().timestamp()))
@@ -194,26 +120,11 @@ class Neo4jDatabase:
             record = result.single()
             return str(record["node_id"]) if record else None
 
-
-        # CAUSE-1 FIX: MERGE on business key
-        query = """
-        MERGE (n:Action {action_id: $action_id})
-        SET n += $props
-        RETURN elementId(n) as node_id
-        """
-        with self.driver.session(database=self.database) as session:
-            result = session.run(query,
-                                 action_id=properties["action_id"],
-                                 props=properties)
-            record = result.single()
-            return str(record["node_id"]) if record else None
-
     def update_node_property(
         self,
         node_id: str,
         property_name: str,
         property_value: Any,
-        node_type: Optional[str] = None,
         node_type: Optional[str] = None,
     ) -> bool:
         if isinstance(property_value, (dict, list)):
@@ -233,9 +144,6 @@ class Neo4jDatabase:
             WHERE n.page_id = $node_id
                OR n.element_id = $node_id
                OR n.action_id = $node_id
-            WHERE n.page_id = $node_id
-               OR n.element_id = $node_id
-               OR n.action_id = $node_id
             SET n[$property_name] = $property_value
             RETURN n
             """
@@ -251,22 +159,15 @@ class Neo4jDatabase:
                 if not record:
                     print(f"Warning: update_node_property: node {node_id} not found")
                 return record is not None
-                if not record:
-                    print(f"Warning: update_node_property: node {node_id} not found")
-                return record is not None
         except Exception as exc:
             print(f"Error updating node property: {exc}")
             return False
 
     # ── relationships ─────────────────────────────────────────────────────────
 
-    # ── relationships ─────────────────────────────────────────────────────────
-
     def add_element_to_page(self, page_id: str, element_id: str) -> bool:
         """HAS_ELEMENT: Page → Element. Already uses MERGE — no change needed."""
-        """HAS_ELEMENT: Page → Element. Already uses MERGE — no change needed."""
         query = """
-        MATCH (p:Page    {page_id:    $page_id})
         MATCH (p:Page    {page_id:    $page_id})
         MATCH (e:Element {element_id: $element_id})
         MERGE (p)-[r:HAS_ELEMENT]->(e)
@@ -279,11 +180,7 @@ class Neo4jDatabase:
                 if not record:
                     print(f"Warning: HAS_ELEMENT failed: page={page_id} elem={element_id}")
                 return record is not None
-                if not record:
-                    print(f"Warning: HAS_ELEMENT failed: page={page_id} elem={element_id}")
-                return record is not None
         except Exception as exc:
-            print(f"Error creating HAS_ELEMENT: {exc}")
             print(f"Error creating HAS_ELEMENT: {exc}")
             return False
 
@@ -308,94 +205,14 @@ class Neo4jDatabase:
             action_params = json.dumps(action_params)
 
         # CAUSE-3 FIX: split MERGE key from SET properties
-        """
-        CAUSE-3 FIX for COMPOSED_OF:
-        MERGE on the stable structural key (action_id, element_id, order).
-        SET the mutable properties (atomic_action, action_params) separately
-        so re-runs update rather than duplicate.
-
-        ORIGINAL used all five fields as the MERGE key, meaning any change to
-        action_params (which can contain a timestamp) created a new edge.
-        """
-        if action_params:
-            action_params = json.dumps(action_params)
-
-        # CAUSE-3 FIX: split MERGE key from SET properties
         query = """
-        MATCH (a:Action  {action_id:  $action_id})
         MATCH (a:Action  {action_id:  $action_id})
         MATCH (e:Element {element_id: $element_id})
         MERGE (a)-[r:COMPOSED_OF {order: $order}]->(e)
         SET r.atomic_action = $atomic_action,
             r.action_params  = $action_params
-        MERGE (a)-[r:COMPOSED_OF {order: $order}]->(e)
-        SET r.atomic_action = $atomic_action,
-            r.action_params  = $action_params
         RETURN type(r) as rel_type
         """
-        try:
-            with self.driver.session(database=self.database) as session:
-                result = session.run(
-                    query,
-                    action_id=action_id,
-                    element_id=element_id,
-                    order=order,
-                    atomic_action=atomic_action,
-                    action_params=action_params or "",
-                )
-                return result.single() is not None
-        except Exception as exc:
-            print(f"Error creating COMPOSED_OF: {exc}")
-            return False
-
-    def add_element_leads_to(
-        self,
-        element_id: str,
-        target_id: str,
-        action_name: str,
-        action_params: Optional[Dict[str, Any]] = None,
-        confidence_score: float = 0.0,
-    ) -> bool:
-        """
-        CAUSE-3 FIX for LEADS_TO:
-        MERGE on the stable key (element_id → page_id + action_name).
-        SET action_params and confidence_score separately.
-
-        ORIGINAL included action_params (which embeds a timestamp) in the MERGE
-        key, so every call created a fresh edge instead of updating the existing
-        one — producing multiple LEADS_TO edges between the same pair.
-        """
-        if action_params:
-            action_params = json.dumps(action_params)
-
-        # CAUSE-3 FIX: only stable fields in MERGE key
-        query = """
-        MATCH (e:Element {element_id: $element_id})
-        MATCH (t:Page    {page_id:    $target_id})
-        MERGE (e)-[r:LEADS_TO {action_name: $action_name}]->(t)
-        SET r.action_params    = $action_params,
-            r.confidence_score = $confidence_score
-        RETURN type(r) as rel_type
-        """
-        try:
-            with self.driver.session(database=self.database) as session:
-                result = session.run(
-                    query,
-                    element_id=element_id,
-                    target_id=target_id,
-                    action_name=action_name,
-                    action_params=action_params or "",
-                    confidence_score=confidence_score,
-                )
-                record = result.single()
-                if not record:
-                    print(f"Warning: LEADS_TO failed: elem={element_id} page={target_id}")
-                return record is not None
-        except Exception as exc:
-            print(f"Error creating LEADS_TO: {exc}")
-            return False
-
-    # ── read helpers ──────────────────────────────────────────────────────────
         try:
             with self.driver.session(database=self.database) as session:
                 result = session.run(
@@ -475,10 +292,6 @@ class Neo4jDatabase:
                         element["possible_actions"] = json.loads(element["possible_actions"])
                     except (json.JSONDecodeError, TypeError):
                         pass
-                    try:
-                        element["possible_actions"] = json.loads(element["possible_actions"])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
                 elements.append(element)
             return elements
 
@@ -486,9 +299,7 @@ class Neo4jDatabase:
         query = """
         MATCH (a:Action {action_id: $action_id})-[r:COMPOSED_OF]->(e:Element)
         RETURN e.element_id  as element_id,
-        RETURN e.element_id  as element_id,
                e.element_type as element_type,
-               r.order         as order,
                r.order         as order,
                r.atomic_action as atomic_action,
                r.action_params as action_params
@@ -499,9 +310,6 @@ class Neo4jDatabase:
             sequences = []
             for record in result:
                 record_dict = {
-                    "element_id":    record["element_id"],
-                    "element_type":  record["element_type"],
-                    "order":         record["order"],
                     "element_id":    record["element_id"],
                     "element_type":  record["element_type"],
                     "order":         record["order"],
@@ -521,21 +329,11 @@ class Neo4jDatabase:
     #  Element-less action navigation  (swipe / back / wait)
     # ─────────────────────────────────────────────────────────────────────────
     def add_page_navigated_by(
-        
-        
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Element-less action navigation  (swipe / back / wait)
-    # ─────────────────────────────────────────────────────────────────────────
-    def add_page_navigated_by(
         self,
         source_page_id: str,
         target_page_id: str,
         action_type: str,
-        source_page_id: str,
-        target_page_id: str,
-        action_type: str,
         action_params: Optional[Dict[str, Any]] = None,
-        confidence_score: float = 1.0,
         confidence_score: float = 1.0,
     ) -> bool:
         """
@@ -563,37 +361,7 @@ class Neo4jDatabase:
         if action_params:
             action_params = json.dumps(action_params)
  
-        """
-        Write a direct Page -[:NAVIGATED_BY]-> Page edge for actions that have
-        no target element (swipe, back, wait).
- 
-        WHY THIS IS NEEDED
-        ──────────────────
-        For tap/text/long_press a LEADS_TO edge is written from the interacted
-        Element to the next Page.  The chain traversal follows:
-            Page -[:HAS_ELEMENT]-> Element -[:LEADS_TO]-> Page
- 
-        swipe, back, and wait produce no Element node, so no element links the
-        two Pages.  Without a direct Page->Page edge the chain breaks at every
-        element-less step:
-          - get_chain_start_nodes() misidentifies the page AFTER the gap as a
-            start node (it has HAS_ELEMENT edges but no incoming LEADS_TO).
-          - get_chain_from_start() stops traversing at the page BEFORE the gap
-            because none of its elements has a LEADS_TO edge onward.
- 
-        NAVIGATED_BY fills that gap directly at the Page level.  Both chain
-        queries are updated to include it as a valid traversal hop.
-        Merged on (source_page_id, target_page_id, action_type) — idempotent.
-        """
-        if action_params:
-            action_params = json.dumps(action_params)
- 
         query = """
-        MATCH (src:Page {page_id: $source_page_id})
-        MATCH (tgt:Page {page_id: $target_page_id})
-        MERGE (src)-[r:NAVIGATED_BY {action_type: $action_type}]->(tgt)
-        SET r.action_params    = $action_params,
-            r.confidence_score = $confidence_score
         MATCH (src:Page {page_id: $source_page_id})
         MATCH (tgt:Page {page_id: $target_page_id})
         MERGE (src)-[r:NAVIGATED_BY {action_type: $action_type}]->(tgt)
@@ -608,9 +376,6 @@ class Neo4jDatabase:
                     source_page_id=source_page_id,
                     target_page_id=target_page_id,
                     action_type=action_type,
-                    source_page_id=source_page_id,
-                    target_page_id=target_page_id,
-                    action_type=action_type,
                     action_params=action_params or "",
                     confidence_score=confidence_score,
                 )
@@ -619,19 +384,9 @@ class Neo4jDatabase:
                     print(f"Warning: NAVIGATED_BY failed: "
                           f"src={source_page_id} tgt={target_page_id}")
                 return record is not None
-                if not record:
-                    print(f"Warning: NAVIGATED_BY failed: "
-                          f"src={source_page_id} tgt={target_page_id}")
-                return record is not None
         except Exception as exc:
             print(f"Error creating NAVIGATED_BY: {exc}")
-            print(f"Error creating NAVIGATED_BY: {exc}")
             return False
- 
-
-    # ─────────────────────────────────────────────────────────────────────────
-    #  get_chain_start_nodes  (handles element-less action gaps)
-    # ─────────────────────────────────────────────────────────────────────────
  
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -649,22 +404,8 @@ class Neo4jDatabase:
         Without condition 2, a page reached by swipe/back has no incoming
         LEADS_TO and was incorrectly identified as a start page.
         """
-        """
-        Returns genuine start pages only.
- 
-        A start page satisfies ALL of:
-          1. No incoming LEADS_TO edge     (no element navigated TO it)
-          2. No incoming NAVIGATED_BY edge (no element-less action TO it)
-          3. Has at least one HAS_ELEMENT  (it is a real parsed page)
- 
-        Without condition 2, a page reached by swipe/back has no incoming
-        LEADS_TO and was incorrectly identified as a start page.
-        """
         query = """
         MATCH (n:Page)
-        WHERE NOT EXISTS { ()-[:LEADS_TO]->(n) }
-          AND NOT EXISTS { ()-[:NAVIGATED_BY]->(n) }
-          AND EXISTS     { (n)-[:HAS_ELEMENT]->() }
         WHERE NOT EXISTS { ()-[:LEADS_TO]->(n) }
           AND NOT EXISTS { ()-[:NAVIGATED_BY]->(n) }
           AND EXISTS     { (n)-[:HAS_ELEMENT]->() }
@@ -673,7 +414,6 @@ class Neo4jDatabase:
         try:
             with self.driver.session(database=self.database) as session:
                 result = session.run(query)
-                return [dict(record["n"]) for record in result]
                 return [dict(record["n"]) for record in result]
         except Exception as exc:
             print(f"Error getting chain start nodes: {exc}")

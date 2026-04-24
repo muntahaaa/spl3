@@ -122,14 +122,6 @@ def perform_action(action, element_number, text_input, swipe_direction):
     # For back it is optional; single_human_explor handles None gracefully.
     resolved_elem = int(element_number) if element_number is not None else None
 
-    # element_number is shared across tap/long_press/swipe/back/text.
-    # For back it is optional; single_human_explor handles None gracefully.
-    resolved_elem = int(element_number) if element_number is not None else None
-
-    # element_number is shared across tap/long_press/swipe/back/text.
-    # For back it is optional; single_human_explor handles None gracefully.
-    resolved_elem = int(element_number) if element_number is not None else None
-
     updated = single_human_explor(
         state,
         action,

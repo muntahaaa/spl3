@@ -111,9 +111,6 @@ def _to_relative(path_str: str) -> str:
     Convert an absolute path to a path relative to the project root (cwd).
     Always uses forward slashes.  Falls back to the original string if
     relativisation raises (e.g. path is on a different Windows drive).
-    Convert an absolute path to a path relative to the project root (cwd).
-    Always uses forward slashes.  Falls back to the original string if
-    relativisation raises (e.g. path is on a different Windows drive).
     """
     if not path_str:
         return path_str
@@ -122,13 +119,10 @@ def _to_relative(path_str: str) -> str:
     except ValueError:
         # Different drive on Windows, or path outside cwd – keep original
         # but at least normalise separators
-        # Different drive on Windows, or path outside cwd – keep original
-        # but at least normalise separators
         return path_str.replace("\\", "/").strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Screenshot capture  (unchanged from previous version)
 #  Screenshot capture  (unchanged from previous version)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -171,7 +165,6 @@ def capture_screenshot_only(state: State) -> State:
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Element-ID → pixel coords  (unchanged)
-#  Element-ID → pixel coords  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def element_number_to_coords(state: State, element_id: int) -> Tuple[int, int]:
@@ -181,14 +174,11 @@ def element_number_to_coords(state: State, element_id: int) -> Tuple[int, int]:
         msg = (
             "[element_number_to_coords] No parsed result available.  "
             "POST /api/insert_parsed_result first."
-            "[element_number_to_coords] No parsed result available.  "
-            "POST /api/insert_parsed_result first."
         )
         state["errors"].append({"step": state["step"], "func": "element_number_to_coords", "error_msg": msg})
         raise RuntimeError(msg)
 
     if not os.path.isfile(json_path):
-        msg = f"[element_number_to_coords] JSON not found: {json_path}"
         msg = f"[element_number_to_coords] JSON not found: {json_path}"
         state["errors"].append({"step": state["step"], "func": "element_number_to_coords", "error_msg": msg})
         raise FileNotFoundError(msg)
@@ -243,9 +233,6 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
         state["step"] += 1
         return state
 
-    # tap, long_press, swipe all need element coords (required).
-    # back also accepts an optional element_number to identify the back
-    # button/icon as the interacted element in the graph.
     # tap, long_press, swipe all need element coords (required).
     # back also accepts an optional element_number to identify the back
     # button/icon as the interacted element in the graph.
