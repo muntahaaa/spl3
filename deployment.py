@@ -4,8 +4,7 @@ from typing import Any, Optional, Tuple
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-#from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from pydantic import SecretStr
@@ -20,7 +19,7 @@ os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "DeploymentExecution"
 
-model = ChatGroq(
+model = ChatGoogleGenerativeAI(
     model=config.LLM_MODEL,
     google_api_key=config.LLM_API_KEY,
 )

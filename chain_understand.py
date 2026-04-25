@@ -8,8 +8,7 @@ import json
 import os
 import base64
 import traceback
-#from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from data.graph_db import Neo4jDatabase
 from llm_rate_limit import wait_for_llm_slot
 import config
@@ -22,7 +21,7 @@ os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "ChainEvolve"
 
 assert config.LLM_API_KEY, "LLM_API_KEY is not set in config!"
-model = ChatGroq(
+model = ChatGoogleGenerativeAI(
     model=config.LLM_MODEL,
     google_api_key=config.LLM_API_KEY,
     max_retries=0,

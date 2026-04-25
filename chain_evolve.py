@@ -5,8 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-#from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 import config
 from data.graph_db import Neo4jDatabase
@@ -22,7 +21,7 @@ os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "ChainEvolve"
 
 # Initialize LLM model
-model = ChatGroq(
+model = ChatGoogleGenerativeAI(
     model=config.LLM_MODEL,
     google_api_key=config.LLM_API_KEY,
     max_retries=0,
@@ -367,7 +366,7 @@ def create_action_node_in_db(action_data: Dict[str, Any]) -> Optional[str]:
             "name":            action_data["name"],
             "description":     action_data["description"],
             "preconditions":   json.dumps(action_data["preconditions"]),
-            "element_sequence": action_data["element_sequence"],
+            "element_sequence": json.dumps(action_data["element_sequence"]),
             "template_pattern": json.dumps(action_data["template_pattern"]),
             "is_high_level":   True,
         }

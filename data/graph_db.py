@@ -103,6 +103,16 @@ class Neo4jDatabase:
 
         properties = dict(properties)
         properties.setdefault("timestamp", int(datetime.now().timestamp()))
+
+        # Neo4j node properties cannot store map values or arrays of maps.
+        # Normalize structured payloads to JSON strings for safe persistence.
+        for key, value in list(properties.items()):
+            if isinstance(value, dict):
+                properties[key] = json.dumps(value)
+            elif isinstance(value, list):
+                if any(isinstance(item, (dict, list)) for item in value):
+                    properties[key] = json.dumps(value)
+
         if "action_result" in properties:
             if isinstance(properties["action_result"], dict):
                 properties["action_result"] = json.dumps(properties["action_result"])
