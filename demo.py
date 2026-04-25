@@ -701,7 +701,11 @@ with gr.Blocks(
 
                 try:
                     # Connect to Neo4j database
-                    db = Neo4jDatabase(uri=config.Neo4j_URI, auth=config.Neo4j_AUTH)
+                    db = Neo4jDatabase(
+                        uri=config.Neo4j_URI,
+                        auth=config.Neo4j_AUTH,
+                        database=config.Neo4j_DB,
+                    )
 
                     # Get all start nodes
                     add_log("Getting start nodes...")
@@ -948,7 +952,11 @@ with gr.Blocks(
 
                 try:
                     # Connect to Neo4j database
-                    db = Neo4jDatabase(uri=config.Neo4j_URI, auth=config.Neo4j_AUTH)
+                    db = Neo4jDatabase(
+                        uri=config.Neo4j_URI,
+                        auth=config.Neo4j_AUTH,
+                        database=config.Neo4j_DB,
+                    )
 
                     # Get all start nodes
                     add_log("Getting start nodes...")

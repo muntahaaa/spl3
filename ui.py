@@ -231,11 +231,10 @@ def perform_action(action, element_number, text_input, swipe_direction):
     }
     session.user_log_storage.append(json.dumps(log_entry, ensure_ascii=False))
 
-    for p in updated.get("page_history", []):
-        labeled = _labeled_image_from_json(json_path) if json_path else ""
-        gallery_path = labeled or p
-        if gallery_path and gallery_path not in session.user_page_storage:
-            session.user_page_storage.append(gallery_path)
+    labeled = _labeled_image_from_json(json_path) if json_path else ""
+    gallery_path = labeled or post_screenshot
+    if gallery_path and gallery_path not in session.user_page_storage:
+        session.user_page_storage.append(gallery_path)
 
     status = (
         f"Step {updated['step']} done — '{action}' executed.\n"

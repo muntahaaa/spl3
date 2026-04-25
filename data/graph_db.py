@@ -9,7 +9,7 @@ from neo4j.exceptions import ServiceUnavailable
 class Neo4jDatabase:
     """Graph-storage adapter for human-exploration traces."""
 
-    def __init__(self, uri: str, auth: tuple, database: str = "neo4j"):
+    def __init__(self, uri: str, auth: tuple, database: str = "graphdb"):
         self.driver = None
         self.database = database
         try:
@@ -197,9 +197,6 @@ class Neo4jDatabase:
         MERGE on the stable structural key (action_id, element_id, order).
         SET the mutable properties (atomic_action, action_params) separately
         so re-runs update rather than duplicate.
-
-        ORIGINAL used all five fields as the MERGE key, meaning any change to
-        action_params (which can contain a timestamp) created a new edge.
         """
         if action_params:
             action_params = json.dumps(action_params)
@@ -240,10 +237,6 @@ class Neo4jDatabase:
         CAUSE-3 FIX for LEADS_TO:
         MERGE on the stable key (element_id → page_id + action_name).
         SET action_params and confidence_score separately.
-
-        ORIGINAL included action_params (which embeds a timestamp) in the MERGE
-        key, so every call created a fresh edge instead of updating the existing
-        one — producing multiple LEADS_TO edges between the same pair.
         """
         if action_params:
             action_params = json.dumps(action_params)
@@ -323,92 +316,24 @@ class Neo4jDatabase:
                         pass
                 sequences.append(record_dict)
             return sequences
-        
-        
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Element-less action navigation  (swipe / back / wait)
-    # ─────────────────────────────────────────────────────────────────────────
-    def add_page_navigated_by(
-        self,
-        source_page_id: str,
-        target_page_id: str,
-        action_type: str,
-        action_params: Optional[Dict[str, Any]] = None,
-        confidence_score: float = 1.0,
-    ) -> bool:
-        """
-        Write a direct Page -[:NAVIGATED_BY]-> Page edge for actions that have
-        no target element (swipe, back, wait).
- 
-        WHY THIS IS NEEDED
-        ──────────────────
-        For tap/text/long_press a LEADS_TO edge is written from the interacted
-        Element to the next Page.  The chain traversal follows:
-            Page -[:HAS_ELEMENT]-> Element -[:LEADS_TO]-> Page
- 
-        swipe, back, and wait produce no Element node, so no element links the
-        two Pages.  Without a direct Page->Page edge the chain breaks at every
-        element-less step:
-          - get_chain_start_nodes() misidentifies the page AFTER the gap as a
-            start node (it has HAS_ELEMENT edges but no incoming LEADS_TO).
-          - get_chain_from_start() stops traversing at the page BEFORE the gap
-            because none of its elements has a LEADS_TO edge onward.
- 
-        NAVIGATED_BY fills that gap directly at the Page level.  Both chain
-        queries are updated to include it as a valid traversal hop.
-        Merged on (source_page_id, target_page_id, action_type) — idempotent.
-        """
-        if action_params:
-            action_params = json.dumps(action_params)
- 
-        query = """
-        MATCH (src:Page {page_id: $source_page_id})
-        MATCH (tgt:Page {page_id: $target_page_id})
-        MERGE (src)-[r:NAVIGATED_BY {action_type: $action_type}]->(tgt)
-        SET r.action_params    = $action_params,
-            r.confidence_score = $confidence_score
-        RETURN type(r) as rel_type
-        """
-        try:
-            with self.driver.session(database=self.database) as session:
-                result = session.run(
-                    query,
-                    source_page_id=source_page_id,
-                    target_page_id=target_page_id,
-                    action_type=action_type,
-                    action_params=action_params or "",
-                    confidence_score=confidence_score,
-                )
-                record = result.single()
-                if not record:
-                    print(f"Warning: NAVIGATED_BY failed: "
-                          f"src={source_page_id} tgt={target_page_id}")
-                return record is not None
-        except Exception as exc:
-            print(f"Error creating NAVIGATED_BY: {exc}")
-            return False
- 
+
+
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  get_chain_start_nodes  (handles element-less action gaps)
+    #  get_chain_start_nodes
     # ─────────────────────────────────────────────────────────────────────────
     def get_chain_start_nodes(self) -> List[Dict[str, Any]]:
         """
         Returns genuine start pages only.
- 
-        A start page satisfies ALL of:
-          1. No incoming LEADS_TO edge     (no element navigated TO it)
-          2. No incoming NAVIGATED_BY edge (no element-less action TO it)
-          3. Has at least one HAS_ELEMENT  (it is a real parsed page)
- 
-        Without condition 2, a page reached by swipe/back has no incoming
-        LEADS_TO and was incorrectly identified as a start page.
+
+                A start page satisfies ALL of:
+                    1. No incoming LEADS_TO edge     (no element navigated TO it)
+                    2. Has at least one HAS_ELEMENT  (it is a real parsed page)
         """
         query = """
         MATCH (n:Page)
-        WHERE NOT EXISTS { ()-[:LEADS_TO]->(n) }
-          AND NOT EXISTS { ()-[:NAVIGATED_BY]->(n) }
-          AND EXISTS     { (n)-[:HAS_ELEMENT]->() }
+                WHERE NOT EXISTS { ()-[:LEADS_TO]->(n) }
+                    AND EXISTS     { (n)-[:HAS_ELEMENT]->() }
         RETURN n
         """
         try:
@@ -418,88 +343,76 @@ class Neo4jDatabase:
         except Exception as exc:
             print(f"Error getting chain start nodes: {exc}")
             return []
- 
+
     # ─────────────────────────────────────────────────────────────────────────
-    #  get_chain_from_start  (handles element-less action gaps)
+    #  get_chain_from_start  — element-based triplets only
     # ─────────────────────────────────────────────────────────────────────────
     def get_chain_from_start(self, start_page_id: str) -> List[Dict[str, Any]]:
         """
-        Walk the full exploration chain from start_page_id to the terminal
-        page, crossing both element-mediated hops (HAS_ELEMENT + LEADS_TO)
-        and element-less hops (NAVIGATED_BY).
- 
-        Returns a flat list of step dicts, one per page-to-page hop:
-          {
-            "source_page" : {page properties},
-            "target_page" : {page properties},
-            "element"     : {element properties} | None,
-            "action"      : {relationship properties},
-            "hop_type"    : "element_hop" | "direct_hop",
-          }
- 
-        WHY TWO QUERIES INSTEAD OF ONE PATH PATTERN
-        ─────────────────────────────────────────────
-        The original single Cypher path:
-            -[:HAS_ELEMENT|LEADS_TO*]->
-        requires every hop to be Element-mediated. A swipe step leaves a
-        direct Page->Page NAVIGATED_BY edge with no intermediate Element.
-        Mixing Page->Element->Page hops with Page->Page hops in one
-        variable-length pattern is not expressible cleanly in Cypher.
- 
-        Solution: run two focused queries and merge in Python.
-          Query A: element hops   (Page)-[:HAS_ELEMENT]->(Elem)-[:LEADS_TO]->(Page)
-          Query B: direct hops    (Page)-[:NAVIGATED_BY]->(Page)
-        Both are restricted to pages reachable from start_page_id. Results are
-        merged, sorted by target page timestamp, and deduplicated.
+        Walk the full exploration chain from start_page_id and return a flat
+        list of element-based hop dicts.
+
+            {
+              "source_page" : {page properties},
+              "target_page" : {page properties},
+              "element"     : {element properties},   # always a dict, never None
+              "action"      : {                        # normalised action dict
+                  "action_name"  : str,               # unified key for all types
+                  "action_type"  : str,               # original type label
+                  "action_params": str,
+                  ...other relationship properties
+              },
+              "hop_type"    : "element_hop" | "direct_hop",
+            }
+
+        HOW ELEMENT HOPS WORK (tap / text / long_press)
+        ─────────────────────────────────────────────────
+        Path: (Page)-[:HAS_ELEMENT]->(Element)-[:LEADS_TO]->(Page)
+        The element is the node that was interacted with.
+        action_name comes from the LEADS_TO.action_name property.
+
         """
+        # ── Element-mediated hops (tap / text / long_press / swipe / back) ───
         elem_query = """
         MATCH (start:Page {page_id: $start_page_id})
         MATCH (src:Page)-[:HAS_ELEMENT]->(e:Element)-[lt:LEADS_TO]->(tgt:Page)
         WHERE src.page_id = start.page_id
            OR EXISTS {
-               MATCH (start)-[:HAS_ELEMENT|LEADS_TO|NAVIGATED_BY*]->(src)
+               MATCH (start)-[:HAS_ELEMENT|LEADS_TO*]->(src)
            }
         RETURN src, e, lt, tgt
         """
-        direct_query = """
-        MATCH (start:Page {page_id: $start_page_id})
-        MATCH (src:Page)-[nb:NAVIGATED_BY]->(tgt:Page)
-        WHERE src.page_id = start.page_id
-           OR EXISTS {
-               MATCH (start)-[:HAS_ELEMENT|LEADS_TO|NAVIGATED_BY*]->(src)
-           }
-        RETURN src, nb, tgt
-        """
+
+        def _to_int(value: Any) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
         try:
             with self.driver.session(database=self.database) as session:
+
                 elem_hops = []
                 for record in session.run(elem_query, start_page_id=start_page_id):
+                    lt = dict(record["lt"])
+                    # Normalise: LEADS_TO already has action_name; add action_type alias
+                    lt.setdefault("action_type", lt.get("action_name", ""))
+
                     elem_hops.append({
                         "source_page": dict(record["src"]),
                         "target_page": dict(record["tgt"]),
                         "element":     dict(record["e"]),
-                        "action":      dict(record["lt"]),
+                        "action":      lt,
                         "hop_type":    "element_hop",
-                        "_sort_key":   record["tgt"].get("timestamp", 0),
+                        "_sort_key":   _to_int(record["tgt"].get("timestamp", 0)),
                     })
- 
-                direct_hops = []
-                for record in session.run(direct_query, start_page_id=start_page_id):
-                    direct_hops.append({
-                        "source_page": dict(record["src"]),
-                        "target_page": dict(record["tgt"]),
-                        "element":     None,
-                        "action":      dict(record["nb"]),
-                        "hop_type":    "direct_hop",
-                        "_sort_key":   record["tgt"].get("timestamp", 0),
-                    })
- 
-            all_hops = elem_hops + direct_hops
-            all_hops.sort(key=lambda h: h["_sort_key"])
- 
+
+            # ── Sort, deduplicate ────────────────────────────────────────────
+            elem_hops.sort(key=lambda h: h["_sort_key"])
+
             seen: set = set()
             chain: List[Dict[str, Any]] = []
-            for hop in all_hops:
+            for hop in elem_hops:
                 key = (
                     hop["source_page"].get("page_id"),
                     hop["target_page"].get("page_id"),
@@ -508,16 +421,14 @@ class Neo4jDatabase:
                     seen.add(key)
                     hop.pop("_sort_key")
                     chain.append(hop)
- 
+
             return chain
- 
+
         except Exception as exc:
             print(f"Error getting chain from start: {exc}")
             return []
 
     # ── read helpers (ported from graph_db2) ─────────────────────────────────
-    # All session calls use self.database (not hardcoded "neo4j") to stay
-    # consistent with the rest of this file.
 
     def get_all_actions(self) -> List[Dict[str, Any]]:
         """Get all Action nodes from the database."""

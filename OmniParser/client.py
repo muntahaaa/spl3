@@ -92,12 +92,17 @@ def display_result(result: dict, task_id: str) -> str:
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(json_dir, exist_ok=True)
 
+    # ── Build timestamped base name for outputs ─────────────────────────────-
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    ms = int(time.time() * 1000) % 1000
+    base_name = f"{ts}_{ms:03d}"
+
     # ── Save annotated image ─────────────────────────────────────────────────
     img_b64 = result.get('annotated_image')
     if img_b64:
         try:
             img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
-            img_path = os.path.join(img_dir, f"{task_id}.png")
+            img_path = os.path.join(img_dir, f"{base_name}.png")
             img.save(img_path)
             print(f"[CLIENT] Image saved → {img_path}")
         except Exception as exc:
@@ -105,7 +110,7 @@ def display_result(result: dict, task_id: str) -> str:
 
     # ── Save JSON ────────────────────────────────────────────────────────────
     elements = result.get('elements', [])
-    json_path = os.path.join(json_dir, f"{task_id}.json")
+    json_path = os.path.join(json_dir, f"{base_name}.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(elements, f, indent=2, ensure_ascii=False)
     print(f"[CLIENT] JSON saved  → {json_path}")

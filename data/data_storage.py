@@ -327,9 +327,8 @@ def json2db(json_path: str) -> str:
     task_id   = _md5(data["tsk"], 12)
     task_name = data.get("tsk", "")
     app_name  = data.get("app_name", "")
-    pages_info:          List[dict] = []
-    elements_info:       List[dict] = []
-    navigated_by_pending: List[dict] = []  # element-less steps awaiting NAVIGATED_BY edge
+    pages_info:    List[dict] = []
+    elements_info: List[dict] = []
 
     try:
         db = Neo4jDatabase(uri=config.Neo4j_URI, auth=config.Neo4j_AUTH,
@@ -432,7 +431,7 @@ def json2db(json_path: str) -> str:
 
             db.create_action({
                 "action_id":     action_uuid,
-                "action_name":   step.get("recommended_action", ""),
+                "action_name":   action_type or step.get("recommended_action", ""),
                 "timestamp":     step.get("timestamp", ""),
                 "step":          step_no,
                 "action_result": json.dumps(tool_result),
@@ -445,6 +444,8 @@ def json2db(json_path: str) -> str:
                 elements_path=elements_path,
                 elements_data=elements_data,
                 recommended_action=step.get("recommended_action", ""),
+                source_page=step.get("source_page", ""),
+                tool_result=tool_result,
             )
 
             if interacted is not None:
@@ -471,58 +472,15 @@ def json2db(json_path: str) -> str:
                     elements_info.append({
                         "element_id": interacted_neo4j_id,
                         "step":       step_no,
-                        "action":     step.get("recommended_action", ""),
+                        "action":     action_type or step.get("recommended_action", ""),
                         "status":     action_status,
                         "timestamp":  step.get("timestamp", ""),
                     })
             else:
-                # Only swipe_precise has no element by design (start/end coords,
-                # not an element ID).  swipe and back now carry element IDs so
-                # they reach this else branch only when no element was provided
-                # (back without an element_number), which is still valid —
-                # use NAVIGATED_BY for those cases too.
-                # wait has been removed from the action set entirely.
-                ELEMENT_LESS = ("swipe_precise",)
-                if action_type in ELEMENT_LESS or action_type in ("back",):
-                    navigated_by_pending.append({
-                        "source_page_id":  page_id,
-                        "source_step":     step_no,
-                        "action_type":     action_type,
-                        "action_params":   {
-                            "execution_result": action_status,
-                            "timestamp":        step.get("timestamp", ""),
-                        },
-                        "confidence_score": _confidence_from_status(action_status),
-                    })
-                else:
-                    print(f"[json2db] Step {step_no}: could not resolve interacted element "
-                          f"for action '{action_type}' — LEADS_TO edge skipped")
-
-        # ── Write NAVIGATED_BY edges (after all page_ids are known) ──────────────
-        max_history_step = max(
-            (p["step"] for p in pages_info if isinstance(p["step"], int)), default=-1
-        )
-        for nav in navigated_by_pending:
-            # Target is the page created for the next step number
-            target = next(
-                (p for p in pages_info if p["step"] == nav["source_step"] + 1), None
-            )
-            # If this was the last history step, the target is the final page
-            if target is None and nav["source_step"] == max_history_step:
-                target = next(
-                    (p for p in pages_info if p["step"] == "final"), None
+                print(
+                    f"[json2db] Step {step_no}: could not resolve interacted element "
+                    f"for action '{action_type}' — LEADS_TO edge skipped"
                 )
-            if target:
-                db.add_page_navigated_by(
-                    source_page_id=nav["source_page_id"],
-                    target_page_id=target["page_id"],
-                    action_type=nav["action_type"],
-                    action_params=nav["action_params"],
-                    confidence_score=nav["confidence_score"],
-                )
-            else:
-                print(f"[json2db] NAVIGATED_BY: no target page for step "
-                      f"{nav['source_step']} action '{nav['action_type']}'")
 
         # ══════════════════════════════════════════════════════════════════════════
         #  FINAL PAGE NODE
@@ -635,29 +593,67 @@ def json2db(json_path: str) -> str:
 #  Private helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fallback_element_by_center(elements_data: list) -> Optional[Dict]:
+    if not elements_data:
+        return None
+    best = None
+    best_dist = float("inf")
+    for elem in elements_data:
+        bbox = elem.get("bbox")
+        if not bbox or len(bbox) != 4:
+            if best is None:
+                best = elem
+            continue
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        dist = (cx - 0.5) ** 2 + (cy - 0.5) ** 2
+        if dist < best_dist:
+            best_dist = dist
+            best = elem
+    return best
+
+
 def _resolve_element_for_action(
     action_type: str,
     clicked_elem: Optional[Dict],
     elements_path: Optional[Path],
     elements_data: list,
     recommended_action: str,
+    source_page: Optional[str] = None,
+    tool_result: Optional[Dict] = None,
 ) -> Optional[Dict]:
     if not elements_data:
         return None
-    # tap, long_press, swipe: element_number is required and x/y are resolved
-    # from it in explor_human, so clicked_elem will always have valid coords.
-    # back: element_number is optional; if provided, clicked_elem carries coords.
+    # tap, long_press, swipe, back: prefer coords from clicked_elem
     if action_type in ("tap", "long_press", "swipe", "back"):
         if clicked_elem and elements_path:
-            resolved = pos2id(clicked_elem["x"], clicked_elem["y"], str(elements_path))
+            resolved = pos2id(
+                clicked_elem["x"],
+                clicked_elem["y"],
+                str(elements_path),
+                source_page=source_page,
+            )
             if resolved:
                 return resolved
         # Fallback: element_number embedded in recommended_action string
         elem_id = _parse_element_number(recommended_action)
         if elem_id is not None:
             return next((e for e in elements_data if e.get("ID") == elem_id), None)
-        # back with no element_number provided — no interacted element
-        return None
+        # Ensure element-based linkage for back/swipe
+        return _fallback_element_by_center(elements_data)
+    if action_type == "swipe_precise":
+        swipe_info = (tool_result or {}).get("swipe_precise", {})
+        start = swipe_info.get("start")
+        if start and len(start) == 2 and elements_path:
+            resolved = pos2id(
+                start[0],
+                start[1],
+                str(elements_path),
+                source_page=source_page,
+            )
+            if resolved:
+                return resolved
+        return _fallback_element_by_center(elements_data)
     if action_type == "text":
         elem_id = _parse_element_number(recommended_action)
         if elem_id is not None:
