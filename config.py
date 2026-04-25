@@ -44,5 +44,5 @@ LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "")
 
 # ── LLM settings (OpenAI-compatible endpoint) ─
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "AIzaSyAGDzLO2Qlf6KhIbdsIXzKRkfWGonv22ew")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")

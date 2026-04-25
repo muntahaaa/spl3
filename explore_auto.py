@@ -10,7 +10,8 @@ from langgraph.types import RetryPolicy
 from pydantic import SecretStr
 from data.State import State
 from tool.screen_content import screen_action  # only screen_action is still used here
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
+#from langchain_google_genai import ChatGoogleGenerativeAI
 # ── NEW: route all screenshot+parse through client.run() ─────────────────────
 from client import run as omniparser_run
 from tool.adb_tools import take_adb_screenshot          # raw ADB screenshot only
@@ -20,7 +21,7 @@ os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
 
-model = ChatGoogleGenerativeAI(
+model = ChatGroq(
     model=config.LLM_MODEL,
     google_api_key=config.LLM_API_KEY,
 )
