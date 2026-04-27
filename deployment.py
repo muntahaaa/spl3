@@ -1,20 +1,25 @@
 import time
-from typing import Any, Optional, Tuple
+import os
+import json
+import base64
+import config
+from typing import Any, Optional, Tuple, Dict, List
 
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from pydantic import SecretStr
 from data.State import DeploymentState, ElementMatch
-from data.graph_db2 import Neo4jDatabase
+from data.graph_db import Neo4jDatabase
 from data.vector_db import VectorStore
 from tool.img_tool import *
-from tool.screen_content import *
+from tool.adb_tools import *
+from OmniParser.client import run as omniparser_run
 
-os.environ["LANGCHAIN_TRACING_V2"] = config.LANGCHAIN_TRACING_V2
+os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
 os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"] = "DeploymentExecution"
@@ -168,23 +173,21 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
             print("❌ Screenshot failed")
             return state
 
-        # 2. Parse screen elements
-        screen_result = screen_element.invoke({"image_path": screenshot_path})
+        # 2. Parse screen elements via OmniParser client
+        with open(screenshot_path, "rb") as fh:
+            image_b64 = base64.b64encode(fh.read()).decode("utf-8")
 
-        if "error" in screen_result:
-            print(f"❌ Screen element parsing failed: {screen_result['error']}")
+        json_path = omniparser_run(image_b64)
+        if not json_path:
+            print("❌ Screen element parsing failed: OmniParser returned no result")
             return state
 
         # 3. Update current page information
         state["current_page"]["screenshot"] = screenshot_path
-        state["current_page"]["elements_json"] = screen_result[
-            "parsed_content_json_path"
-        ]
+        state["current_page"]["elements_json"] = json_path
 
         # 4. Load element data
-        with open(
-            screen_result["parsed_content_json_path"], "r", encoding="utf-8"
-        ) as f:
+        with open(json_path, "r", encoding="utf-8") as f:
             state["current_page"]["elements_data"] = json.load(f)
 
         print(

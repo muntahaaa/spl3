@@ -516,7 +516,9 @@ class Neo4jDatabase:
         """Get all high-level Action nodes (is_high_level, high_level, or type='high_level')."""
         query = """
         MATCH (a:Action)
-        WHERE a.is_high_level = true OR a.high_level = true OR a.type = 'high_level'
+          WHERE coalesce(a.is_high_level, false) = true
+              OR coalesce(a.high_level, false) = true
+              OR (a.type IS NOT NULL AND a.type = 'high_level')
         RETURN a
         """
         try:
@@ -543,7 +545,11 @@ class Neo4jDatabase:
         """
         query = """
         MATCH (a:Action)
-        WHERE (a.is_high_level = true OR a.high_level = true OR a.type = 'high_level')
+                WHERE (
+                        coalesce(a.is_high_level, false) = true
+                        OR coalesce(a.high_level, false) = true
+                    OR (a.type IS NOT NULL AND a.type = 'high_level')
+                )
           AND (a.name CONTAINS $task OR a.description CONTAINS $task)
         RETURN a
         """

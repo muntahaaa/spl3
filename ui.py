@@ -15,6 +15,8 @@ import json
 import os
 import threading
 import time
+import io
+import contextlib
 
 import gradio as gr
 
@@ -23,6 +25,7 @@ from explor_human import capture_screenshot_only, single_human_explor
 from state_manager import session
 from tool.adb_tools import get_device_size, list_all_devices, list_devices_diagnostics
 from data.State import State
+from deployment import run_task as run_high_level_task
 
 # ── OmniParser endpoint ───────────────────────────────────────────────────────
 from OmniParser.client import run as omniparser_run
@@ -101,6 +104,24 @@ def _action_visibility(action: str):
         gr.update(visible=show_text),
         gr.update(visible=show_swipe),
     )
+
+
+def _run_high_level(task: str, device: str):
+    """Run high-level task execution and capture reasoning/output logs."""
+    task = (task or "").strip()
+    device = (device or "").strip()
+    if not task:
+        return "Error: provide a task description.", ""
+    if not device or device == "No devices found":
+        return "Error: select a valid ADB device.", ""
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = run_high_level_task(task=task, device=device)
+
+    reasoning = buf.getvalue().strip()
+    outcome = json.dumps(result, ensure_ascii=False, indent=2)
+    return reasoning or "(no logs)", outcome
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,6 +509,46 @@ def build_ui() -> gr.Blocks:
                 poll_chain_status,
                 inputs=[job_id_box],
                 outputs=[chain_status_box],
+            )
+
+        # ── Tab 5 : High-Level Execution ─────────────────────────────────────
+        with gr.Tab("⑤ High-Level Execution"):
+            gr.Markdown(
+                "Run high-level task execution using stored actions in Neo4j.\n"
+                "Provide the task text and select the device; logs show the reasoning process."
+            )
+            hl_task_input = gr.Textbox(
+                label="High-level task",
+                placeholder="e.g. Check today's weather in the Weather app",
+            )
+            hl_device_radio = gr.Radio(
+                label="Select ADB device",
+                choices=_get_devices(),
+            )
+            hl_refresh_btn = gr.Button("🔄 Refresh devices")
+            hl_run_btn = gr.Button("▶ Run high-level task")
+
+            hl_reasoning = gr.TextArea(
+                label="Reasoning / process logs",
+                interactive=False,
+                lines=14,
+            )
+            hl_outcome = gr.TextArea(
+                label="Outcome",
+                interactive=False,
+                lines=8,
+            )
+
+            hl_refresh_btn.click(
+                lambda: gr.update(choices=_get_devices()),
+                outputs=[hl_device_radio],
+                queue=False,
+            )
+            hl_run_btn.click(
+                _run_high_level,
+                inputs=[hl_task_input, hl_device_radio],
+                outputs=[hl_reasoning, hl_outcome],
+                queue=False,
             )
 
     return demo

@@ -1,3 +1,24 @@
 Gradio path: http://127.0.0.1:7860/
 Swagger path: http://localhost:7860/docs#/
 Vector DB: https://app.pinecone.io/organizations/-OLKFDfXJSGsshq9f8W5/projects/23cdbbff-0a89-401b-ad30-f812f9bec6d8/indexes/vectordb/browser
+
+
+How to Verify Everything is Working
+Auto Exploration
+LangSmith tracing is enabled (via LANGCHAIN_TRACING_V2, LANGCHAIN_PROJECT). Check your LangSmith dashboard for the graph run traces.
+Look at state["history_steps"] — each completed step records: step, recommended_action, tool_result, source_page, source_json, timestamp
+Check that screenshots are being saved in labeled_image/ and that JSON files exist alongside them
+The callback hook fires at each node (tsk_setting, page_understand, perform_action) — hook into it in the UI to display live progress
+Chain Understanding
+After process_and_update_chain() completes, query Neo4j: check that Page and Element nodes now have richer description fields and that Element nodes have a reasoning property (JSON string)
+The chain_service.run_understand() coroutine writes job status to task_store — poll get_job(job_id) and check status == "done" and result["triplets_processed"] > 0
+Chain Evaluation & Evolution
+run_evolve() in chain_service.py wraps evolve_chain_to_action() — poll get_job(job_id)
+status == "done" and result["action_id"] != None → chain was templateable and an Action node was created in Neo4j
+status == "done" and result["action_id"] == None → chain was evaluated as non-templateable (check chain_evolve.py stdout for the LLM's reason)
+status == "error" → exception occurred (check result["error"] for the message)
+Directly run chain_evolve.py as a script — its run_test() function prints step-by-step output including:
+✓ Using starting page ID: <id>
+confidence score and suggested name
+✓ Chain evolution succeeded! High-level action node ID: <id>
+Verify in Neo4j: MATCH (a:Action {is_high_level: true}) RETURN a to confirm the action node exists with its full description and MATCH (a:Action)-[:COMPOSED_OF]->(e:Element) RETURN a.name, e.element_id to verify element relationships

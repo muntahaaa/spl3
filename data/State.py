@@ -46,7 +46,7 @@ class State(TypedDict):
     callback: Optional[Callable[[Dict[str, Any]], None]]   # Callback function, accepts current State and returns None
 
 
-class DeploymentState(TypedDict):
+class DeploymentState(TypedDict, total=False):
     """
     State machine for task deployment execution
     """
@@ -64,9 +64,7 @@ class DeploymentState(TypedDict):
     device: str  # Device ID
 
     # Page information
-    current_page: (
-        Dict  # Current page information, including screenshot path and element data
-    )
+    current_page: Dict  # Current page information, including screenshot path and element data
 
     # Execution related
     current_element: Optional[Dict]  # Current element being operated
@@ -85,8 +83,9 @@ class DeploymentState(TypedDict):
 
     # Callback
     callback: Optional[Callable[[Dict[str, Any]], None]]  # Callback function
-    chain_job_id: Optional[str] = None      # last triggered chain job
-    chain_status: Optional[str] = None      # "pending" | "running" | "done" | "error"
+    chain_job_id: Optional[str]  # last triggered chain job
+    chain_status: Optional[str]  # "pending" | "running" | "done" | "error"
+
 
 def create_deployment_state(
     task: str,
@@ -147,10 +146,9 @@ def create_deployment_state(
     # Callback
     state["callback"] = callback
 
-    # Check if all fields are initialized
-    for key in DeploymentState.__annotations__:
-        if key not in state:
-            raise ValueError(f"State initialization failed: missing field '{key}'")
+    # Chain job tracking (optional but required by schema)
+    state["chain_job_id"] = None
+    state["chain_status"] = None
 
     return state
 
