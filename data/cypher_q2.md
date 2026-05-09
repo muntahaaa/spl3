@@ -1,3 +1,13 @@
+### Find Start Pages (Pages with No Incoming LEADS_TO)
+
+```cypher
+MATCH (p:Page)
+WHERE NOT EXISTS { ()-[:LEADS_TO]->(p) }
+RETURN 
+  p.page_id as PageId,
+  p.description as Description,
+  p.timestamp as Timestamp;
+```
 ## To check high level action description 
 ```cypher
 MATCH (a:Action)
@@ -36,4 +46,10 @@ RETURN
   p2.page_id as TargetPage,
   p2.timestamp as TargetTimestamp
 ORDER BY p1.timestamp ASC;
+```
+
+## Delete all 
+```cypher
+MATCH (n)
+DETACH DELETE n;
 ```

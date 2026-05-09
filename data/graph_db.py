@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,43 @@ class Neo4jDatabase:
                 self.driver.verify_connectivity()
             else:
                 raise
+
+        # Ensure target DB exists before opening sessions against it.
+        self._ensure_database_exists(self.database)
+
+    def _validate_database_name(self, database: str) -> None:
+        """Allow only safe Neo4j database identifier characters."""
+        if not database:
+            raise ValueError("Database name cannot be empty")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", database):
+            raise ValueError(f"Invalid Neo4j database name: {database}")
+
+    def _ensure_database_exists(self, database: str) -> None:
+        """
+        Create the Neo4j database if it is missing.
+        Requires privileges to run SHOW/CREATE DATABASE in the system DB.
+        """
+        self._validate_database_name(database)
+
+        try:
+            with self.driver.session(database="system") as session:
+                exists = session.run(
+                    """
+                    SHOW DATABASES YIELD name
+                    WHERE name = $database
+                    RETURN count(*) > 0 AS exists
+                    """,
+                    database=database,
+                ).single()
+
+                if exists and exists.get("exists"):
+                    return
+
+                session.run(f"CREATE DATABASE `{database}` IF NOT EXISTS")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to ensure Neo4j database '{database}' exists: {exc}"
+            ) from exc
 
     def close(self):
         if self.driver is not None:
