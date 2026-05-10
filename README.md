@@ -31,6 +31,10 @@ human UI-exploration sessions on Android devices.
 spl3/
 ├── main.py                ← entry point (FastAPI + Gradio)
 ├── config.py              ← DB credentials, paths
+├── firebase_llm_bridge.py ← Firebase RTDB async LLM bridge
+├── chain_understand.py    ← triplet reasoning + graph enrichment
+├── chain_evolve.py        ← high-level action synthesis
+├── deployment.py          ← execution workflow runner
 ├── state_manager.py       ← thread-safe shared session state
 ├── ui.py                  ← Gradio layout
 ├── api/
@@ -42,6 +46,7 @@ spl3/
 │   └── task_store.py      ← in-memory job store
 ├── OmniParser/
 │   └── client.py          ← Firebase queue client (auto-parse)
+│   └── omniparser-queue.ipynb ← OmniParser worker notebook
 ├── explor_human.py        ← ADB action + screenshot logic
 ├── explore_auto.py        ← automated exploration
 ├── data/
@@ -58,6 +63,9 @@ spl3/
 ├── labeled_image/
 │   ├── img/               ← OmniParser labeled PNGs
 │   └── json_labeled_data/ ← OmniParser elements JSON
+├── qwen_firebase_worker.ipynb ← Qwen2.5-VL Firebase worker (Colab)
+├── verify_pipeline.py     ← end-to-end pipeline validation
+├── context_chain.md       ← chain_understand/chain_evolve design notes
 └── requirements.txt
 ```
 
@@ -94,7 +102,127 @@ pip install -r requirements.txt
 #      Neo4j_URI, Neo4j_AUTH
 #      PINECONE_API_KEY
 #      Feature_URI   (your ResNet50 service base URL)
+#      CHAIN_FIREBASE_URL
+#      FIREBASE_SECRET  (or service-account-based access token flow)
 ```
+
+---
+
+## Chain reasoning and evolution context
+
+### Overview
+
+ChainEvolve is a graph-driven multimodal UI reasoning system that observes UI interaction flows, understands their semantic meaning with an LLM, and converts repeated low-level UI operations into reusable high-level task abstractions.
+
+It combines:
+
+- Neo4j for structured UI memory
+- Firebase as an asynchronous inference bridge
+- Multimodal LLM reasoning using screenshots + textual UI metadata
+- Graph-based workflow abstraction and procedural memory generation
+
+### Core idea
+
+Instead of storing raw clicks and page transitions only, the system learns:
+
+- what each interaction means
+- what the user is trying to accomplish
+- how UI states change
+- how multiple low-level steps form reusable workflows
+
+Example high-level actions:
+
+```text
+Create Alarm
+Login to Application
+Send Email
+Search Contact
+```
+
+### System architecture
+
+```text
+UI Interaction Recording
+  ↓
+Graph Storage (Neo4j)
+  ↓
+Multimodal LLM Reasoning
+  ↓
+Semantic Graph Enrichment
+  ↓
+Workflow Abstraction
+  ↓
+Reusable High-Level Actions
+```
+
+### Graph structure
+
+```text
+(Page)-[:HAS_ELEMENT]->(Element)-[:LEADS_TO]->(Page)
+```
+
+### Chain retrieval
+
+The system retrieves a navigation chain starting from a page:
+
+```python
+chain = db.get_chain_from_start(start_page_id)
+```
+
+A chain consists of triplets:
+
+```python
+{
+  source_page,
+  element,
+  target_page,
+  action
+}
+```
+
+### Multimodal UI understanding (chain_understand.py)
+
+Inputs:
+
+- Source page description
+- Target page description
+- UI element metadata
+- Screenshots of pages
+
+Processing:
+
+- screenshots are loaded, resized, converted to base64, and sent to the LLM
+- the LLM receives both visual context and structured textual context
+
+The LLM generates:
+
+- context
+- user intent
+- state change
+- task relation
+- enhanced descriptions
+
+### Firebase-based inference bridge flow
+
+```text
+Main Application
+      ↓
+Firebase Task Queue
+      ↓
+Colab/Qwen-VL Runtime (T4 GPU supported)
+      ↓
+Inference Result
+      ↓
+Neo4j Graph Update
+```
+
+### Graph enrichment
+
+After reasoning, the system updates Neo4j nodes with richer semantic descriptions and merges overlapping page descriptions for coherence.
+
+### Workflow abstraction (chain_evolve.py)
+
+The system evaluates whether a chain is reusable and, if so, produces a high-level action node with preconditions, element sequence, and template pattern for reuse.
 
 ---
 
@@ -125,7 +253,9 @@ This starts **one** Uvicorn server on port **7860** that serves both:
    - Click **Refresh devices** → select your device
    - Enter a task description → click **Initialize**
 3. Go to **② Exploration** tab
-  - Click **▶ Start session** — the first screenshot is taken and sent to OmniParser
+  - Click **▶ Start session** — the first screenshot is taken 
+  - Start **omniparser-queue.ipynb** into a T4 GPU supported environment
+  - First screenshot is sent to OmniParser
   - The labeled image + elements JSON are saved automatically
 4. Choose an action and click **⚡ Perform action**
   - A new screenshot is captured and automatically parsed again
@@ -237,6 +367,34 @@ In the **④ Chain Processing** tab:
 3. Copy the **Job ID** and click **🔄 Poll status** to track progress
 
 Jobs are tracked in an in-memory store and return status + results when done.
+
+---
+
+## Notebook execution (GPU)
+
+Run these notebooks with a **T4 GPU** enabled runtime:
+
+- `qwen_firebase_worker.ipynb`
+- `OmniParser/omniparser-queue.ipynb`
+
+---
+
+## Component stack
+
+| Component | Tool/Technology |
+|---|---|
+| Frontend | React (JavaScript) |
+| Backend | FastAPI (Python) |
+| ML Framework | Hugging Face Transformers |
+| NLP Framework | spaCy, TextBlob, Hugging Face Tokenizers |
+| Bias Mitigation Method | Word Replacement, Fairness Constraints, Attention Mechanism |
+| ML Model | BERT, RoBERTa (for text classification) |
+| DL Model | T5, XLNet, DeBERTa |
+| Dataset | Custom Dataset from Bengali News Sources |
+| Preprocessing Tool | NLTK, spaCy |
+| Version Control | Git, GitHub |
+| Database | PostgreSQL |
+| Environment | Visual studio/ Jupyter notebook |
 
 ---
 
