@@ -20,6 +20,9 @@ human UI-exploration sessions on Android devices.
 │  STEP 4  –  Chain Processing  (Gradio tab)                    │
 │  • chain_understand: triplet reasoning + description updates  │
 │  • chain_evolve: optional high-level action synthesis         │
+├──────────────────────────────────────────────────────────────┤
+│  STEP 5  –  Action Execution (Deployment engine)              │
+│  • structured execution + reactive fallback                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -367,6 +370,49 @@ In the **④ Chain Processing** tab:
 3. Copy the **Job ID** and click **🔄 Poll status** to track progress
 
 Jobs are tracked in an in-memory store and return status + results when done.
+
+---
+
+### STEP 5 – Action execution strategy (deployment engine)
+
+The deployment engine executes high-level tasks on Android devices using a hybrid strategy:
+
+```text
+User Task
+  ↓
+Task Matching
+  ↓
+Screen Capture + UI Parsing
+  ↓
+Element Matching
+  ↓
+Shortcut Discovery
+  ↓
+Execution Template Generation
+  ↓
+Action Execution
+  ↓
+Task Completion Verification
+```
+
+If any structured step fails, it falls back to a reactive LLM-driven UI agent:
+
+```text
+Fallback → Reactive LLM-driven UI agent
+```
+
+Key execution modes:
+
+- **Structured execution**: matches tasks to known high-level actions, uses shortcuts/templates, and executes deterministic steps (faster, reliable, lower LLM cost).
+- **Reactive fallback**: captures the screen, sends screenshot + UI JSON to the LLM, and executes the next atomic action until completion.
+
+Core execution components:
+
+- `FirebaseLLMBridge`: async LLM calls via Firebase RTDB
+- `Neo4jDatabase`: actions, shortcuts, page flows, UI metadata
+- `OmniParser`: screen parsing and element extraction
+- `ADB Tools`: tap/swipe/text/back device actions
+- `LangGraph Workflow`: orchestration state machine
 
 ---
 
