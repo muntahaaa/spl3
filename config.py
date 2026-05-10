@@ -36,6 +36,10 @@ JSON_STATE_DIR = os.getenv("JSON_STATE_DIR", "./log/json_state")
 GEMINI_API_KEY =  os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "")
 
+CHAIN_FIREBASE_URL = os.getenv("CHAIN_FIREBASE_URL", "https://appagent-chain-default-rtdb.firebaseio.com/")
+FIREBASE_SECRET = os.getenv("FIREBASE_SECRET", "")
+CHAIN_FIREBASE_SECRET = os.getenv("CHAIN_FIREBASE_SECRET", "")
+
 # ── LangChain tracing ────────────────────────
 LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
 LANGCHAIN_ENDPOINT = os.getenv("LANGCHAIN_ENDPOINT", "")

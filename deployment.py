@@ -1,179 +1,187 @@
-import time
-import os
-import json
-import base64
-import config
-from typing import Any, Optional, Tuple, Dict, List
+"""
+deployment.py  (Firebase/Qwen edition)
+---------------------------------------
+Replaces all direct Gemini (ChatGoogleGenerativeAI) calls with
+Firebase Realtime DB round-trips handled by the Colab Qwen2.5-VL
+worker notebook.
 
-from langchain_core.prompts import ChatPromptTemplate
+All public APIs and the LangGraph workflow structure are preserved.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
-from pydantic import SecretStr
+
+import config
 from data.State import DeploymentState, ElementMatch
 from data.graph_db import Neo4jDatabase
 from data.vector_db import VectorStore
 from tool.img_tool import *
 from tool.adb_tools import *
 from OmniParser.client import run as omniparser_run
+from firebase_llm_bridge import FirebaseLLMBridge
 
+# ── LangSmith tracing ────────────────────────────────────────────────────────
 os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
-os.environ["LANGCHAIN_ENDPOINT"] = config.LANGCHAIN_ENDPOINT
-os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
-os.environ["LANGCHAIN_PROJECT"] = "DeploymentExecution"
+os.environ["LANGCHAIN_ENDPOINT"]   = config.LANGCHAIN_ENDPOINT
+os.environ["LANGCHAIN_API_KEY"]    = config.LANGCHAIN_API_KEY
+os.environ["LANGCHAIN_PROJECT"]    = "DeploymentExecution"
 
-model = ChatGoogleGenerativeAI(
-    model=config.LLM_MODEL,
-    google_api_key=config.LLM_API_KEY,
+# ── Firebase bridge (replaces ChatGoogleGenerativeAI) ────────────────────────
+bridge = FirebaseLLMBridge(
+    firebase_url=config.CHAIN_FIREBASE_URL,
+    firebase_secret=config.CHAIN_FIREBASE_SECRET,
 )
 
-URI = config.Neo4j_URI
+# ── Database / vector store ──────────────────────────────────────────────────
+URI  = config.Neo4j_URI
 AUTH = config.Neo4j_AUTH
-db = Neo4jDatabase(URI, AUTH)
-
+db   = Neo4jDatabase(URI, AUTH)
 vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
 
 
-def create_execution_state(device: str) -> Dict[str, Any]:
-    """
-    Create initial execution state
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tiny sync wrapper so callers that aren't already in an async context
+#  can invoke the bridge without restructuring.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Args:
-        device: Device ID
-
-    Returns:
-        Dictionary containing initial state
-    """
-    from data.State import create_deployment_state
-
-    state = create_deployment_state(
-        task="",
-        device=device,
+def _sync_call_text(system_prompt: str, user_prompt: str, timeout: float = 300.0) -> str:
+    """Run an async bridge call from synchronous code."""
+    return asyncio.get_event_loop().run_until_complete(
+        bridge.call_text(system_prompt=system_prompt, user_prompt=user_prompt, timeout=timeout)
     )
 
-    return state
+
+def _sync_call_json(
+    system_prompt: str,
+    user_prompt: str,
+    images_b64: Optional[List[str]] = None,
+    timeout: float = 300.0,
+) -> Dict[str, Any]:
+    return asyncio.get_event_loop().run_until_complete(
+        bridge.call_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images_b64=images_b64,
+            timeout=timeout,
+        )
+    )
+
+
+def _sync_call_vision(
+    system_prompt: str,
+    user_prompt: str,
+    images_b64: List[str],
+    timeout: float = 300.0,
+) -> str:
+    return asyncio.get_event_loop().run_until_complete(
+        bridge.call_vision(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images_b64=images_b64,
+            timeout=timeout,
+        )
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _img_to_b64(path: str) -> Optional[str]:
+    if path and os.path.exists(path):
+        with open(path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode("utf-8")
+    return None
+
+
+def create_execution_state(device: str) -> Dict[str, Any]:
+    from data.State import create_deployment_state
+    return create_deployment_state(task="", device=device)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Task → high-level action matching
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MATCH_SYSTEM = (
+    "You are an AI assistant specialized in matching user tasks with predefined "
+    "high-level actions. Analyse the task description and decide if it matches any "
+    "predefined high-level action. Only consider a match when the degree is above 0.7.\n\n"
+    "If matched, reply with:\n  MATCHED: <complete JSON of the best matching action>\n"
+    "If not matched, reply with:\n  NO_MATCH <brief explanation>"
+)
 
 
 def match_task_to_action(
     state: Dict[str, Any], task: str
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    """
-    Match user task with high-level action nodes
-
-    Args:
-        state: Execution state
-        task: User input task description
-
-    Returns:
-        (whether match successful, matched high-level action node)
-    """
+    """Match user task with high-level action nodes via the Qwen bridge."""
     print(f"Matching task: {task}")
 
-    # 1. Get all high-level action nodes from database
     high_level_actions = db.get_all_high_level_actions()
-
     if not high_level_actions:
         print("❌ No high-level action nodes found")
         return False, None
 
     print(f"Found {len(high_level_actions)} high-level action nodes")
 
-    if len(high_level_actions) == 0:
-        return False, None
-
-    # 2. Create task matching prompt
-    task_match_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """You are an AI assistant specialized in matching user tasks with predefined high-level actions.
-You need to analyze the user's task description and determine if it matches any predefined high-level actions.
-If you find a matching high-level action, return the complete information of that action. If no match is found, clearly indicate no match.
-Only consider it a match when the matching degree is high (above 0.7).""",
-            ),
-            (
-                "human",
-                """User task: {task}
-
-Available high-level actions:
-{actions_json}
-
-Please determine if the user task matches any high-level action.
-If matched successfully, return the complete information of the best matching action (keeping the original JSON format) with "MATCHED: " prefix.
-If no match is found, return "NO_MATCH" with a brief explanation.
-""",
-            ),
-        ]
+    actions_json = json.dumps(high_level_actions, ensure_ascii=False, indent=2)
+    user_prompt  = (
+        f"User task: {task}\n\n"
+        f"Available high-level actions:\n{actions_json}\n\n"
+        "Determine if the task matches any high-level action and reply as instructed."
     )
 
-    # 3. Prepare JSON string of high-level actions
-    actions_json = json.dumps(high_level_actions, ensure_ascii=False, indent=2)
-
-    # 4. Call LLM for matching
     try:
-        # Prepare input
-        match_input = {"task": task, "actions_json": actions_json}
+        result = _sync_call_text(_MATCH_SYSTEM, user_prompt, timeout=180)
 
-        # Use simple string output parser
-        match_chain = task_match_prompt | model | StrOutputParser()
-
-        # Execute matching
-        result = match_chain.invoke(match_input)
-
-        # Parse results
         if result.startswith("MATCHED:"):
-            # Extract matched action information
-            action_json_str = result[len("MATCHED:") :].strip()
+            action_json_str = result[len("MATCHED:"):].strip()
             try:
                 matched_action = json.loads(action_json_str)
-                print(
-                    f"✓ Found matching high-level action: {matched_action.get('name', 'Unknown')} (ID: {matched_action.get('action_id', 'Unknown')})"
-                )
+                print(f"✓ Matched: {matched_action.get('name','?')} (ID: {matched_action.get('action_id','?')})")
                 return True, matched_action
             except json.JSONDecodeError:
                 print(f"❌ Cannot parse matching result: {action_json_str}")
                 return False, None
         elif result.startswith("NO_MATCH"):
-            reason = result[len("NO_MATCH") :].strip()
-            print(f"❌ No matching high-level action found")
-            print(f"  Reason: {reason}")
+            print(f"❌ No matching high-level action found: {result[len('NO_MATCH'):].strip()}")
             return False, None
         else:
-            print(f"❌ Unrecognized matching result: {result}")
+            print(f"❌ Unrecognised matching result: {result}")
             return False, None
 
     except Exception as e:
-        print(f"❌ Error during task matching: {str(e)}")
+        print(f"❌ Error during task matching: {e}")
         return False, None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Screen capture / OmniParser  (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
-    """
-    Capture current screen and parse elements, update state
-
-    Args:
-        state: Deployment state
-
-    Returns:
-        Updated deployment state
-    """
     try:
-        # 1. Take screenshot
-        screenshot_path = take_screenshot.invoke(
-            {
-                "device": state["device"],
-                "app_name": "deployment",
-                "step": state["current_step"],
-            }
-        )
-
+        screenshot_path = take_screenshot.invoke({
+            "device":    state["device"],
+            "app_name":  "deployment",
+            "step":      state["current_step"],
+        })
         if not screenshot_path or not os.path.exists(screenshot_path):
             print("❌ Screenshot failed")
             return state
 
-        # 2. Parse screen elements via OmniParser client
         with open(screenshot_path, "rb") as fh:
             image_b64 = base64.b64encode(fh.read()).decode("utf-8")
 
@@ -182,738 +190,431 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
             print("❌ Screen element parsing failed: OmniParser returned no result")
             return state
 
-        # 3. Update current page information
-        state["current_page"]["screenshot"] = screenshot_path
+        state["current_page"]["screenshot"]   = screenshot_path
         state["current_page"]["elements_json"] = json_path
 
-        # 4. Load element data
         with open(json_path, "r", encoding="utf-8") as f:
             state["current_page"]["elements_data"] = json.load(f)
 
-        print(
-            
-            f"✓ Successfully parsed current screen, detected {len(state['current_page']['elements_data'])} UI elements"
-        )
+        print(f"✓ Parsed screen — {len(state['current_page']['elements_data'])} UI elements")
         return state
 
     except Exception as e:
-        print(f"❌ Error capturing and parsing screen: {str(e)}")
+        print(f"❌ Error capturing and parsing screen: {e}")
         return state
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Element matching  (visual then semantic fallback)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def match_screen_elements(
     state: DeploymentState, action_sequence: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Match current screen elements with elements in high-level action nodes using visual embedding comparison
-
-    Args:
-        state: Deployment state
-        action_sequence: Element sequence in high-level action nodes
-
-    Returns:
-        List of matching results, including screen element ID and matching score
-    """
     if not state["current_page"]["elements_data"]:
         print("❌ Current screen element data is empty")
         return []
 
-    # Get current step information
     current_step_idx = state["current_step"]
     if current_step_idx >= len(action_sequence):
-        print(f"⚠️ Current step {current_step_idx} exceeds action sequence range")
         return []
 
     current_action = action_sequence[current_step_idx]
-
-    # Get element information
-    element_id = current_action.get("element_id")
+    element_id     = current_action.get("element_id")
     if not element_id:
-        print("⚠️ No element ID specified in current step")
         return []
 
-    # Get template element from database - using correct method name
-    db_element = db.get_action_by_id(element_id)
+    db_element = db.get_action_by_id(element_id) or db.get_element_by_id(element_id)
     if not db_element:
-        print(f"⚠️ Element with ID {element_id} not found")
-        # Try to get from another type
-        db_element = db.get_element_by_id(element_id)
-        if not db_element:
-            print(f"⚠️ Action with ID {element_id} also not found")
-            return []
+        return []
 
-    # If retrieved node is an Action node, ensure it contains necessary visual information
-    # Otherwise fall back to semantic matching
     if "action_id" in db_element and not any(
-        key in db_element for key in ["visual_embedding", "screenshot_path"]
+        k in db_element for k in ["visual_embedding", "screenshot_path"]
     ):
-        print(
-            f"⚠️ Retrieved node is an Action node but lacks visual information, falling back to semantic matching"
-        )
         return fallback_to_semantic_match(state, action_sequence)
 
-    # Check if visual embedding exists
     template_embedding = None
     if "visual_embedding" in db_element and db_element["visual_embedding"]:
         template_embedding = db_element["visual_embedding"]
     else:
-        print("⚠️ Template element has no visual embedding, trying to extract features")
-        # Try to get element screenshot or extract features using bounding box information
         if "screenshot_path" in db_element and db_element["screenshot_path"]:
             try:
-                # Extract template element features
-                template_embedding = extract_features(
-                    db_element["screenshot_path"], "resnet50"
-                )["features"]
+                template_embedding = extract_features(db_element["screenshot_path"], "resnet50")["features"]
             except Exception as e:
-                print(f"❌ Cannot extract template element features: {str(e)}")
+                print(f"❌ Cannot extract template element features: {e}")
                 return fallback_to_semantic_match(state, action_sequence)
         else:
-            # No visual embedding, fall back to semantic matching
-            print(
-                "⚠️ Cannot get template element visual features, falling back to semantic matching"
-            )
             return fallback_to_semantic_match(state, action_sequence)
 
-    # Process current screen elements
-    screen_elements = state["current_page"]["elements_data"]
-    screenshot_path = state["current_page"]["screenshot"]
-    elements_json_path = state["current_page"]["elements_json"]
+    screen_elements   = state["current_page"]["elements_data"]
+    screenshot_path   = state["current_page"]["screenshot"]
 
     try:
-        # Get visual embeddings for all elements on current screen
-        from tool.img_tool import elements_img, extract_features
-
-        # Extract features for all screen elements
+        import numpy as np
         element_embeddings = []
         for idx, element in enumerate(screen_elements):
             try:
-                # Use element_img to get element image
-                element_img_stream = elements_img(
-                    screenshot_path, json.dumps(screen_elements), element.get("ID", idx)
-                )
-                # Extract features
-                element_feature = extract_features(element_img_stream, "resnet50")
-                element_embeddings.append((idx, element_feature["features"]))
-            except Exception as e:
-                print(f"⚠️ Cannot extract features for element {idx}: {str(e)}")
+                element_img_stream = elements_img(screenshot_path, json.dumps(screen_elements), element.get("ID", idx))
+                feat = extract_features(element_img_stream, "resnet50")
+                element_embeddings.append((idx, feat["features"]))
+            except Exception:
                 continue
 
         if not element_embeddings:
-            print("❌ Failed to extract features for any screen elements")
             return fallback_to_semantic_match(state, action_sequence)
 
-        # Calculate similarity and sort
-        import numpy as np
-
         matches = []
+        tmpl_vec = np.array(template_embedding).flatten()
+        tmpl_norm = np.linalg.norm(tmpl_vec)
         for idx, embedding in element_embeddings:
-            # Calculate cosine similarity
-            template_vec = np.array(template_embedding).flatten()
-            element_vec = np.array(embedding).flatten()
+            elem_vec  = np.array(embedding).flatten()
+            elem_norm = np.linalg.norm(elem_vec)
+            similarity = 0.0 if (tmpl_norm == 0 or elem_norm == 0) else float(np.dot(tmpl_vec, elem_vec) / (tmpl_norm * elem_norm))
+            if similarity >= 0.6:
+                matches.append({
+                    "element_id":       element_id,
+                    "match_score":      similarity,
+                    "screen_element_id": idx,
+                    "action_type":      current_action.get("atomic_action", "tap"),
+                    "parameters":       current_action.get("action_params", {}),
+                })
 
-            # Normalize vectors
-            template_norm = np.linalg.norm(template_vec)
-            element_norm = np.linalg.norm(element_vec)
-
-            if template_norm == 0 or element_norm == 0:
-                similarity = 0
-            else:
-                similarity = np.dot(template_vec, element_vec) / (
-                    template_norm * element_norm
-                )
-
-            # Convert similarity to match score
-            match_score = float(similarity)
-
-            if match_score >= 0.6:  # Matching threshold
-                matches.append(
-                    {
-                        "element_id": element_id,
-                        "match_score": match_score,
-                        "screen_element_id": idx,
-                        "action_type": current_action.get("atomic_action", "tap"),
-                        "parameters": current_action.get("action_params", {}),
-                    }
-                )
-
-        # Sort by similarity
         matches.sort(key=lambda x: x["match_score"], reverse=True)
-
         if matches:
-            best_match = matches[0]
-            print(
-                f"✓ Found matching screen element ID: {best_match['screen_element_id']}"
-            )
-            print(f"  Match score: {best_match['match_score']}")
-            print(f"  Action type: {best_match['action_type']}")
-            return matches
-        else:
-            print("❌ No matching screen element found")
-            return []
+            print(f"✓ Matched screen element {matches[0]['screen_element_id']} (score={matches[0]['match_score']:.2f})")
+        return matches
 
     except Exception as e:
-        print(f"❌ Error during visual matching: {str(e)}")
-        # Fall back to semantic matching on error
+        print(f"❌ Error during visual matching: {e}")
         return fallback_to_semantic_match(state, action_sequence)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Semantic fallback element matching via Qwen
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ELEM_MATCH_SYSTEM = (
+    "You are an AI assistant specialized in matching UI elements. "
+    "Analyse the template element description and current screen elements, "
+    "then find the best match.\n\n"
+    "Return ONLY a JSON object with these keys:\n"
+    "  element_id (str), match_score (float 0-1), screen_element_id (int),\n"
+    "  action_type (str: tap/text/swipe/long_press/back), parameters (dict)\n"
+    "If no element scores above 0.6, set match_score=0 and screen_element_id=-1.\n"
+    "No preamble, no markdown fences."
+)
 
 
 def fallback_to_semantic_match(
     state: DeploymentState, action_sequence: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Fallback to semantic matching when visual matching fails
-    """
     print("🔄 Falling back to semantic matching...")
 
-    # Prepare template element features
-    template_elements = []
     current_step_idx = state["current_step"]
     if current_step_idx >= len(action_sequence):
         return []
 
-    step_info = action_sequence[current_step_idx]
-
-    # Get element information
+    step_info  = action_sequence[current_step_idx]
     element_id = step_info.get("element_id")
     if not element_id:
         return []
 
-    # Get element information from database - using correct method name
-    db_element = db.get_action_by_id(element_id)
+    db_element = db.get_action_by_id(element_id) or db.get_element_by_id(element_id)
     if not db_element:
-        print(f"⚠️ Element with ID {element_id} not found")
-        # Try to get from another type
-        db_element = db.get_element_by_id(element_id)
-        if not db_element:
-            print(f"⚠️ Action with ID {element_id} also not found")
-            return []
-
-    template_elements.append({"db_element": db_element, "step_info": step_info})
-
-    # If no elements to match, return empty list
-    if not template_elements:
         return []
 
-    current_template = template_elements[0]
+    # Build template description
+    id_field = "element_id" if "element_id" in db_element else "action_id"
+    tmpl_desc = f"ID: {db_element.get(id_field, 'unknown')}\n"
+    if db_element.get("description"):
+        tmpl_desc += f"Description: {db_element['description']}\n"
+    elif db_element.get("name"):
+        tmpl_desc += f"Name: {db_element['name']}\n"
 
-    # Prepare matching prompt
-    element_match_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """You are an AI assistant specialized in matching UI elements. You need to analyze template element descriptions and current screen elements to find the best match. Your answer must be in JSON format, including the matching results.""",
-            ),
-            (
-                "human",
-                """Template element description: 
-{template_element}
-
-Current screen elements:
-{screen_elements}
-
-Please find the screen element that best matches the template element, and return in the following JSON format:
-{
-  "element_id": "template element ID",
-  "match_score": matching score (0-1),
-  "screen_element_id": screen element ID,
-  "action_type": "atomic action type (tap/text/swipe etc.)",
-  "parameters": {action parameters object}
-}
-
-If no element with matching score above 0.6 is found, set match_score to 0 and screen_element_id to -1.
-""",
-            ),
-        ]
-    )
-
-    # Parse template element information
-    current_db_element = current_template["db_element"]
-
-    # Determine correct ID field
-    element_id_field = (
-        "element_id" if "element_id" in current_db_element else "action_id"
-    )
-    template_element_desc = (
-        f"ID: {current_db_element.get(element_id_field, 'unknown')}\n"
-    )
-
-    if "description" in current_db_element and current_db_element["description"]:
-        template_element_desc += f"Description: {current_db_element['description']}\n"
-    elif "name" in current_db_element and current_db_element["name"]:
-        template_element_desc += f"Name: {current_db_element['name']}\n"
-
-    # Check position information, supporting different field names
-    bbox_field = None
     for field in ["bounding_box", "bbox", "position"]:
-        if field in current_db_element and current_db_element[field]:
-            bbox_field = field
+        if db_element.get(field):
+            bbox = db_element[field]
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                tmpl_desc += f"Position: [{bbox[0]:.3f},{bbox[1]:.3f},{bbox[2]:.3f},{bbox[3]:.3f}]\n"
+            elif isinstance(bbox, str):
+                tmpl_desc += f"Position: {bbox}\n"
             break
 
-    if bbox_field:
-        bbox = current_db_element[bbox_field]
-        if isinstance(bbox, list) and len(bbox) >= 4:
-            template_element_desc += f"Position: [{bbox[0]:.3f}, {bbox[1]:.3f}, {bbox[2]:.3f}, {bbox[3]:.3f}]\n"
-        elif isinstance(bbox, str):
-            template_element_desc += f"Position: {bbox}\n"
+    tmpl_desc += f"Action type: {step_info.get('atomic_action','tap')}\n"
+    params = step_info.get("action_params", {})
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            pass
+    if isinstance(params, dict) and params:
+        tmpl_desc += "Action parameters:\n" + "\n".join(f"  {k}: {v}" for k, v in params.items())
 
-    # Add action information
-    template_element_desc += (
-        f"Action type: {current_template['step_info'].get('atomic_action', 'tap')}\n"
+    # Build screen description
+    screen_desc = ""
+    for i, element in enumerate(state["current_page"]["elements_data"]):
+        screen_desc += f"Element {i} (ID: {element.get('ID', i)}):\n"
+        for key in ("type", "content"):
+            if element.get(key):
+                screen_desc += f"  {key.capitalize()}: {element[key]}\n"
+        if "bbox" in element:
+            b = element["bbox"]
+            screen_desc += f"  Position: [{b[0]:.3f},{b[1]:.3f},{b[2]:.3f},{b[3]:.3f}]\n"
+        screen_desc += "\n"
+
+    user_prompt = (
+        f"Template element:\n{tmpl_desc}\n\n"
+        f"Current screen elements:\n{screen_desc}\n\n"
+        "Find the best match and return JSON."
     )
 
-    if (
-        "action_params" in current_template["step_info"]
-        and current_template["step_info"]["action_params"]
-    ):
-        params = current_template["step_info"]["action_params"]
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except:
-                pass
-
-        if isinstance(params, dict):
-            template_element_desc += "Action parameters:\n"
-            for k, v in params.items():
-                template_element_desc += f"  {k}: {v}\n"
-
-    # Parse screen elements information
-    screen_elements_desc = ""
-    for i, element in enumerate(state["current_page"]["elements_data"]):
-        screen_elements_desc += f"Element {i} (ID: {element.get('ID', i)}):\n"
-        if "type" in element:
-            screen_elements_desc += f"  Type: {element['type']}\n"
-        if "content" in element:
-            screen_elements_desc += f"  Content: {element['content']}\n"
-        if "bbox" in element:
-            bbox = element["bbox"]
-            screen_elements_desc += f"  Position: [{bbox[0]:.3f}, {bbox[1]:.3f}, {bbox[2]:.3f}, {bbox[3]:.3f}]\n"
-        screen_elements_desc += "\n"
-
-    # Call LLM for matching
     try:
-        # Prepare input
-        match_input = {
-            "template_element": template_element_desc,
-            "screen_elements": screen_elements_desc,
-        }
+        result = _sync_call_json(_ELEM_MATCH_SYSTEM, user_prompt, timeout=180)
 
-        # Create parser
-        parser = JsonOutputParser(pydantic_object=ElementMatch)
+        # result may be a raw dict or wrapped in ElementMatch shape
+        match_score       = float(result.get("match_score", 0))
+        screen_element_id = int(result.get("screen_element_id", -1))
 
-        # Build chain
-        match_chain = element_match_prompt | model | parser
-
-        # Execute matching
-        match_result = match_chain.invoke(match_input)
-
-        # Check matching result
-        if match_result.match_score >= 0.6 and match_result.screen_element_id >= 0:
-            print(
-                f"✓ Found matching screen element ID: {match_result.screen_element_id}"
-            )
-            print(f"  Match score: {match_result.match_score}")
-            print(f"  Action type: {match_result.action_type}")
-            return [match_result.dict()]
+        if match_score >= 0.6 and screen_element_id >= 0:
+            print(f"✓ Semantic match — element {screen_element_id} (score={match_score:.2f})")
+            return [{
+                "element_id":        result.get("element_id", element_id),
+                "match_score":       match_score,
+                "screen_element_id": screen_element_id,
+                "action_type":       result.get("action_type", "tap"),
+                "parameters":        result.get("parameters", {}),
+            }]
         else:
-            print(f"❌ No matching screen element found")
+            print("❌ No matching screen element found via semantic match")
             return []
 
     except Exception as e:
-        print(f"❌ Error during element matching: {str(e)}")
+        print(f"❌ Error during semantic element matching: {e}")
         return []
 
 
-def execute_element_action(
-    state: DeploymentState, element_match: Dict[str, Any]
-) -> bool:
-    """
-    Execute screen element action
+# ─────────────────────────────────────────────────────────────────────────────
+#  Execute element action  (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Args:
-        state: Execution state
-        element_match: Element matching result
-
-    Returns:
-        Whether the operation was successful
-    """
+def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]) -> bool:
     try:
         if not element_match:
             return False
 
-        # Get action type and parameters
-        action_type = element_match.get("action_type", "tap")
-        parameters = element_match.get("parameters", {})
+        action_type       = element_match.get("action_type", "tap")
+        parameters        = element_match.get("parameters", {})
         screen_element_id = element_match.get("screen_element_id", -1)
 
-        if screen_element_id < 0 or screen_element_id >= len(
-            state["current_page"]["elements_data"]
-        ):
+        if screen_element_id < 0 or screen_element_id >= len(state["current_page"]["elements_data"]):
             print(f"❌ Invalid screen element ID: {screen_element_id}")
             return False
 
-        # Get element position
-        element = state["current_page"]["elements_data"][screen_element_id]
-        bbox = element.get("bbox", [0, 0, 0, 0])
-
-        # Get device size and calculate center point
+        element     = state["current_page"]["elements_data"][screen_element_id]
+        bbox        = element.get("bbox", [0, 0, 0, 0])
         device_size = get_device_size.invoke(state["device"])
         if isinstance(device_size, str):
-            # Default size
             device_size = {"width": 1080, "height": 2400}
+
         center_x = int((bbox[0] + bbox[2]) / 2 * device_size["width"])
         center_y = int((bbox[1] + bbox[3]) / 2 * device_size["height"])
 
-        # Prepare action parameters
-        action_params = {
-            "device": state["device"],
-            "action": action_type,
-            "x": center_x,
-            "y": center_y,
-        }
-
-        # Add specific parameters based on action type
+        action_params = {"device": state["device"], "action": action_type, "x": center_x, "y": center_y}
         if action_type == "text":
             action_params["input_str"] = parameters.get("text", "")
         elif action_type == "long_press":
             action_params["duration"] = parameters.get("duration", 1000)
         elif action_type == "swipe":
             action_params["direction"] = parameters.get("direction", "up")
-            action_params["dist"] = parameters.get("distance", "medium")
+            action_params["dist"]      = parameters.get("distance", "medium")
 
-        # Execute action
-        print(f"Executing action: {action_type} at position ({center_x}, {center_y})")
+        print(f"Executing action: {action_type} at ({center_x}, {center_y})")
         result = screen_action.invoke(action_params)
 
-        # Parse operation result
         if isinstance(result, str):
             try:
                 result_json = json.loads(result)
                 if result_json.get("status") == "success":
-                    print(f"✓ Action executed successfully")
+                    print("✓ Action executed successfully")
                     return True
                 else:
-                    print(
-                        f"❌ Action execution failed: {result_json.get('message', 'Unknown error')}"
-                    )
+                    print(f"❌ Action failed: {result_json.get('message','unknown')}")
                     return False
-            except:
+            except Exception:
                 print(f"❌ Cannot parse operation result: {result}")
                 return False
-        else:
-            print(f"❌ Operation returned non-string result")
-            return False
+        return False
 
     except Exception as e:
-        print(f"❌ Error executing element action: {str(e)}")
+        print(f"❌ Error executing element action: {e}")
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  React fallback  (uses Qwen for decision, ADB tool for execution)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REACT_SYSTEM = (
+    "You are an intelligent smartphone operation assistant. "
+    "Observe the current screen and perform one atomic operation "
+    "(tap / type text / swipe / long press / back) to progress toward the user's goal. "
+    "Reply with a JSON object:\n"
+    "  {\"action\": \"<type>\", \"x\": <int>, \"y\": <int>, "
+    "\"input_str\": \"<text if action=text>\", "
+    "\"direction\": \"<up/down/left/right if action=swipe>\", "
+    "\"duration\": <ms if action=long_press>}\n"
+    "For back action omit x/y. Return JSON only."
+)
+
+
 def fallback_to_react(state: DeploymentState) -> DeploymentState:
-    """
-    Fall back to React mode when template execution fails
-
-    Args:
-        state: Execution state
-
-    Returns:
-        Updated execution state
-    """
     print("🔄 Falling back to React mode execution...")
     task = state["task"]
 
-    # Create action_agent for page operation decisions
-    action_agent = create_react_agent(model, [screen_action])
-
-    # Initialize React mode
-    if not state["messages"]:
-        # Set system prompt
-        system_message = SystemMessage(
-            content="""You are an intelligent smartphone operation assistant who will help users complete tasks on mobile devices.
-You can help users by observing the screen and performing various operations (clicking, typing text, swiping, etc.).
-Analyze the current screen content, determine the best next action, and use the appropriate tools to execute it.
-Each step of the operation should move toward completing the user's goal task."""
-        )
-
-        state["messages"].append(system_message)
-
-        # Add user task
-        user_message = HumanMessage(
-            content=f"I need to complete the following task on a mobile device: {task}"
-        )
-        state["messages"].append(user_message)
-
-    # Capture current screen
     state = capture_and_parse_screen(state)
     if not state["current_page"]["screenshot"]:
         state["execution_status"] = "error"
         print("Unable to capture or parse screen")
         return state
 
-    # Prepare screen information
-    screenshot_path = state["current_page"]["screenshot"]
+    screenshot_path   = state["current_page"]["screenshot"]
     elements_json_path = state["current_page"]["elements_json"]
-    device = state["device"]
-    device_size = get_device_size.invoke(device)
+    device            = state["device"]
+    device_size       = get_device_size.invoke(device)
 
-    # Load screenshot as base64
-    with open(screenshot_path, "rb") as f:
-        image_data = f.read()
-        image_data_base64 = base64.b64encode(image_data).decode("utf-8")
-
-    # Load element JSON data
     with open(elements_json_path, "r", encoding="utf-8") as f:
         elements_data = json.load(f)
 
-    elements_text = json.dumps(elements_data, ensure_ascii=False, indent=2)
+    img_b64 = _img_to_b64(screenshot_path)
+    images  = [img_b64] if img_b64 else []
 
-    # Build messages
-    messages = [
-        SystemMessage(
-            content=f"""Below is the current page information and user intent. Please analyze comprehensively and recommend the next reasonable action (please complete only one step),
-and complete it by calling tools. All tool calls must pass in device to specify the operating device. Only execute one tool call."""
-        ),
-        HumanMessage(
-            content=f"The current device is: {device}, the device screen size is {device_size}. The user's current task intent is: {task}"
-        ),
-        HumanMessage(
-            content="Below is the current page's parsed JSON data (where bbox is a relative value, please convert to actual operation position based on screen size):\n"
-            + elements_text
-        ),
-        HumanMessage(
-            content=[
-                {"type": "text", "text": "Below is the screenshot data:"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_data_base64}"},
-                },
-            ],
-        ),
-    ]
+    user_prompt = (
+        f"Device: {device}  Size: {device_size}\n"
+        f"Task: {task}\n\n"
+        f"Current screen elements (bbox values are relative 0-1):\n"
+        f"{json.dumps(elements_data, ensure_ascii=False, indent=2)}\n\n"
+        "Determine the next single operation and return JSON."
+    )
 
-    # Add these messages to state
-    state["messages"].extend(messages)
+    try:
+        result_json = _sync_call_json(
+            system_prompt=_REACT_SYSTEM,
+            user_prompt=user_prompt,
+            images_b64=images,
+            timeout=240,
+        )
 
-    # Call action_agent for decision making and action execution
-    action_result = action_agent.invoke({"messages": state["messages"][-4:]})
+        action_type = result_json.get("action", "tap")
+        action_params: Dict[str, Any] = {"device": device, "action": action_type}
+        if action_type != "back":
+            action_params["x"] = int(result_json.get("x", 0))
+            action_params["y"] = int(result_json.get("y", 0))
+        if action_type == "text":
+            action_params["input_str"] = result_json.get("input_str", "")
+        elif action_type == "long_press":
+            action_params["duration"] = int(result_json.get("duration", 1000))
+        elif action_type == "swipe":
+            action_params["direction"] = result_json.get("direction", "up")
+            action_params["dist"]      = result_json.get("dist", "medium")
 
-    # Parse results
-    final_messages = action_result.get("messages", [])
-    if final_messages:
-        # Add AI reply to message history
-        ai_message = final_messages[-1]
-        state["messages"].append(ai_message)
-
-        # Extract recommended action from final_message
-        recommended_action = ai_message.content.strip()
-
-        # Update execution status
+        screen_action.invoke(action_params)
         state["current_step"] += 1
-        state["history"].append(
-            {
-                "step": state["current_step"],
-                "screenshot": screenshot_path,
-                "elements_json": elements_json_path,
-                "action": "react_mode",
-                "recommended_action": recommended_action,
-                "status": "success",
-            }
-        )
-
+        state["history"].append({
+            "step":      state["current_step"],
+            "screenshot": screenshot_path,
+            "action":    action_type,
+            "params":    action_params,
+            "status":    "success",
+        })
         state["execution_status"] = "success"
-        print(f"✓ React mode execution successful: {recommended_action}")
-    else:
-        error_msg = "React mode execution failed: No messages returned"
-        print(f"❌ {error_msg}")
+        print(f"✓ React mode: executed {action_type}")
 
-        # Update execution status
-        state["history"].append(
-            {
-                "step": state["current_step"],
-                "screenshot": screenshot_path,
-                "elements_json": elements_json_path,
-                "action": "react_mode",
-                "status": "error",
-                "error": error_msg,
-            }
-        )
-
+    except Exception as e:
+        print(f"❌ React mode error: {e}")
+        state["history"].append({
+            "step":   state["current_step"],
+            "action": "react_mode",
+            "status": "error",
+            "error":  str(e),
+        })
         state["execution_status"] = "error"
 
     return state
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  execute_task  (top-level, unchanged logic)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def execute_task(
     state: DeploymentState, task: str, device: str, neo4j_db: Neo4jDatabase = None
 ) -> Dict[str, Any]:
-    """
-    Main function to execute a task
-
-    Args:
-        state: Initial state
-        task: User task
-        device: Device ID
-        neo4j_db: Neo4j database connection (optional, uses global db by default)
-
-    Returns:
-        Execution result
-    """
-    # Update state using create_deployment_state function
     from data.State import create_deployment_state
-
-    # Create new state
-    state = create_deployment_state(task=task, device=device)
-
-    # Use global db object
+    state    = create_deployment_state(task=task, device=device)
     neo4j_db = neo4j_db or db
 
-    # Query database for all element nodes - using correct method name
     all_elements = neo4j_db.get_all_actions()
     if not all_elements:
         print("⚠️ No element nodes in database, falling back to React mode")
         state = fallback_to_react(state)
         return {"status": state["execution_status"], "state": state}
 
-    # Query database for high-level actions related to the task
     high_level_actions = neo4j_db.get_high_level_actions_for_task(task)
     if high_level_actions:
-        print(
-            f"✓ Found {len(high_level_actions)} high-level actions related to the task"
-        )
-
-        # Check for shortcut associations
         shortcuts = check_shortcut_associations(state, high_level_actions)
-
         if shortcuts:
-            print(f"✓ Found {len(shortcuts)} possible shortcuts")
-
-            # Evaluate shortcut execution conditions
             valid_shortcuts = evaluate_shortcut_execution(state, shortcuts)
-
             if valid_shortcuts:
-                print(f"✓ {len(valid_shortcuts)} shortcuts meet execution conditions")
-
-                # Generate execution template
                 execution_template = generate_execution_template(state, valid_shortcuts)
-
                 if execution_template:
-                    print("✓ Generated execution template")
-
-                    # Sort shortcuts by priority
-                    prioritized_shortcuts = prioritize_shortcuts(state, valid_shortcuts)
-
-                    # Execute high-level operation
-                    result = execute_high_level_action(
-                        state, prioritized_shortcuts, execution_template
-                    )
-
+                    prioritized = prioritize_shortcuts(state, valid_shortcuts)
+                    result = execute_high_level_action(state, prioritized, execution_template)
                     if result.get("status") == "success":
-                        print(
-                            f"✓ High-level operation executed successfully: {result.get('message', '')}"
-                        )
                         state["execution_status"] = "success"
-                        state["completed"] = True
+                        state["completed"]         = True
                         return {"status": "success", "state": state}
                     else:
-                        print(
-                            f"❌ High-level operation execution failed: {result.get('message', '')}"
-                        )
-                        # Fall back to React mode on failure
                         state = fallback_to_react(state)
                         return {"status": state["execution_status"], "state": state}
         else:
-            # No shortcuts, try executing basic operation sequence
             for action in high_level_actions:
                 action_sequence = action.get("action_sequence", [])
                 if not action_sequence:
                     continue
-
-                # Capture and parse screen
                 state = capture_and_parse_screen(state)
                 if not state["current_page"]["screenshot"]:
                     state["retry_count"] += 1
                     if state["retry_count"] >= state["max_retries"]:
-                        print(
-                            f"❌ Failed to capture or parse screen {state['max_retries']} times in a row, falling back to React mode"
-                        )
                         state = fallback_to_react(state)
                         return {"status": state["execution_status"], "state": state}
                     continue
-
-                # Reset retry count
                 state["retry_count"] = 0
-
-                # Match screen elements
                 element_matches = match_screen_elements(state, action_sequence)
                 if not element_matches:
                     state["retry_count"] += 1
                     if state["retry_count"] >= state["max_retries"]:
-                        print(
-                            f"❌ No matching elements found {state['max_retries']} times in a row, falling back to React mode"
-                        )
                         state = fallback_to_react(state)
                         return {"status": state["execution_status"], "state": state}
                     continue
-
-                # Reset retry count
                 state["retry_count"] = 0
-
-                # Execute element action
                 best_match = element_matches[0]
                 success = execute_element_action(state, best_match)
-
                 if success:
-                    print(f"✓ Step {state['current_step']} executed successfully")
-
-                    # Update history
-                    state["history"].append(
-                        {
-                            "step": state["current_step"],
-                            "screenshot": state["current_page"]["screenshot"],
-                            "elements_json": state["current_page"]["elements_json"],
-                            "action": best_match.get("action_type", "tap"),
-                            "element_id": best_match.get("element_id", ""),
-                            "screen_element_id": best_match.get(
-                                "screen_element_id", -1
-                            ),
-                            "status": "success",
-                        }
-                    )
-
-                    # Update current step
                     state["current_step"] += 1
-
-                    # Check if all steps are completed
+                    state["history"].append({
+                        "step": state["current_step"],
+                        "screenshot": state["current_page"]["screenshot"],
+                        "action": best_match.get("action_type", "tap"),
+                        "element_id": best_match.get("element_id", ""),
+                        "status": "success",
+                    })
                     if state["current_step"] >= len(action_sequence):
-                        print("✓ All steps completed")
                         state["execution_status"] = "success"
-                        state["completed"] = True
+                        state["completed"]         = True
                         return {"status": "success", "state": state}
                 else:
-                    print(f"❌ Step {state['current_step']} execution failed")
-
-                    # Update history
-                    state["history"].append(
-                        {
-                            "step": state["current_step"],
-                            "screenshot": state["current_page"]["screenshot"],
-                            "elements_json": state["current_page"]["elements_json"],
-                            "action": best_match.get("action_type", "tap"),
-                            "element_id": best_match.get("element_id", ""),
-                            "screen_element_id": best_match.get(
-                                "screen_element_id", -1
-                            ),
-                            "status": "error",
-                        }
-                    )
-
-                    # Increment retry count
                     state["retry_count"] += 1
                     if state["retry_count"] >= state["max_retries"]:
-                        print(
-                            f"❌ Operation failed {state['max_retries']} times in a row, falling back to React mode"
-                        )
                         state = fallback_to_react(state)
                         return {"status": state["execution_status"], "state": state}
     else:
@@ -921,455 +622,174 @@ def execute_task(
         state = fallback_to_react(state)
         return {"status": state["execution_status"], "state": state}
 
-    # If all above methods fail, fall back to React mode
-    print(
-        "⚠️ Unable to complete task with high-level operations, falling back to basic operation space"
-    )
     state = fallback_to_react(state)
     return {"status": state["execution_status"], "state": state}
 
 
-def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
-    """
-    Execute a single task
-
-    Args:
-        task: User task description
-        device: Device ID
-
-    Returns:
-        Execution result
-    """
-    print(f"🚀 Starting task execution: {task}")
-
-    try:
-        # Initialize state using create_deployment_state function
-        from data.State import create_deployment_state
-
-        state = create_deployment_state(
-            task=task,
-            device=device,
-            max_retries=3,
-        )
-
-        # Execute task using LangGraph workflow
-        workflow = build_workflow()
-        app = workflow.compile()
-        result = app.invoke(state)
-
-        # Display final screenshot if execution was successful
-        if (
-            result["execution_status"] == "success"
-            and result["current_page"]["screenshot"]
-        ):
-            try:
-                from PIL import Image
-
-                img = Image.open(result["current_page"]["screenshot"])
-                img.show()
-            except Exception as e:
-                print(f"Unable to display final screenshot: {str(e)}")
-
-        return {
-            "status": result["execution_status"],
-            "message": "Task execution completed",
-            "steps_completed": result["current_step"],
-            "total_steps": result["total_steps"],
-        }
-
-    except Exception as e:
-        print(f"❌ Error executing task: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Error executing task: {str(e)}",
-            "error": str(e),
-        }
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shortcut helpers  (all Gemini prompts replaced with bridge calls)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def check_shortcut_associations(
     state: DeploymentState, high_level_actions: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Check if high-level actions are associated with shortcuts
-
-    Args:
-        state: Execution state
-        high_level_actions: List of high-level actions
-
-    Returns:
-        List of associated shortcuts
-    """
     print("🔍 Checking high-level action shortcut associations...")
-    shortcuts = []
-
+    shortcuts: List[Dict[str, Any]] = []
     for action in high_level_actions:
         action_id = action.get("action_id")
         if not action_id:
             continue
-
-        # Query database for shortcuts associated with high-level action
-        associated_shortcuts = state["neo4j_db"].get_shortcuts_for_action(action_id)
-        if associated_shortcuts:
-            for shortcut in associated_shortcuts:
-                shortcuts.append(
-                    {
-                        "shortcut_id": shortcut.get("shortcut_id"),
-                        "name": shortcut.get("name"),
-                        "description": shortcut.get("description"),
-                        "action_id": action_id,
-                        "action_name": action.get("name"),
-                        "action_sequence": action.get("action_sequence", []),
-                        "conditions": shortcut.get("conditions", {}),
-                        "priority": shortcut.get("priority", 0),
-                        "page_flow": shortcut.get("page_flow", []),
-                    }
-                )
-
-    if shortcuts:
-        print(f"✓ Found {len(shortcuts)} associated shortcuts")
-    else:
-        print("⚠️ No associated shortcuts found")
-
+        associated = state.get("neo4j_db", db).get_shortcuts_for_action(action_id)
+        for shortcut in (associated or []):
+            shortcuts.append({
+                "shortcut_id":    shortcut.get("shortcut_id"),
+                "name":           shortcut.get("name"),
+                "description":    shortcut.get("description"),
+                "action_id":      action_id,
+                "action_name":    action.get("name"),
+                "action_sequence": action.get("action_sequence", []),
+                "conditions":     shortcut.get("conditions", {}),
+                "priority":       shortcut.get("priority", 0),
+                "page_flow":      shortcut.get("page_flow", []),
+            })
+    print(f"{'✓' if shortcuts else '⚠️'} Found {len(shortcuts)} associated shortcut(s)")
     return shortcuts
+
+
+_SHORTCUT_EVAL_SYSTEM = (
+    "You are a smartphone operation assistant that evaluates whether the current "
+    "scenario meets the conditions for executing shortcuts.\n\n"
+    "Return ONLY a JSON object:\n"
+    "  {\"valid_shortcuts\": [{\"shortcut_id\": \"...\", \"reason\": \"...\", \"confidence\": 0.0}]}\n"
+    "If no shortcuts match, return an empty list. No preamble, no markdown fences."
+)
 
 
 def evaluate_shortcut_execution(
     state: DeploymentState, shortcuts: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Evaluate if shortcuts meet execution conditions
-
-    Args:
-        state: Execution state
-        shortcuts: List of shortcuts
-
-    Returns:
-        List of shortcuts that meet execution conditions
-    """
     print("🧠 Evaluating shortcut execution conditions...")
-
     if not shortcuts:
-        print("⚠️ No shortcuts to evaluate")
         return []
 
-    # Prepare current screen information
     screen_desc = ""
     if state["current_page"]["elements_data"]:
-        screen_desc = "Current screen contains the following elements:\n"
-        for i, element in enumerate(state["current_page"]["elements_data"]):
-            element_type = element.get("type", "Unknown type")
-            element_content = element.get("content", "")
-            screen_desc += f"{i+1}. Type: {element_type}, Content: {element_content}\n"
+        screen_desc = "Current screen elements:\n"
+        for i, el in enumerate(state["current_page"]["elements_data"]):
+            screen_desc += f"  {i+1}. Type: {el.get('type','?')}  Content: {el.get('content','')}\n"
 
-    # Prepare task information
-    task_desc = state["task"]
-
-    # Create evaluation prompt
-    eval_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """You are a smartphone operation assistant responsible for evaluating whether the current scenario meets the conditions for executing shortcuts.
-Analyze the current screen information, user task, and shortcut execution conditions to determine which shortcuts can be executed.
-Only execute shortcuts when their conditions match the current scenario.""",
-            ),
-            (
-                "human",
-                """User task: {task}
-
-Current screen information:
-{screen_info}
-
-Available shortcuts:
-{shortcuts_info}
-
-Please evaluate if each shortcut meets execution conditions, return in JSON format:
-{{
-  "valid_shortcuts": [
-    {{
-      "shortcut_id": "ID of shortcut meeting conditions",
-      "reason": "Reason for meeting conditions",
-      "confidence": "Confidence level between 0.0-1.0"
-    }},
-    ...
-  ]
-}}
-
-If no shortcuts meet conditions, return an empty list.
-""",
-            ),
-        ]
-    )
-
-    # Prepare shortcuts information
     shortcuts_info = ""
-    for i, shortcut in enumerate(shortcuts):
-        shortcuts_info += f"{i+1}. ID: {shortcut.get('shortcut_id')}\n"
-        shortcuts_info += f"   Name: {shortcut.get('name')}\n"
-        shortcuts_info += (
-            f"   Description: {shortcut.get('description', 'No description')}\n"
-        )
-
-        # Add conditions information
-        conditions = shortcut.get("conditions", {})
-        if conditions:
-            shortcuts_info += "   Execution conditions:\n"
-            if isinstance(conditions, dict):
-                for k, v in conditions.items():
-                    shortcuts_info += f"     - {k}: {v}\n"
-            elif isinstance(conditions, str):
-                shortcuts_info += f"     - {conditions}\n"
-
+    for i, sc in enumerate(shortcuts):
+        shortcuts_info += f"{i+1}. ID: {sc.get('shortcut_id')}  Name: {sc.get('name')}\n"
+        shortcuts_info += f"   Description: {sc.get('description','N/A')}\n"
+        cond = sc.get("conditions", {})
+        if cond:
+            if isinstance(cond, dict):
+                shortcuts_info += "   Conditions: " + "; ".join(f"{k}={v}" for k, v in cond.items()) + "\n"
+            else:
+                shortcuts_info += f"   Conditions: {cond}\n"
         shortcuts_info += "\n"
 
-    # Call LLM for evaluation
+    user_prompt = (
+        f"User task: {state['task']}\n\n"
+        f"{screen_desc}\n"
+        f"Available shortcuts:\n{shortcuts_info}\n"
+        "Evaluate which shortcuts meet execution conditions and return JSON."
+    )
+
     try:
-        # Prepare input
-        eval_input = {
-            "task": task_desc,
-            "screen_info": screen_desc,
-            "shortcuts_info": shortcuts_info,
-        }
-
-        # Create parser
-        parser = JsonOutputParser()
-
-        # Build chain
-        eval_chain = eval_prompt | model | parser
-
-        # Execute evaluation
-        result = eval_chain.invoke(eval_input)
-
-        # Parse results
-        valid_shortcuts = result.get("valid_shortcuts", [])
-
-        if valid_shortcuts:
-            # Find corresponding complete shortcut information
-            valid_shortcut_objects = []
-            for valid in valid_shortcuts:
-                shortcut_id = valid.get("shortcut_id")
-                for shortcut in shortcuts:
-                    if shortcut.get("shortcut_id") == shortcut_id:
-                        # Add evaluation information
-                        shortcut_copy = shortcut.copy()
-                        shortcut_copy["evaluation"] = {
-                            "reason": valid.get("reason", ""),
-                            "confidence": valid.get("confidence", 0.0),
-                        }
-                        valid_shortcut_objects.append(shortcut_copy)
+        result        = _sync_call_json(_SHORTCUT_EVAL_SYSTEM, user_prompt, timeout=180)
+        valid_list    = result.get("valid_shortcuts", [])
+        valid_ids     = {v["shortcut_id"] for v in valid_list}
+        valid_objects = []
+        for sc in shortcuts:
+            if sc.get("shortcut_id") in valid_ids:
+                sc_copy = sc.copy()
+                for v in valid_list:
+                    if v["shortcut_id"] == sc.get("shortcut_id"):
+                        sc_copy["evaluation"] = {"reason": v.get("reason",""), "confidence": v.get("confidence", 0.0)}
                         break
-
-            print(
-                f"✓ Found {len(valid_shortcut_objects)} shortcuts meeting execution conditions"
-            )
-            return valid_shortcut_objects
-        else:
-            print("⚠️ No shortcuts meet execution conditions")
-            return []
-
+                valid_objects.append(sc_copy)
+        print(f"✓ {len(valid_objects)} shortcut(s) meet execution conditions")
+        return valid_objects
     except Exception as e:
-        print(f"❌ Error evaluating shortcut execution conditions: {str(e)}")
+        print(f"❌ Error evaluating shortcuts: {e}")
         return []
+
+
+_TEMPLATE_GEN_SYSTEM = (
+    "You are a smartphone operation assistant that generates detailed execution "
+    "templates from shortcuts and the current screen state.\n\n"
+    "Return ONLY a JSON object:\n"
+    "  {\"steps\": [{\"action_type\": \"tap|text|swipe|long_press|back\", "
+    "\"target_element_id\": <int or null>, \"parameters\": {...}}]}\n"
+    "No preamble, no markdown fences."
+)
 
 
 def generate_execution_template(
     state: DeploymentState, shortcuts: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """
-    Generate execution template based on shortcuts
-
-    Args:
-        state: Execution state
-        shortcuts: List of shortcuts that meet execution conditions
-
-    Returns:
-        Execution template with operation steps and parameters
-    """
     print("📝 Generating execution template...")
-
     if not shortcuts:
-        print("⚠️ No available shortcuts, cannot generate execution template")
         return {}
 
-    # Select shortcut with highest confidence
-    selected_shortcut = max(
-        shortcuts, key=lambda x: x.get("evaluation", {}).get("confidence", 0)
-    )
+    selected = max(shortcuts, key=lambda x: x.get("evaluation", {}).get("confidence", 0))
 
-    # Get device dimensions
     device_size = get_device_size.invoke(state["device"])
     if isinstance(device_size, str):
         device_size = {"width": 1080, "height": 1920}
 
-    # Prepare current screen information
-    screen_elements = state["current_page"]["elements_data"]
-    screen_elements_json = json.dumps(screen_elements, ensure_ascii=False, indent=2)
+    shortcut_info = (
+        f"ID: {selected.get('shortcut_id')}\n"
+        f"Name: {selected.get('name')}\n"
+        f"Description: {selected.get('description','N/A')}\n"
+    )
+    seq = selected.get("action_sequence", [])
+    if seq:
+        shortcut_info += "Action sequence:\n" + "\n".join(
+            f"  {i+1}. {json.dumps(a, ensure_ascii=False)}" for i, a in enumerate(seq)
+        )
+    eval_ = selected.get("evaluation", {})
+    if eval_:
+        shortcut_info += f"\nReason: {eval_.get('reason','')}  Confidence: {eval_.get('confidence',0)}"
 
-    # Create template generation prompt
-    template_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """You are a smartphone operation assistant responsible for generating detailed execution templates based on shortcuts and current screen state.
-The execution template should include all steps needed to complete the operation, with each step specifying the action type, target element, and necessary parameters.
-Available action types include: tap, text (input text), swipe, long_press, back.
-Ensure the generated template can accurately execute the operations described in the shortcut.""",
-            ),
-            (
-                "human",
-                """Shortcut information:
-{shortcut_info}
-
-Current screen elements:
-{screen_elements}
-
-Device size: {device_size}
-
-Please generate a detailed template for executing this shortcut, return in JSON format:
-{
-  "steps": [
-    {
-      "action_type": "action type(tap/text/swipe/long_press/back)",
-      "target_element_id": target element ID(number),
-      "parameters": {
-        // Add appropriate parameters based on action type
-        // e.g., text operation needs "text" parameter
-        // swipe operation needs "direction" and "distance" parameters
-      }
-    },
-    // more steps...
-  ]
-}
-
-Ensure each step has a clear operation target and necessary parameters. If the operation doesn't need a target element (like back operation), you can omit target_element_id.
-""",
-            ),
-        ]
+    user_prompt = (
+        f"Shortcut:\n{shortcut_info}\n\n"
+        f"Screen elements:\n{json.dumps(state['current_page']['elements_data'], ensure_ascii=False, indent=2)}\n\n"
+        f"Device size: {json.dumps(device_size, ensure_ascii=False)}\n\n"
+        "Generate the execution template JSON now."
     )
 
-    # Prepare shortcut information
-    shortcut_info = f"ID: {selected_shortcut.get('shortcut_id')}\n"
-    shortcut_info += f"Name: {selected_shortcut.get('name')}\n"
-    shortcut_info += (
-        f"Description: {selected_shortcut.get('description', 'No description')}\n"
-    )
-
-    # Add action sequence information
-    action_sequence = selected_shortcut.get("action_sequence", [])
-    if action_sequence:
-        shortcut_info += "Action sequence:\n"
-        if isinstance(action_sequence, list):
-            for i, action in enumerate(action_sequence):
-                shortcut_info += f"  {i+1}. {json.dumps(action, ensure_ascii=False)}\n"
-        elif isinstance(action_sequence, str):
-            shortcut_info += f"  {action_sequence}\n"
-
-    # Add evaluation information
-    evaluation = selected_shortcut.get("evaluation", {})
-    if evaluation:
-        shortcut_info += f"Execution reason: {evaluation.get('reason', 'None')}\n"
-        shortcut_info += f"Confidence: {evaluation.get('confidence', 0.0)}\n"
-
-    # Call LLM to generate template
     try:
-        # Prepare input
-        template_input = {
-            "shortcut_info": shortcut_info,
-            "screen_elements": screen_elements_json,
-            "device_size": json.dumps(device_size, ensure_ascii=False),
-        }
-
-        # Create parser
-        parser = JsonOutputParser()
-
-        # Build chain
-        template_chain = template_prompt | model | parser
-
-        # Execute generation
-        result = template_chain.invoke(template_input)
-
-        # Validate result
-        if (
-            "steps" in result
-            and isinstance(result["steps"], list)
-            and len(result["steps"]) > 0
-        ):
-            print(
-                f"✓ Successfully generated execution template with {len(result['steps'])} steps"
-            )
+        result = _sync_call_json(_TEMPLATE_GEN_SYSTEM, user_prompt, timeout=240)
+        if "steps" in result and isinstance(result["steps"], list) and result["steps"]:
+            print(f"✓ Generated template with {len(result['steps'])} steps")
             return result
-        else:
-            print("❌ Generated execution template is invalid")
-            return {}
-
+        print("❌ Generated template is invalid")
+        return {}
     except Exception as e:
-        print(f"❌ Error generating execution template: {str(e)}")
+        print(f"❌ Error generating template: {e}")
         return {}
 
 
 def prioritize_shortcuts(
     state: Dict[str, Any], shortcuts: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Prioritize shortcuts based on page flow
-
-    Args:
-        state: Execution state
-        shortcuts: List of shortcuts
-
-    Returns:
-        Prioritized list of shortcuts
-    """
     if not shortcuts or len(shortcuts) <= 1:
         return shortcuts
-
     try:
-        # Get page flow information from database
-        page_flow = state["neo4j_db"].get_page_flow()
-
+        page_flow = state.get("neo4j_db", db).get_page_flow()
         if not page_flow:
-            print("⚠️ No page flow information found, using default sorting")
-            # Default sort by match score
-            return sorted(
-                shortcuts,
-                key=lambda x: x["element_match"].get("match_score", 0),
-                reverse=True,
-            )
-
-        # Assign priority to each shortcut based on page flow position
+            return sorted(shortcuts, key=lambda x: x.get("element_match", {}).get("match_score", 0), reverse=True)
         prioritized = []
-        for shortcut in shortcuts:
-            # Find shortcut position in page flow
-            position = -1
-            shortcut_id = shortcut["shortcut_id"]
-
-            for idx, flow_node in enumerate(page_flow):
-                if flow_node.get("shortcut_id") == shortcut_id:
-                    position = idx
-                    break
-
-            prioritized.append(
-                {
-                    "shortcut": shortcut,
-                    "flow_position": position,
-                    "match_score": shortcut["element_match"].get("match_score", 0),
-                }
-            )
-
-        # First sort by flow position, unknown positions (-1) at the end
-        # For same positions, sort by match score
-        prioritized.sort(
-            key=lambda x: (
-                x["flow_position"] if x["flow_position"] >= 0 else float("inf"),
-                -x["match_score"],
-            )
-        )
-
-        return [item["shortcut"] for item in prioritized]
-
+        for sc in shortcuts:
+            pos = next((i for i, n in enumerate(page_flow) if n.get("shortcut_id") == sc.get("shortcut_id")), -1)
+            prioritized.append({"shortcut": sc, "pos": pos, "score": sc.get("element_match", {}).get("match_score", 0)})
+        prioritized.sort(key=lambda x: (x["pos"] if x["pos"] >= 0 else float("inf"), -x["score"]))
+        return [p["shortcut"] for p in prioritized]
     except Exception as e:
-        print(f"⚠️ Shortcut prioritization failed: {str(e)}")
-        # Return original list on error
+        print(f"⚠️ Shortcut prioritisation failed: {e}")
         return shortcuts
 
 
@@ -1378,114 +798,57 @@ def execute_high_level_action(
     shortcuts: List[Dict[str, Any]],
     execution_template: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Execute high-level operations
-
-    Args:
-        state: Execution state
-        shortcuts: List of shortcuts meeting execution conditions
-        execution_template: Execution template
-
-    Returns:
-        Execution result
-    """
     print("🚀 Executing high-level operations...")
 
     if not execution_template or "steps" not in execution_template:
-        print("❌ Invalid execution template")
         return {"status": "error", "message": "Invalid execution template"}
 
     steps = execution_template["steps"]
-    if not steps or not isinstance(steps, list):
-        print("❌ No valid steps in execution template")
-        return {"status": "error", "message": "No valid steps in execution template"}
+    if not steps:
+        return {"status": "error", "message": "No steps in execution template"}
 
-    # Initialize execution state
-    state["current_step"] = 0
-    state["total_steps"] = len(steps)
+    state["current_step"]    = 0
+    state["total_steps"]     = len(steps)
     state["execution_status"] = "running"
-    state["history"] = []
+    state["history"]         = []
 
-    # Record shortcut execution start
-    shortcut_names = ", ".join([s.get("name", "Unnamed shortcut") for s in shortcuts])
-    print(f"Starting execution of shortcuts: {shortcut_names}")
-    print(f"Total steps: {state['total_steps']}")
+    shortcut_names = ", ".join(s.get("name", "Unnamed") for s in shortcuts)
+    print(f"Executing shortcuts: {shortcut_names}  ({len(steps)} steps)")
 
-    # Execute each step
     while state["current_step"] < state["total_steps"]:
-        current_step_idx = state["current_step"]
-        step = steps[current_step_idx]
+        idx  = state["current_step"]
+        step = steps[idx]
+        print(f"\nStep {idx + 1}/{state['total_steps']}")
 
-        print(f"\nExecuting step {current_step_idx + 1}/{state['total_steps']}")
-
-        # Capture and parse current screen
         state = capture_and_parse_screen(state)
         if not state["current_page"]["screenshot"]:
             state["retry_count"] += 1
             if state["retry_count"] >= state["max_retries"]:
-                print(
-                    f"❌ Failed to capture or parse screen {state['max_retries']} times in a row"
-                )
-                return {
-                    "status": "error",
-                    "message": "Unable to capture or parse screen",
-                }
+                return {"status": "error", "message": "Unable to capture screen"}
+            time.sleep(1)
+            continue
+        state["retry_count"] = 0
 
-            # Wait a second before retrying
+        action_type       = step.get("action_type", "tap")
+        target_element_id = step.get("target_element_id")
+        parameters        = step.get("parameters", {})
+
+        if action_type == "back":
+            screen_action.invoke({"device": state["device"], "action": "back"})
+            state["history"].append({"step": idx, "action": "back", "status": "success"})
+            state["current_step"] += 1
             time.sleep(1)
             continue
 
-        # Reset retry counter
-        state["retry_count"] = 0
-
-        # Get action type and parameters
-        action_type = step.get("action_type", "tap")
-        target_element_id = step.get("target_element_id")
-        parameters = step.get("parameters", {})
-
-        # Special handling for back operation
-        if action_type == "back":
-            print("Executing back operation")
-            result = screen_action.invoke({"device": state["device"], "action": "back"})
-
-            # Record history
-            state["history"].append(
-                {
-                    "step": current_step_idx,
-                    "screenshot": state["current_page"]["screenshot"],
-                    "elements_json": state["current_page"]["elements_json"],
-                    "action": "back",
-                    "status": "success",
-                }
-            )
-
-            # Move to next step
-            state["current_step"] += 1
-            time.sleep(1)  # Wait for operation to take effect
-            continue
-
-        # For operations requiring target element
         if target_element_id is None:
-            print("❌ Operation missing target element ID")
-            return {
-                "status": "error",
-                "message": f"Step {current_step_idx + 1} missing target element ID",
-            }
+            return {"status": "error", "message": f"Step {idx+1} missing target_element_id"}
 
-        # Check if target element exists
         screen_elements = state["current_page"]["elements_data"]
         if target_element_id < 0 or target_element_id >= len(screen_elements):
-            print(f"❌ Invalid target element ID: {target_element_id}")
-            return {
-                "status": "error",
-                "message": f"Invalid target element ID for step {current_step_idx + 1}",
-            }
+            return {"status": "error", "message": f"Invalid target_element_id for step {idx+1}"}
 
-        # Get element position
-        element = screen_elements[target_element_id]
-        bbox = element.get("bbox", [0, 0, 0, 0])
-
-        # Get device size and calculate center point
+        element     = screen_elements[target_element_id]
+        bbox        = element.get("bbox", [0, 0, 0, 0])
         device_size = get_device_size.invoke(state["device"])
         if isinstance(device_size, str):
             device_size = {"width": 1080, "height": 1920}
@@ -1493,615 +856,362 @@ def execute_high_level_action(
         center_x = int((bbox[0] + bbox[2]) / 2 * device_size["width"])
         center_y = int((bbox[1] + bbox[3]) / 2 * device_size["height"])
 
-        # Prepare operation parameters
-        action_params = {
-            "device": state["device"],
-            "action": action_type,
-            "x": center_x,
-            "y": center_y,
-        }
-
-        # Add specific parameters based on action type
+        action_params: Dict[str, Any] = {"device": state["device"], "action": action_type, "x": center_x, "y": center_y}
         if action_type == "text":
             action_params["input_str"] = parameters.get("text", "")
         elif action_type == "long_press":
             action_params["duration"] = parameters.get("duration", 1000)
         elif action_type == "swipe":
             action_params["direction"] = parameters.get("direction", "up")
-            action_params["dist"] = parameters.get("distance", "medium")
+            action_params["dist"]      = parameters.get("distance", "medium")
 
-        # Execute operation
-        print(
-            f"Executing operation: {action_type} at position ({center_x}, {center_y})"
-        )
-        if action_type == "text":
-            print(f"Input text: {action_params.get('input_str', '')}")
-
-        result = screen_action.invoke(action_params)
-
-        # Parse operation result
+        result  = screen_action.invoke(action_params)
         success = False
         if isinstance(result, str):
             try:
-                result_json = json.loads(result)
-                if result_json.get("status") == "success":
-                    success = True
-            except:
+                success = json.loads(result).get("status") == "success"
+            except Exception:
                 pass
 
         if success:
-            print(f"✓ Step {current_step_idx + 1} executed successfully")
-
-            # Record history
-            state["history"].append(
-                {
-                    "step": current_step_idx,
-                    "screenshot": state["current_page"]["screenshot"],
-                    "elements_json": state["current_page"]["elements_json"],
-                    "action": action_type,
-                    "target_element_id": target_element_id,
-                    "parameters": parameters,
-                    "status": "success",
-                }
-            )
-
-            # Move to next step
+            print(f"✓ Step {idx + 1} OK")
+            state["history"].append({"step": idx, "action": action_type, "target": target_element_id, "status": "success"})
             state["current_step"] += 1
-            state["retry_count"] = 0
-
-            # Wait for operation to take effect
+            state["retry_count"]   = 0
             time.sleep(1.5)
         else:
-            print(f"❌ Step {current_step_idx + 1} execution failed")
-
-            # Record history
-            state["history"].append(
-                {
-                    "step": current_step_idx,
-                    "screenshot": state["current_page"]["screenshot"],
-                    "elements_json": state["current_page"]["elements_json"],
-                    "action": action_type,
-                    "target_element_id": target_element_id,
-                    "parameters": parameters,
-                    "status": "error",
-                }
-            )
-
-            # Increment retry counter
+            print(f"❌ Step {idx + 1} failed")
+            state["history"].append({"step": idx, "action": action_type, "target": target_element_id, "status": "error"})
             state["retry_count"] += 1
             if state["retry_count"] >= state["max_retries"]:
-                print(f"❌ Operation failed {state['max_retries']} times in a row")
-                return {
-                    "status": "error",
-                    "message": f"Step {current_step_idx + 1} execution failed",
-                }
-
-            # Wait a second before retrying
+                return {"status": "error", "message": f"Step {idx+1} failed after {state['max_retries']} retries"}
             time.sleep(1)
 
-    # Capture final screen
     state = capture_and_parse_screen(state)
-
-    # Execution complete
-    print(
-        f"\n✨ High-level operation execution complete! Completed {state['current_step']} operations"
-    )
     state["execution_status"] = "success"
-    state["completed"] = True
-
+    state["completed"]         = True
+    print(f"\n✨ High-level execution complete — {state['current_step']} steps done")
     return {
-        "status": "success",
-        "message": "Successfully executed high-level operations",
-        "steps_completed": state["current_step"],
-        "total_steps": state["total_steps"],
-        "final_screenshot": state["current_page"]["screenshot"],
+        "status":            "success",
+        "message":           "Successfully executed high-level operations",
+        "steps_completed":   state["current_step"],
+        "total_steps":       state["total_steps"],
+        "final_screenshot":  state["current_page"]["screenshot"],
         "execution_history": state["history"],
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Task completion check  (vision + text via Qwen)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CRITERIA_SYSTEM = (
+    "You are an assistant that generates clear, checkable task-completion criteria. "
+    "Describe what must appear on screen for the task to be considered done."
+)
+
+_JUDGE_SYSTEM = (
+    "You are a page assessment assistant. "
+    "Given the completion criteria and recent screenshots, decide if the task is complete. "
+    "Reply with only 'yes' or 'no'."
+)
+
+
+def check_task_completion(state: DeploymentState) -> DeploymentState:
+    if state["current_step"] < 2:
+        return state
+
+    print("🔍 Evaluating if task is completed...")
+    task = state["task"]
+
+    # Generate criteria
+    try:
+        completion_criteria = _sync_call_text(
+            system_prompt=_CRITERIA_SYSTEM,
+            user_prompt=f"The user's task is: {task}\nDescribe clear, checkable completion criteria.",
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"⚠️ Could not generate criteria: {e}")
+        return state
+
+    # Collect recent screenshots
+    recent_screenshots: List[str] = [
+        step["screenshot"] for step in state["history"][-3:] if step.get("screenshot")
+    ]
+    if not recent_screenshots and state["current_page"]["screenshot"]:
+        recent_screenshots = [state["current_page"]["screenshot"]]
+    if not recent_screenshots:
+        print("⚠️ No screenshots available")
+        return state
+
+    images_b64: List[str] = []
+    for p in recent_screenshots:
+        b64 = _img_to_b64(p)
+        if b64:
+            images_b64.append(b64)
+
+    user_prompt = (
+        f"Completion criteria: {completion_criteria}\n\n"
+        "Analyse the provided screenshots. "
+        "If screenshots are identical the task may be stuck — answer 'yes' to end.\n"
+        "Is the task complete? Reply yes or no."
+    )
+
+    try:
+        answer = _sync_call_vision(
+            system_prompt=_JUDGE_SYSTEM,
+            user_prompt=user_prompt,
+            images_b64=images_b64,
+            timeout=180,
+        ).strip().lower()
+    except Exception as e:
+        print(f"⚠️ Completion check error: {e}")
+        return state
+
+    if "yes" in answer or "complete" in answer:
+        state["completed"]        = True
+        state["execution_status"] = "completed"
+        print(f"✓ Task completed: {answer}")
+    else:
+        state["completed"] = False
+        print(f"⚠️ Task not completed: {answer}")
+
+    state["history"].append({
+        "step":               state["current_step"],
+        "action":             "task_completion_check",
+        "completion_criteria": completion_criteria,
+        "judgement":          answer,
+        "status":             "success",
+        "completed":          state["completed"],
+    })
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LangGraph node wrappers  (unchanged structure)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def capture_screen_node(state: DeploymentState) -> DeploymentState:
     print("📸 Capturing and parsing current screen...")
-
-    state_dict = dict(state)
-    updated_state = capture_and_parse_screen(state_dict)
-
-    # Update state
-    for key, value in updated_state.items():
-        if key in state:
-            state[key] = value
-
+    state_dict   = dict(state)
+    updated      = capture_and_parse_screen(state_dict)
+    for k, v in updated.items():
+        if k in state:
+            state[k] = v
     if not state["current_page"]["screenshot"]:
         state["should_fallback"] = True
         print("❌ Unable to capture screen, marking for fallback")
     else:
         print("✓ Screen captured successfully")
-
     return state
 
 
 def match_elements_node(state: DeploymentState) -> DeploymentState:
-    """
-    Match current screen elements using visual embeddings
-    """
-    print("🔍 Matching current screen elements using visual embeddings...")
-
-    # Get all element nodes from database - using correct method name
+    print("🔍 Matching current screen elements...")
     all_elements = db.get_all_actions()
     if not all_elements:
-        print("⚠️ No element nodes in database, marking for fallback")
         state["should_fallback"] = True
         return state
 
-    # Build action sequence with all elements from database
-    action_sequence = []
+    action_sequence: List[Dict[str, Any]] = []
     for element in all_elements:
-        # Ensure element has element_id field
         if "element_id" in element:
-            action_sequence.append(
-                {
-                    "element_id": element["element_id"],
-                    "atomic_action": "tap",  # Default action
-                    "action_params": {},
-                }
-            )
+            action_sequence.append({"element_id": element["element_id"], "atomic_action": "tap", "action_params": {}})
         else:
-            # If no element_id, try using other possible ID fields
-            element_id = (
-                element.get("id") or element.get("node_id") or str(hash(str(element)))
-            )
-            print(
-                f"⚠️ Element missing element_id field, using alternative ID: {element_id}"
-            )
-            action_sequence.append(
-                {
-                    "element_id": element_id,
-                    "atomic_action": "tap",  # Default action
-                    "action_params": {},
-                }
-            )
+            element_id = element.get("id") or element.get("node_id") or str(hash(str(element)))
+            action_sequence.append({"element_id": element_id, "atomic_action": "tap", "action_params": {}})
 
-    # Call match_screen_elements function
     state_dict = dict(state)
     element_matches = match_screen_elements(state_dict, action_sequence)
     state["matched_elements"] = element_matches
 
     if not state["matched_elements"]:
-        print(
-            "⚠️ No matching screen elements found, trying high-level task matching first"
-        )
-
-        # Try matching task to high-level actions
         is_matched, matched_action = match_task_to_action(state_dict, state["task"])
-
         if is_matched and matched_action:
-            print(
-                f"✓ Task matched to high-level action: {matched_action.get('name', 'Unknown')}"
-            )
-            # Save current executing high-level action
             state["current_action"] = matched_action
-
-            # Get element sequence
             element_sequence = matched_action.get("element_sequence", [])
             if isinstance(element_sequence, str):
                 try:
                     element_sequence = json.loads(element_sequence)
-                except:
-                    print(f"❌ Failed to parse element sequence")
+                except Exception:
                     state["should_fallback"] = True
                     return state
-
-            if not element_sequence or not isinstance(element_sequence, list):
-                print(f"❌ Element sequence is empty or invalid format")
+            if not element_sequence:
                 state["should_fallback"] = True
                 return state
-
-            # Update step information in state
-            state["current_step"] = 0
-            state["total_steps"] = len(element_sequence)
-
-            # Recapture screen and match elements
-            updated_state = capture_and_parse_screen(state_dict)
-            for key, value in updated_state.items():
-                if key in state:
-                    state[key] = value
-
-            element_matches = match_screen_elements(state_dict, element_sequence)
-            state["matched_elements"] = element_matches
-
-            if not element_matches:
-                print(
-                    "❌ Still no matching screen elements found, marking for fallback"
-                )
+            state["current_step"]  = 0
+            state["total_steps"]   = len(element_sequence)
+            updated = capture_and_parse_screen(state_dict)
+            for k, v in updated.items():
+                if k in state:
+                    state[k] = v
+            state["matched_elements"] = match_screen_elements(state_dict, element_sequence)
+            if not state["matched_elements"]:
                 state["should_fallback"] = True
         else:
-            print("❌ No matching high-level actions found, marking for fallback")
             state["should_fallback"] = True
     else:
         print(f"✓ Found {len(state['matched_elements'])} matching elements")
-
     return state
 
 
 def check_shortcuts_node(state: DeploymentState) -> DeploymentState:
-    """
-    Check element associations with shortcuts
-    """
     print("🔍 Checking element associations with shortcuts...")
-
     if not state["matched_elements"]:
-        print("⚠️ No matched elements, cannot check shortcut associations")
         state["should_fallback"] = True
         return state
-
-    # Call check_shortcut_associations function
     state_dict = dict(state)
-    associated_shortcuts = check_shortcut_associations(
-        state_dict, state["matched_elements"]
-    )
-    state["associated_shortcuts"] = associated_shortcuts
-
-    if state["associated_shortcuts"]:
-        print(f"✓ Found {len(state['associated_shortcuts'])} associated shortcut nodes")
-
-        # Priority sorting
-        prioritized_shortcuts = prioritize_shortcuts(state_dict, associated_shortcuts)
-        state["associated_shortcuts"] = prioritized_shortcuts
+    associated = check_shortcut_associations(state_dict, state["matched_elements"])
+    if associated:
+        state["associated_shortcuts"] = prioritize_shortcuts(state_dict, associated)
+        print(f"✓ Found {len(state['associated_shortcuts'])} associated shortcut node(s)")
     else:
         print("📝 No associated shortcut nodes found")
-
+        state["associated_shortcuts"] = []
     return state
 
 
 def shortcut_evaluation_node(state: DeploymentState) -> DeploymentState:
-    """
-    Evaluate whether to execute shortcut operations
-    """
     print("🧠 Evaluating whether to execute shortcut operations...")
-
     if not state["associated_shortcuts"]:
-        print("⚠️ No associated shortcuts, skipping evaluation")
         return state
-
-    # Call evaluate_shortcut_execution function
     state_dict = dict(state)
-    execution_decision = evaluate_shortcut_execution(
-        state_dict, state["associated_shortcuts"], state["task"]
-    )
-
-    state["should_execute_shortcut"] = execution_decision.get("should_execute", False)
-    if "shortcut" in execution_decision:
-        state["current_shortcut"] = execution_decision["shortcut"]
-
-    if state["should_execute_shortcut"]:
-        print(
-            f"✓ Decided to execute shortcut: {state['current_shortcut'].get('name', 'Unknown')}"
-        )
-        print(f"  Reason: {execution_decision.get('reason', '')}")
-    else:
-        print(
-            f"⚠️ Decided not to execute shortcut operations: {execution_decision.get('reason', '')}"
-        )
-
+    # evaluate_shortcut_execution returns a list, not a dict — handle both shapes
+    result = evaluate_shortcut_execution(state_dict, state["associated_shortcuts"])
+    if isinstance(result, list) and result:
+        state["should_execute_shortcut"] = True
+        state["current_shortcut"]        = result[0]
+    elif isinstance(result, dict):
+        state["should_execute_shortcut"] = result.get("should_execute", False)
+        if "shortcut" in result:
+            state["current_shortcut"] = result["shortcut"]
+    print(f"{'✓' if state.get('should_execute_shortcut') else '⚠️'} Execute shortcut: {state.get('should_execute_shortcut')}")
     return state
 
 
 def generate_template_node(state: DeploymentState) -> DeploymentState:
-    """
-    Generate execution template
-    """
     print("📝 Generating execution template...")
-
-    if not state["should_execute_shortcut"] or "current_shortcut" not in state:
-        print("⚠️ Not executing shortcut, skipping template generation")
+    if not state.get("should_execute_shortcut") or "current_shortcut" not in state:
         return state
-
-    # Call generate_execution_template function
     state_dict = dict(state)
-    execution_template = generate_execution_template(
-        state_dict, state["current_shortcut"], state["task"]
-    )
-    state["execution_template"] = execution_template
-
-    print(
-        f"✓ Generated execution template with {len(state['execution_template']['steps'])} steps"
-    )
-
+    shortcuts  = [state["current_shortcut"]] if isinstance(state["current_shortcut"], dict) else state["associated_shortcuts"]
+    state["execution_template"] = generate_execution_template(state_dict, shortcuts)
+    steps = len(state.get("execution_template", {}).get("steps", []))
+    print(f"✓ Template generated with {steps} step(s)")
     return state
 
 
 def execute_action_node(state: DeploymentState) -> DeploymentState:
-    """
-    Execute operation
-    """
     state_dict = dict(state)
-
-    if state["should_execute_shortcut"] and state["execution_template"]:
+    if state.get("should_execute_shortcut") and state.get("execution_template"):
         print("🚀 Executing high-level operation...")
-        # Call execute_high_level_action function
-        result = execute_high_level_action(
-            state_dict, state["associated_shortcuts"], state["execution_template"]
-        )
-
+        result = execute_high_level_action(state_dict, state["associated_shortcuts"], state["execution_template"])
         if result["status"] == "success":
-            print("✨ High-level operation executed successfully!")
             state["execution_status"] = "success"
-            state["completed"] = True
-
-            # Update history
+            state["completed"]         = True
             if "execution_history" in result:
                 state["history"] = result["execution_history"]
-
-            # Update final screenshot
-            if "final_screenshot" in result and "current_page" in state:
+            if "final_screenshot" in result:
                 state["current_page"]["screenshot"] = result["final_screenshot"]
         else:
-            print(
-                f"❌ High-level operation execution failed: {result.get('message', '')}"
-            )
-            # Mark for fallback on failure
             state["should_fallback"] = True
     else:
         print("📝 Attempting to match task with high-level actions...")
-        # Call match_task_to_action function
         is_matched, matched_action = match_task_to_action(state_dict, state["task"])
-
         if is_matched and matched_action:
-            print(
-                f"✓ Task matched to high-level action: {matched_action.get('name', 'Unknown')}"
-            )
-
-            # Save current executing high-level action
             state["current_action"] = matched_action
-
-            # Get action sequence
             element_sequence = matched_action.get("element_sequence", [])
             if isinstance(element_sequence, str):
                 try:
                     element_sequence = json.loads(element_sequence)
-                except:
-                    print(f"❌ Failed to parse element sequence")
+                except Exception:
                     state["should_fallback"] = True
                     return state
-
-            if not element_sequence or not isinstance(element_sequence, list):
-                print(f"❌ Element sequence is empty or incorrectly formatted")
+            if not element_sequence:
                 state["should_fallback"] = True
                 return state
-
-            # Update state
-            state["current_step"] = 0
-            state["total_steps"] = len(element_sequence)
+            state["current_step"]    = 0
+            state["total_steps"]     = len(element_sequence)
             state["execution_status"] = "running"
-
-            # Execute operation sequence (should actually enter next cycle)
             state["execution_template"] = {"steps": element_sequence}
-            # Not executing here, returning to capture_screen for next cycle
         else:
-            print(
-                "⚠️ Unable to complete task with high-level operations, marking for fallback"
-            )
             state["should_fallback"] = True
-
     return state
 
 
 def fallback_node(state: DeploymentState) -> DeploymentState:
-    """
-    Fall back to React mode
-    """
     print("⚠️ Falling back to basic operation space")
-
-    # Call fallback_to_react function
     state = fallback_to_react(state)
-
-    # Mark task as completed
     state["completed"] = True
-
     return state
 
 
-# Routing functions
-def should_fallback(state: DeploymentState) -> str:
-    """
-    Decide whether to fall back to basic operations
-    """
-    if state["should_fallback"]:
-        return "fallback"
-    return "continue"
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routing functions  (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 
+def should_fallback(state: DeploymentState) -> str:
+    return "fallback" if state.get("should_fallback") else "continue"
 
 def should_execute_shortcut(state: DeploymentState) -> str:
-    """
-    Decide whether to execute shortcut
-    """
-    if state["should_execute_shortcut"]:
-        return "execute_shortcut"
-    return "match_task"
-
+    return "execute_shortcut" if state.get("should_execute_shortcut") else "match_task"
 
 def is_task_completed(state: DeploymentState) -> str:
-    """
-    Check if task is completed
-    """
-    if state["completed"]:
-        return "end"
-    return "continue"
+    return "end" if state.get("completed") else "continue"
 
 
-# Build state graph
+# ─────────────────────────────────────────────────────────────────────────────
+#  LangGraph workflow  (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_workflow() -> StateGraph:
-    """
-    Build workflow state graph
-    """
     workflow = StateGraph(DeploymentState)
 
-    # Add nodes
-    workflow.add_node("capture_screen", capture_screen_node)
-    workflow.add_node("match_elements", match_elements_node)
-    workflow.add_node("check_shortcuts", check_shortcuts_node)
+    workflow.add_node("capture_screen",    capture_screen_node)
+    workflow.add_node("match_elements",    match_elements_node)
+    workflow.add_node("check_shortcuts",   check_shortcuts_node)
     workflow.add_node("evaluate_shortcut", shortcut_evaluation_node)
     workflow.add_node("generate_template", generate_template_node)
-    workflow.add_node("execute_action", execute_action_node)
-    workflow.add_node("fallback", fallback_node)
-    workflow.add_node(
-        "check_completion", check_task_completion
-    )  # New task completion check node
+    workflow.add_node("execute_action",    execute_action_node)
+    workflow.add_node("fallback",          fallback_node)
+    workflow.add_node("check_completion",  check_task_completion)
 
-    # Define edges
     workflow.set_entry_point("capture_screen")
 
-    # Routing after screen capture
-    workflow.add_conditional_edges(
-        "capture_screen",
-        should_fallback,
-        {"fallback": "fallback", "continue": "match_elements"},
-    )
-
-    # Routing after element matching
-    workflow.add_conditional_edges(
-        "match_elements",
-        should_fallback,
-        {"fallback": "fallback", "continue": "check_shortcuts"},
-    )
-
-    # Check shortcut associations
+    workflow.add_conditional_edges("capture_screen",    should_fallback, {"fallback": "fallback", "continue": "match_elements"})
+    workflow.add_conditional_edges("match_elements",    should_fallback, {"fallback": "fallback", "continue": "check_shortcuts"})
     workflow.add_edge("check_shortcuts", "evaluate_shortcut")
-
-    # Routing after shortcut evaluation
-    workflow.add_conditional_edges(
-        "evaluate_shortcut",
-        should_execute_shortcut,
-        {"execute_shortcut": "generate_template", "match_task": "execute_action"},
-    )
-
-    # Execute action after template generation
+    workflow.add_conditional_edges("evaluate_shortcut", should_execute_shortcut, {"execute_shortcut": "generate_template", "match_task": "execute_action"})
     workflow.add_edge("generate_template", "execute_action")
-
-    # Check task completion after action execution
-    workflow.add_edge("execute_action", "check_completion")
-
-    # Routing after task completion check
-    workflow.add_conditional_edges(
-        "check_completion",
-        is_task_completed,
-        {"end": END, "continue": "capture_screen"},
-    )
-
-    # Check task completion after fallback
+    workflow.add_edge("execute_action",    "check_completion")
+    workflow.add_conditional_edges("check_completion",  is_task_completed, {"end": END, "continue": "capture_screen"})
     workflow.add_edge("fallback", "check_completion")
 
     return workflow
 
 
-def check_task_completion(state: DeploymentState) -> DeploymentState:
-    """
-    Determine if task is completed
+def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
+    print(f"🚀 Starting task execution: {task}")
+    try:
+        from data.State import create_deployment_state
+        state   = create_deployment_state(task=task, device=device, max_retries=3)
+        app     = build_workflow().compile()
+        result  = app.invoke(state)
 
-    Args:
-        state: Execution state
+        if result["execution_status"] == "success" and result["current_page"]["screenshot"]:
+            try:
+                from PIL import Image
+                Image.open(result["current_page"]["screenshot"]).show()
+            except Exception:
+                pass
 
-    Returns:
-        Updated execution state with task completion status
-    """
-    # Skip judgment if too few steps
-    if state["current_step"] < 2:
-        return state
-
-    print("🔍 Evaluating if task is completed...")
-
-    # Get task description
-    task = state["task"]
-
-    # Step 1: Generate task completion criteria
-    completion_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are an assistant that will help analyze task completion criteria. Please carefully read the following user task:",
-            ),
-            (
-                "human",
-                f"The user's task is: {task}\nPlease describe clear, checkable task completion criteria. For example: 'When certain elements or states appear on the page, it indicates the task is complete.'",
-            ),
-        ]
-    )
-
-    completion_chain = completion_prompt | model | StrOutputParser()
-    completion_criteria = completion_chain.invoke({})
-
-    # Collect recent screenshots
-    recent_screenshots = []
-    for step in state["history"][-3:]:
-        if "screenshot" in step and step["screenshot"]:
-            recent_screenshots.append(step["screenshot"])
-
-    if not recent_screenshots:
-        if state["current_page"]["screenshot"]:
-            recent_screenshots.append(state["current_page"]["screenshot"])
-
-    if not recent_screenshots:
-        print("⚠️ No screenshots available, cannot determine if task is complete")
-        return state
-
-    # Build image messages
-    image_messages = []
-    for idx, img_path in enumerate(recent_screenshots, start=1):
-        if os.path.exists(img_path):
-            with open(img_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            image_messages.append(
-                HumanMessage(
-                    content=[
-                        {"type": "text", "text": f"Here is data for screenshot {idx}:"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img_data}"},
-                        },
-                    ]
-                )
-            )
-
-    # Step 2: Determine if task is complete
-    judgement_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a page assessment assistant that will determine if a task is complete based on completion criteria and current page screenshots. Please only respond with 'yes' or 'no'.",
-            ),
-            (
-                "human",
-                f"The completion criteria is: {completion_criteria}\n"
-                f"Based on the following screenshots, determine if the task is complete. Note that if screenshots are identical, it may indicate the task cannot proceed, so respond with 'yes' to end the program.",
-            ),
-        ]
-    )
-
-    # Combine all messages
-    all_messages = list(judgement_prompt.messages) + image_messages
-
-    # Call LLM for judgment
-    judgement_response = model.invoke(all_messages)
-    judgement_answer = judgement_response.content.strip()
-
-    # Update task completion status
-    if "yes" in judgement_answer.lower() or "complete" in judgement_answer.lower():
-        state["completed"] = True
-        state["execution_status"] = "completed"
-        print(f"✓ Task completed: {judgement_answer}")
-    else:
-        state["completed"] = False
-        print(f"⚠️ Task not completed: {judgement_answer}")
-
-    # Add to history
-    state["history"].append(
-        {
-            "step": state["current_step"],
-            "action": "task_completion_check",
-            "completion_criteria": completion_criteria,
-            "judgement": judgement_answer,
-            "status": "success",
-            "completed": state["completed"],
+        return {
+            "status":          result["execution_status"],
+            "message":         "Task execution completed",
+            "steps_completed": result["current_step"],
+            "total_steps":     result["total_steps"],
         }
-    )
-
-    return state
+    except Exception as e:
+        print(f"❌ Error executing task: {e}")
+        return {"status": "error", "message": str(e), "error": str(e)}

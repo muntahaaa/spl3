@@ -1,57 +1,4 @@
-"""
-data_storage.py  —  patched
-============================
 
-Seven bugs fixed.  Each fix is marked inline with BUG-N FIX.
-
-Root-cause catalogue
-────────────────────
-BUG-1  Page description always ""
-       CAUSE: page_props["description"] is hard-coded to "".
-       FIX  : _make_page_description() builds a readable string from task +
-              step + element count.
-
-BUG-2  ()->LEADS_TO->(p:Page) returns more than the first page
-       CAUSE: get_chain_start_nodes() in graph_db.py uses
-              NOT EXISTS{()-[:LEADS_TO]->(n)}.  Every page that has no
-              incoming LEADS_TO qualifies, including intermediate pages
-              that simply haven't had their in-edge created yet at query time.
-       FIX  : Tighten to also require the page has at least one HAS_ELEMENT
-              edge (a genuine start page has elements; final pages do not).
-              See graph_db.py.
-
-BUG-3  (p:Page)->LEADS_TO->() returns intermediate pages, not just the last
-       CAUSE: get_chain_from_start() uses
-              WHERE NOT EXISTS { (end)-[:HAS_ELEMENT]->() } as the
-              end-node filter.  But every page has HAS_ELEMENT edges, so
-              nothing is ever filtered out.
-       FIX  : Change to WHERE NOT EXISTS { (end)-[:HAS_ELEMENT]->()-[:LEADS_TO]->() }
-              — the last page is one from which no element leads further.
-              See graph_db.py.
-
-BUG-4  Element description and visual_embedding_id null for all elements
-       (a) description: hard-coded "".
-           FIX: _make_element_description() builds a string from type/content/ID.
-       (b) visual_embedding_id: after _element2vector() succeeds, its Pinecone
-           vector id (= elem_neo4j_id UUID) is never written back to Neo4j.
-           FIX: call db.update_node_property("visual_embedding_id", …) after
-           a successful upsert.
-
-BUG-5  Multiple elements share the same element_original_id
-       CAUSE: JSON element IDs restart from 0 on every page, so element_original_id
-              "0" appears on every page.
-       FIX  : Store f"{page_id}::{json_id}" — globally unique, still readable.
-
-BUG-6  LEADS_TO confidence_score always 0.0
-       CAUSE: db.add_element_leads_to() defaults confidence_score to 0.0 and
-              the call site never passes a value.
-       FIX  : _confidence_from_status() computes 1.0/0.5/0.0 from execution
-              status; passed at the call site.
-
-BUG-7  COMPOSED_OF order always 1
-       CAUSE: db.add_element_to_action() called with order=1 hardcoded.
-       FIX  : Pass order=step["step"] + 1 (1-based execution sequence).
-"""
 
 import hashlib
 import json
@@ -205,7 +152,7 @@ def state2json(state: dict, save_path: str = None) -> str:
         return str(out.resolve())
     except Exception as exc:
         return f"Error saving state: {exc}"
-        return f"Error saving state: {exc}"
+        
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -317,9 +264,6 @@ def json2db(json_path: str) -> str:
     """
     Push state JSON → Neo4j + Pinecone.
     Returns task_id (MD5 of task string).
-
-    BUG-2 and BUG-3 fixes live in graph_db.py (query rewrites).
-    All other fixes are applied inline below.
     """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -351,7 +295,7 @@ def json2db(json_path: str) -> str:
 
             page_props = {
                 "page_id":      page_id,
-                # BUG-1 FIX: meaningful description
+               
                 "description":  _make_page_description(task_name, step_no,
                                                         elements_data, app_name),
                 "raw_page_url": step.get("source_page", ""),
