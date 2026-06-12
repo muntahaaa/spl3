@@ -1,5 +1,6 @@
 from typing import Annotated, Callable, Dict, List, Optional, Any
 from typing_extensions import TypedDict
+# pyrefly: ignore [missing-import]
 from langgraph.graph import add_messages
 from pydantic import BaseModel, Field
 
@@ -78,13 +79,20 @@ class DeploymentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]  # Message history for React mode
 
     # Execution flow control
-    should_fallback: bool  # Whether to fall back to basic operation mode
+    should_fallback: bool  # Whether to fall back to React mode
     should_execute_shortcut: bool  # Whether to execute shortcut operations
+
+    # No-match popup support
+    close_actions: List[Dict]  # Top-N closest HL actions when no exact match found
+
+    # Real-time log streaming
+    log_callback: Optional[Callable[[str], None]]  # Called with each log line
 
     # Callback
     callback: Optional[Callable[[Dict[str, Any]], None]]  # Callback function
     chain_job_id: Optional[str]  # last triggered chain job
     chain_status: Optional[str]  # "pending" | "running" | "done" | "error"
+    force_fallback: bool  # Whether to force React fallback mode execution
 
 
 def create_deployment_state(
@@ -143,12 +151,19 @@ def create_deployment_state(
     state["should_fallback"] = False
     state["should_execute_shortcut"] = False
 
+    # No-match popup
+    state["close_actions"] = []
+
+    # Real-time log streaming (set externally by run_task)
+    state["log_callback"] = None
+
     # Callback
     state["callback"] = callback
 
     # Chain job tracking (optional but required by schema)
     state["chain_job_id"] = None
     state["chain_status"] = None
+    state["force_fallback"] = False
 
     return state
 

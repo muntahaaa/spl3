@@ -1,9 +1,8 @@
 """
-deployment.py  (Firebase/Qwen edition)
----------------------------------------
-Replaces all direct Gemini (ChatGoogleGenerativeAI) calls with
-Firebase Realtime DB round-trips handled by the Colab Qwen2.5-VL
-worker notebook.
+deployment.py  (NVIDIA NIM edition)
+-------------------------------------
+Replaces Firebase round-trips with direct NVIDIA NIM API calls
+(nvidia/llama-3.1-nemotron-nano-vl-8b-v1) via the OpenAI-compatible client.
 
 All public APIs and the LangGraph workflow structure are preserved.
 """
@@ -17,9 +16,13 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+# pyrefly: ignore [missing-import]
 from langchain_core.messages import HumanMessage, SystemMessage
+# pyrefly: ignore [missing-import]
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+# pyrefly: ignore [missing-import]
 from langgraph.graph import StateGraph, END
+# pyrefly: ignore [missing-import]
 from langgraph.prebuilt import create_react_agent
 
 import config
@@ -29,7 +32,7 @@ from data.vector_db import VectorStore
 from tool.img_tool import *
 from tool.adb_tools import *
 from OmniParser.client import run as omniparser_run
-from firebase_llm_bridge import FirebaseLLMBridge
+from nvidia_llm_bridge import NvidiaBridge
 
 # ── LangSmith tracing ────────────────────────────────────────────────────────
 os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
@@ -37,10 +40,11 @@ os.environ["LANGCHAIN_ENDPOINT"]   = config.LANGCHAIN_ENDPOINT
 os.environ["LANGCHAIN_API_KEY"]    = config.LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_PROJECT"]    = "DeploymentExecution"
 
-# ── Firebase bridge (replaces ChatGoogleGenerativeAI) ────────────────────────
-bridge = FirebaseLLMBridge(
-    firebase_url=config.CHAIN_FIREBASE_URL,
-    firebase_secret=config.CHAIN_FIREBASE_SECRET,
+# ── NVIDIA NIM bridge (direct — no Firebase worker needed) ────────────────────
+bridge = NvidiaBridge(
+    max_tokens_text=4096,   # task matching responses include full action JSON (900+ tokens)
+    max_tokens_json=4096,
+    max_tokens_vision=2048,
 )
 
 # ── Database / vector store ──────────────────────────────────────────────────
@@ -56,9 +60,9 @@ vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sync_call_text(system_prompt: str, user_prompt: str, timeout: float = 300.0) -> str:
-    """Run an async bridge call from synchronous code."""
-    return asyncio.get_event_loop().run_until_complete(
-        bridge.call_text(system_prompt=system_prompt, user_prompt=user_prompt, timeout=timeout)
+    """Call NVIDIA NIM synchronously from any thread context."""
+    return asyncio.run(
+        bridge.call_text(system_prompt=system_prompt, user_prompt=user_prompt)
     )
 
 
@@ -68,12 +72,11 @@ def _sync_call_json(
     images_b64: Optional[List[str]] = None,
     timeout: float = 300.0,
 ) -> Dict[str, Any]:
-    return asyncio.get_event_loop().run_until_complete(
+    return asyncio.run(
         bridge.call_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             images_b64=images_b64,
-            timeout=timeout,
         )
     )
 
@@ -84,12 +87,11 @@ def _sync_call_vision(
     images_b64: List[str],
     timeout: float = 300.0,
 ) -> str:
-    return asyncio.get_event_loop().run_until_complete(
+    return asyncio.run(
         bridge.call_vision(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             images_b64=images_b64,
-            timeout=timeout,
         )
     )
 
@@ -111,60 +113,163 @@ def create_execution_state(device: str) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Task → high-level action matching
+#  Task → high-level action matching  (semantic — LLM judges intent, not keywords)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MATCH_SYSTEM = (
-    "You are an AI assistant specialized in matching user tasks with predefined "
-    "high-level actions. Analyse the task description and decide if it matches any "
-    "predefined high-level action. Only consider a match when the degree is above 0.7.\n\n"
-    "If matched, reply with:\n  MATCHED: <complete JSON of the best matching action>\n"
-    "If not matched, reply with:\n  NO_MATCH <brief explanation>"
-)
+_MATCH_SYSTEM = """
+You are an AI assistant that matches a user’s natural-language task to the
+best-fitting stored high-level action using SEMANTIC understanding.
+
+Rules:
+- Do NOT do substring/keyword matching. Understand the INTENT of the task.
+- A match is valid when the user’s intent is substantially the same as the
+  action’s name or description (confidence ≥ 0.6).
+- Copy the full action object VERBATIM — do not truncate element_sequence.
+
+Reply with a JSON object ONLY — no prose, no markdown fences:
+  If matched:    {"matched": true,  "confidence": 0.85, "action": <full action object>}
+  If not matched: {"matched": false, "reason": "<brief explanation>"}
+"""
+
+
+def get_close_high_level_actions(task: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    """
+    Return up to top_k high-level actions that are most semantically similar to
+    the user task.  Used to populate the no-match popup in the UI.
+    """
+    all_actions = db.get_all_high_level_actions()
+    if not all_actions:
+        return []
+
+    _RANK_SYSTEM = (
+        "You are an assistant that ranks stored actions by their semantic similarity "
+        "to a user task. Return ONLY a JSON array of action_ids ordered from most to "
+        "least relevant (most relevant first). No prose, no markdown fences."
+    )
+    actions_summary = json.dumps(
+        [{"action_id": a.get("action_id"), "name": a.get("name"), "description": a.get("description", "")}
+         for a in all_actions],
+        ensure_ascii=False, indent=2,
+    )
+    user_prompt = (
+        f"User task: {task}\n\n"
+        f"Stored actions:\n{actions_summary}\n\n"
+        f"Return a JSON array of the {top_k} most relevant action_ids, ordered best-first."
+    )
+    try:
+        ranked_ids = asyncio.run(bridge.call_json(
+            system_prompt=_RANK_SYSTEM, user_prompt=user_prompt
+        ))
+        # bridge.call_json may return a dict or a list
+        if isinstance(ranked_ids, list):
+            id_order = ranked_ids
+        elif isinstance(ranked_ids, dict):
+            # try common wrapper keys
+            id_order = ranked_ids.get("action_ids", ranked_ids.get("ids", []))
+        else:
+            id_order = []
+
+        action_map = {a.get("action_id"): a for a in all_actions}
+        result = [action_map[aid] for aid in id_order if aid in action_map]
+        # pad with remaining actions if LLM returned fewer than top_k
+        for a in all_actions:
+            if len(result) >= top_k:
+                break
+            if a not in result:
+                result.append(a)
+        return result[:top_k]
+    except Exception as exc:
+        print(f"[get_close_high_level_actions] Error: {exc}")
+        return all_actions[:top_k]
 
 
 def match_task_to_action(
     state: Dict[str, Any], task: str
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    """Match user task with high-level action nodes via the Qwen bridge."""
-    print(f"Matching task: {task}")
+    """
+    Semantic matching: LLM understands the user’s INTENT and picks the best
+    action regardless of exact wording.  Does NOT fall back on keyword search.
+    """
+    _log = state.get("log_callback") or print
+    _log(f"Matching task (semantic): {task}")
 
     high_level_actions = db.get_all_high_level_actions()
     if not high_level_actions:
-        print("❌ No high-level action nodes found")
+        _log("❌ No high-level action nodes found in Neo4j")
         return False, None
 
-    print(f"Found {len(high_level_actions)} high-level action nodes")
+    _log(f"Found {len(high_level_actions)} high-level action node(s)")
+    for i, a in enumerate(high_level_actions):
+        seq_len = len(a.get("element_sequence") or [])
+        _log(f"  [MATCH] action[{i}]: id={a.get('action_id')}  name={a.get('name')}  steps={seq_len}")
 
     actions_json = json.dumps(high_level_actions, ensure_ascii=False, indent=2)
-    user_prompt  = (
+    user_prompt = (
         f"User task: {task}\n\n"
         f"Available high-level actions:\n{actions_json}\n\n"
-        "Determine if the task matches any high-level action and reply as instructed."
+        "Return JSON only. Copy the full action object verbatim — do not truncate element_sequence."
     )
 
     try:
-        result = _sync_call_text(_MATCH_SYSTEM, user_prompt, timeout=180)
+        result = asyncio.run(
+            bridge.call_json(system_prompt=_MATCH_SYSTEM, user_prompt=user_prompt)
+        )
 
-        if result.startswith("MATCHED:"):
-            action_json_str = result[len("MATCHED:"):].strip()
-            try:
-                matched_action = json.loads(action_json_str)
-                print(f"✓ Matched: {matched_action.get('name','?')} (ID: {matched_action.get('action_id','?')})")
-                return True, matched_action
-            except json.JSONDecodeError:
-                print(f"❌ Cannot parse matching result: {action_json_str}")
-                return False, None
-        elif result.startswith("NO_MATCH"):
-            print(f"❌ No matching high-level action found: {result[len('NO_MATCH'):].strip()}")
+        if not isinstance(result, dict):
+            _log(f"  [MATCH] ❌ Unexpected LLM response type: {type(result)}")
             return False, None
-        else:
-            print(f"❌ Unrecognised matching result: {result}")
+
+        if not result.get("matched"):
+            _log(f"  [MATCH] ❌ No semantic match: {result.get('reason', 'no reason given')}")
             return False, None
+
+        matched_action = result.get("action")
+        if not isinstance(matched_action, dict):
+            _log(f"  [MATCH] ❌ 'action' field missing or not a dict")
+            return False, None
+
+        if not matched_action.get("action_id") and not matched_action.get("name"):
+            _log(f"  [MATCH] ❌ Action missing both action_id and name — discarding")
+            return False, None
+
+        seq_len = len(matched_action.get("element_sequence") or [])
+        confidence = result.get("confidence", "?")
+        _log(f"  [MATCH] ✓ Matched: '{matched_action.get('name')}' "
+             f"(ID: {matched_action.get('action_id')})  confidence={confidence}  steps={seq_len}")
+        return True, matched_action
 
     except Exception as e:
-        print(f"❌ Error during task matching: {e}")
+        _log(f"❌ Error during semantic task matching: {e}")
+        import traceback; traceback.print_exc()
         return False, None
+
+
+def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract the first valid JSON object from a string that may contain prose.
+    Scans for '{' and tries progressively larger substrings.
+    Returns the parsed dict, or None if no valid JSON object is found.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    candidate = text[start:]
+    depth = 0
+    end_idx = -1
+    for i, ch in enumerate(candidate):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = i
+                break
+    if end_idx == -1:
+        return None
+    try:
+        return json.loads(candidate[:end_idx + 1])
+    except json.JSONDecodeError:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,198 +309,315 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
         return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Element matching  (visual then semantic fallback)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def match_screen_elements(
-    state: DeploymentState, action_sequence: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    if not state["current_page"]["elements_data"]:
-        print("❌ Current screen element data is empty")
-        return []
-
-    current_step_idx = state["current_step"]
-    if current_step_idx >= len(action_sequence):
-        return []
-
-    current_action = action_sequence[current_step_idx]
-    element_id     = current_action.get("element_id")
-    if not element_id:
-        return []
-
-    db_element = db.get_action_by_id(element_id) or db.get_element_by_id(element_id)
-    if not db_element:
-        return []
-
-    if "action_id" in db_element and not any(
-        k in db_element for k in ["visual_embedding", "screenshot_path"]
-    ):
-        return fallback_to_semantic_match(state, action_sequence)
-
-    template_embedding = None
-    if "visual_embedding" in db_element and db_element["visual_embedding"]:
-        template_embedding = db_element["visual_embedding"]
-    else:
-        if "screenshot_path" in db_element and db_element["screenshot_path"]:
-            try:
-                template_embedding = extract_features(db_element["screenshot_path"], "resnet50")["features"]
-            except Exception as e:
-                print(f"❌ Cannot extract template element features: {e}")
-                return fallback_to_semantic_match(state, action_sequence)
-        else:
-            return fallback_to_semantic_match(state, action_sequence)
-
-    screen_elements   = state["current_page"]["elements_data"]
-    screenshot_path   = state["current_page"]["screenshot"]
-
-    try:
-        import numpy as np
-        element_embeddings = []
-        for idx, element in enumerate(screen_elements):
-            try:
-                element_img_stream = elements_img(screenshot_path, json.dumps(screen_elements), element.get("ID", idx))
-                feat = extract_features(element_img_stream, "resnet50")
-                element_embeddings.append((idx, feat["features"]))
-            except Exception:
-                continue
-
-        if not element_embeddings:
-            return fallback_to_semantic_match(state, action_sequence)
-
-        matches = []
-        tmpl_vec = np.array(template_embedding).flatten()
-        tmpl_norm = np.linalg.norm(tmpl_vec)
-        for idx, embedding in element_embeddings:
-            elem_vec  = np.array(embedding).flatten()
-            elem_norm = np.linalg.norm(elem_vec)
-            similarity = 0.0 if (tmpl_norm == 0 or elem_norm == 0) else float(np.dot(tmpl_vec, elem_vec) / (tmpl_norm * elem_norm))
-            if similarity >= 0.6:
-                matches.append({
-                    "element_id":       element_id,
-                    "match_score":      similarity,
-                    "screen_element_id": idx,
-                    "action_type":      current_action.get("atomic_action", "tap"),
-                    "parameters":       current_action.get("action_params", {}),
-                })
-
-        matches.sort(key=lambda x: x["match_score"], reverse=True)
-        if matches:
-            print(f"✓ Matched screen element {matches[0]['screen_element_id']} (score={matches[0]['match_score']:.2f})")
-        return matches
-
-    except Exception as e:
-        print(f"❌ Error during visual matching: {e}")
-        return fallback_to_semantic_match(state, action_sequence)
+def _log_both(state: Dict[str, Any], msg: str):
+    print(msg)
+    _log = state.get("log_callback")
+    if _log:
+        _log(msg)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Semantic fallback element matching via Qwen
-# ─────────────────────────────────────────────────────────────────────────────
+_VERIFY_MATCH_SYSTEM = (
+    "You are a UI matching assistant. Compare a stored template element description and type "
+    "against a candidate live screen element's content and type. "
+    "Determine if they represent the same functional UI element. "
+    "Return a JSON object containing:\n"
+    "  \"similarity\": <float, between 0.0 and 1.0>,\n"
+    "  \"reason\": \"<brief reason>\""
+)
 
-_ELEM_MATCH_SYSTEM = (
-    "You are an AI assistant specialized in matching UI elements. "
-    "Analyse the template element description and current screen elements, "
-    "then find the best match.\n\n"
-    "Return ONLY a JSON object with these keys:\n"
-    "  element_id (str), match_score (float 0-1), screen_element_id (int),\n"
-    "  action_type (str: tap/text/swipe/long_press/back), parameters (dict)\n"
-    "If no element scores above 0.6, set match_score=0 and screen_element_id=-1.\n"
-    "No preamble, no markdown fences."
+_SEMANTIC_MATCH_SYSTEM = (
+    "You are a UI matching assistant. "
+    "Given a target element description, select the single best matching element "
+    "from the list of live screen elements based on semantic similarity of content. "
+    "Return ONLY a JSON object:\n"
+    "  {\"screen_element_id\": <int, 0-based index of the matching element in the list>,\n"
+    "   \"reason\": \"<brief reason>\"}\n"
+    "If no reasonable match exists, set screen_element_id to -1."
 )
 
 
-def fallback_to_semantic_match(
-    state: DeploymentState, action_sequence: List[Dict[str, Any]]
+def _bbox_center_dist(b1: List[float], b2: List[float]) -> float:
+    c1 = ((b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2)
+    c2 = ((b2[0] + b2[2]) / 2, (b2[1] + b2[3]) / 2)
+    return float(((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5)
+
+
+def match_element_via_pinecone(
+    element_id: str,
+    step_info: Dict[str, Any],
+    state: DeploymentState,
+    threshold: float = 0.7,
 ) -> List[Dict[str, Any]]:
-    print("🔄 Falling back to semantic matching...")
+    """
+    Element-matching strategy:
+      1. Fetch the stored Pinecone vector metadata of the corresponding element ID.
+      2. Find the candidate live element with the closest spatial bounding box (spatial matching).
+      3. Use LLM to verify if stored vector content and live candidate content matches (similarity > 0.7).
+      4. If verified, return this candidate.
+      5. Otherwise, check which live element has the closest semantic matching (excluding bounding boxes from metadata).
+    """
+    _log = lambda msg: _log_both(state, msg)
+    screen_elements = state["current_page"]["elements_data"]
+    screenshot_path = state["current_page"]["screenshot"]
 
-    current_step_idx = state["current_step"]
-    if current_step_idx >= len(action_sequence):
+    if not screen_elements or not screenshot_path:
+        _log("  [ACTION MATCHING] ⚠️  No screen elements or screenshot available")
         return []
 
-    step_info  = action_sequence[current_step_idx]
-    element_id = step_info.get("element_id")
-    if not element_id:
-        return []
+    # ── 1. Fetch stored details from Neo4j & Pinecone ───────────────────────────
+    stored_content = ""
+    stored_type = ""
+    stored_bbox: Optional[List[float]] = None
 
-    db_element = db.get_action_by_id(element_id) or db.get_element_by_id(element_id)
-    if not db_element:
-        return []
-
-    # Build template description
-    id_field = "element_id" if "element_id" in db_element else "action_id"
-    tmpl_desc = f"ID: {db_element.get(id_field, 'unknown')}\n"
-    if db_element.get("description"):
-        tmpl_desc += f"Description: {db_element['description']}\n"
-    elif db_element.get("name"):
-        tmpl_desc += f"Name: {db_element['name']}\n"
-
-    for field in ["bounding_box", "bbox", "position"]:
-        if db_element.get(field):
-            bbox = db_element[field]
-            if isinstance(bbox, list) and len(bbox) >= 4:
-                tmpl_desc += f"Position: [{bbox[0]:.3f},{bbox[1]:.3f},{bbox[2]:.3f},{bbox[3]:.3f}]\n"
-            elif isinstance(bbox, str):
-                tmpl_desc += f"Position: {bbox}\n"
-            break
-
-    tmpl_desc += f"Action type: {step_info.get('atomic_action','tap')}\n"
-    params = step_info.get("action_params", {})
-    if isinstance(params, str):
+    # Retrieve from Neo4j first (we prioritize Neo4j description)
+    neo4j_element = db.get_element_by_id(element_id) or {}
+    neo4j_desc = neo4j_element.get("description") or ""
+    neo4j_reasoning = neo4j_element.get("reasoning") or ""
+    stored_type = neo4j_element.get("element_type") or ""
+    bbox_raw = neo4j_element.get("bounding_box")
+    if isinstance(bbox_raw, str):
         try:
-            params = json.loads(params)
+            stored_bbox = json.loads(bbox_raw)
         except Exception:
-            pass
-    if isinstance(params, dict) and params:
-        tmpl_desc += "Action parameters:\n" + "\n".join(f"  {k}: {v}" for k, v in params.items())
+            stored_bbox = None
+    elif isinstance(bbox_raw, list):
+        stored_bbox = bbox_raw
 
-    # Build screen description
-    screen_desc = ""
-    for i, element in enumerate(state["current_page"]["elements_data"]):
-        screen_desc += f"Element {i} (ID: {element.get('ID', i)}):\n"
-        for key in ("type", "content"):
-            if element.get(key):
-                screen_desc += f"  {key.capitalize()}: {element[key]}\n"
-        if "bbox" in element:
-            b = element["bbox"]
-            screen_desc += f"  Position: [{b[0]:.3f},{b[1]:.3f},{b[2]:.3f},{b[3]:.3f}]\n"
-        screen_desc += "\n"
+    stored_content = neo4j_desc
+
+    # Fallback/merge with Pinecone if needed
+    _log(f"[ACTION MATCHING] Fetching stored metadata for element {element_id[:8]}...")
+    try:
+        fetch_result = vector_db.index.fetch(ids=[element_id], namespace="element")
+        vec_data = (fetch_result.get("vectors") or {}).get(element_id)
+        if vec_data:
+            stored_meta = vec_data.get("metadata", {})
+            if not stored_content:
+                stored_content = stored_meta.get("content", "")
+            if not stored_type:
+                stored_type = stored_meta.get("type", "")
+            
+            # Parse stored bbox if not already resolved from Neo4j
+            if not stored_bbox:
+                bbox_raw_pc = stored_meta.get("bbox")
+                if isinstance(bbox_raw_pc, str):
+                    try:
+                        stored_bbox = json.loads(bbox_raw_pc)
+                    except Exception:
+                        stored_bbox = None
+                elif isinstance(bbox_raw_pc, list):
+                    stored_bbox = bbox_raw_pc
+        else:
+            _log(f"  [ACTION MATCHING] ⚠️ element_id {element_id[:8]} not found in Pinecone.")
+    except Exception as exc:
+        _log(f"  [ACTION MATCHING] Pinecone fetch error: {exc}")
+
+    if not stored_content:
+        # Final fallback: step info parameters
+        params = step_info.get("action_params", {})
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:
+                params = {}
+        stored_content = params.get("element") or ""
+
+    _log(f"[ACTION MATCHING] Stored element: content='{stored_content}' type='{stored_type}' bbox={stored_bbox}")
+
+    # ── 2. Spatial match candidate search ───────────────────────────────
+    corresponding_live_element = None
+    spatial_idx = -1
+    if stored_bbox and len(stored_bbox) == 4:
+        min_dist = float("inf")
+        for idx, el in enumerate(screen_elements):
+            el_bbox = el.get("bbox")
+            if el_bbox and len(el_bbox) == 4:
+                dist = _bbox_center_dist(stored_bbox, el_bbox)
+                if dist < min_dist:
+                    min_dist = dist
+                    corresponding_live_element = el
+                    spatial_idx = idx
+
+    # ── 3. Match verification using LLM ──────────────────────────────────
+    if corresponding_live_element:
+        candidate_content = corresponding_live_element.get("content", "")
+        candidate_type = corresponding_live_element.get("type", "")
+        _log(f"[ACTION MATCHING] Found spatial candidate at index {spatial_idx}: content='{candidate_content}' type='{candidate_type}' (dist: {min_dist:.4f})")
+        
+        # If spatial match is extremely close (exact spatial match slot), accept it directly and bypass similarity check
+        if min_dist < 0.03:
+            _log(f"[ACTION MATCHING] ✓ Spatial match verified dynamically via distance ({min_dist:.4f} < 0.03)")
+            return [{
+                "element_id":        element_id,
+                "match_score":       1.0 - min_dist,
+                "screen_element_id": spatial_idx,
+                "action_type":       step_info.get("atomic_action", "tap"),
+                "parameters":        step_info.get("action_params", {}),
+            }]
+
+        user_prompt = (
+            f"Stored Template Element:\n"
+            f"  Description: {stored_content}\n"
+            f"  Type: {stored_type}\n\n"
+            f"Candidate Live Screen Element:\n"
+            f"  Content: {candidate_content}\n"
+            f"  Type: {candidate_type}\n\n"
+            f"Do they represent the same UI element? Rate the similarity from 0.0 to 1.0. "
+            f"Return JSON only."
+        )
+        try:
+            res = _sync_call_json(_VERIFY_MATCH_SYSTEM, user_prompt, timeout=120)
+            similarity = float(res.get("similarity", 0.0))
+            reason = res.get("reason", "")
+            _log(f"[ACTION MATCHING] LLM verify similarity score (description): {similarity:.2f} (threshold: {threshold}) — Reason: {reason}")
+            
+            if similarity > threshold:
+                _log(f"[ACTION MATCHING] ✓ Spatial match verified via description (score {similarity:.2f} > {threshold})")
+                return [{
+                    "element_id":        element_id,
+                    "match_score":       similarity,
+                    "screen_element_id": spatial_idx,
+                    "action_type":       step_info.get("atomic_action", "tap"),
+                    "parameters":        step_info.get("action_params", {}),
+                }]
+            else:
+                _log(f"[ACTION MATCHING] ⚠️ Spatial verification failed with description (score {similarity:.2f} <= {threshold}). Trying fallback with reasoning...")
+                if neo4j_reasoning:
+                    user_prompt_reasoning = (
+                        f"Stored Template Element Reasoning Details:\n"
+                        f"  Reasoning: {neo4j_reasoning}\n"
+                        f"  Type: {stored_type}\n\n"
+                        f"Candidate Live Screen Element:\n"
+                        f"  Content: {candidate_content}\n"
+                        f"  Type: {candidate_type}\n\n"
+                        f"Do they represent the same UI element? Rate the similarity from 0.0 to 1.0. "
+                        f"Return JSON only."
+                    )
+                    res_reasoning = _sync_call_json(_VERIFY_MATCH_SYSTEM, user_prompt_reasoning, timeout=120)
+                    similarity_reasoning = float(res_reasoning.get("similarity", 0.0))
+                    reason_reasoning = res_reasoning.get("reason", "")
+                    _log(f"[ACTION MATCHING] LLM verify reasoning similarity score: {similarity_reasoning:.2f} (threshold: {threshold}) — Reason: {reason_reasoning}")
+                    
+                    if similarity_reasoning > threshold:
+                        _log(f"[ACTION MATCHING] ✓ Spatial match verified via reasoning details (score {similarity_reasoning:.2f} > {threshold})")
+                        return [{
+                            "element_id":        element_id,
+                            "match_score":       similarity_reasoning,
+                            "screen_element_id": spatial_idx,
+                            "action_type":       step_info.get("atomic_action", "tap"),
+                            "parameters":        step_info.get("action_params", {}),
+                        }]
+                else:
+                    _log("[ACTION MATCHING] No reasoning details available in Neo4j element for fallback verification.")
+        except Exception as exc:
+            _log(f"  [ACTION MATCHING] LLM verification error: {exc}")
+
+    # ── 4. Fallback to semantic matching across all live elements ─────
+    _log("[ACTION MATCHING] Spatial match verification failed or scored <= threshold. Falling back to semantic matching...")
+    return llm_bbox_fallback(element_id, step_info, state, stored_content, stored_type)
+
+
+def llm_bbox_fallback(
+    element_id: str,
+    step_info: Dict[str, Any],
+    state: DeploymentState,
+    stored_content: str,
+    stored_type: str,
+) -> List[Dict[str, Any]]:
+    """
+    Ask the LLM to choose the best semantic match from all live elements
+    without including any bounding boxes in the metadata.
+    """
+    _log = lambda msg: _log_both(state, msg)
+    screen_elements = state["current_page"]["elements_data"]
+
+    # Format list of live elements without bounding boxes (User Comment 1: "Remove bounding box from metadata")
+    live_elements_list = ""
+    for idx, el in enumerate(screen_elements):
+        live_elements_list += f"{idx}: type={el.get('type','?')}  content='{el.get('content','')}'\n"
 
     user_prompt = (
-        f"Template element:\n{tmpl_desc}\n\n"
-        f"Current screen elements:\n{screen_desc}\n\n"
-        "Find the best match and return JSON."
+        f"Target Element Description: {stored_content}\n"
+        f"Target Element Type: {stored_type}\n\n"
+        f"Live Screen Elements:\n{live_elements_list}\n"
+        f"Choose the element that has the closest semantic match to the target description. "
+        f"Return JSON only."
     )
 
     try:
-        result = _sync_call_json(_ELEM_MATCH_SYSTEM, user_prompt, timeout=180)
-
-        # result may be a raw dict or wrapped in ElementMatch shape
-        match_score       = float(result.get("match_score", 0))
-        screen_element_id = int(result.get("screen_element_id", -1))
-
-        if match_score >= 0.6 and screen_element_id >= 0:
-            print(f"✓ Semantic match — element {screen_element_id} (score={match_score:.2f})")
+        result = _sync_call_json(_SEMANTIC_MATCH_SYSTEM, user_prompt, timeout=120)
+        sid = int(result.get("screen_element_id", -1))
+        reason = result.get("reason", "")
+        if sid >= 0 and sid < len(screen_elements):
+            _log(f"[ACTION MATCHING] ✓ LLM semantic fallback picked screen element {sid}. Reason: {reason}")
             return [{
-                "element_id":        result.get("element_id", element_id),
-                "match_score":       match_score,
-                "screen_element_id": screen_element_id,
-                "action_type":       result.get("action_type", "tap"),
-                "parameters":        result.get("parameters", {}),
+                "element_id":        element_id,
+                "match_score":       0.75,
+                "screen_element_id": sid,
+                "action_type":       step_info.get("atomic_action", "tap"),
+                "parameters":        step_info.get("action_params", {}),
             }]
         else:
-            print("❌ No matching screen element found via semantic match")
+            _log(f"[ACTION MATCHING] ❌ LLM could not identify a semantic match (screen_element_id={sid})")
             return []
-
-    except Exception as e:
-        print(f"❌ Error during semantic element matching: {e}")
+    except Exception as exc:
+        _log(f"  [ACTION MATCHING] LLM semantic matching error: {exc}")
         return []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Execute element action  (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
+def _parse_action_result(result: Any) -> bool:
+    """
+    Normalise every possible return value from screen_action.invoke():
+      - dict  → check result["status"] == "success"
+      - str   → try JSON parse, then check; fall back to truthy non-empty string
+      - bool  → use directly
+      - None  → False
+      - any other truthy value → True (tool returned something non-error)
+    """
+    print(f"  [DIAG-ADB] screen_action raw result → type={type(result).__name__}  value={repr(result)[:300]}")
+    if result is None:
+        print("  [DIAG-ADB] → None → False")
+        return False
+    if isinstance(result, bool):
+        print(f"  [DIAG-ADB] → bool → {result}")
+        return result
+    if isinstance(result, dict):
+        status = result.get("status", "")
+        if status:
+            ok = str(status).lower() in ("success", "ok", "done", "true", "1")
+            print(f"  [DIAG-ADB] → dict with status='{status}' → {ok}")
+            return ok
+        ok = "error" not in result
+        print(f"  [DIAG-ADB] → dict without status key, 'error' in keys={not ok} → {ok}")
+        return ok
+    if isinstance(result, str):
+        stripped = result.strip()
+        if not stripped:
+            print("  [DIAG-ADB] → empty string → False")
+            return False
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                status = parsed.get("status", "")
+                if status:
+                    ok = str(status).lower() in ("success", "ok", "done", "true", "1")
+                    print(f"  [DIAG-ADB] → JSON dict status='{status}' → {ok}")
+                    return ok
+                ok = "error" not in parsed
+                print(f"  [DIAG-ADB] → JSON dict no status, 'error' absent={ok} → {ok}")
+                return ok
+            ok = bool(parsed)
+            print(f"  [DIAG-ADB] → JSON scalar={parsed} → {ok}")
+            return ok
+        except (json.JSONDecodeError, ValueError):
+            lower = stripped.lower()
+            ok = not any(kw in lower for kw in ("error", "fail", "false", "exception"))
+            print(f"  [DIAG-ADB] → plain string, failure keywords absent={ok} → {ok}")
+            return ok
+    ok = bool(result)
+    print(f"  [DIAG-ADB] → other type, truthy={ok} → {ok}")
+    return ok
+
 
 def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]) -> bool:
     try:
@@ -416,8 +638,13 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
         if isinstance(device_size, str):
             device_size = {"width": 1080, "height": 2400}
 
-        center_x = int((bbox[0] + bbox[2]) / 2 * device_size["width"])
-        center_y = int((bbox[1] + bbox[3]) / 2 * device_size["height"])
+        # Calculate coordinates conditionally: scale if relative (<= 1.0), use directly otherwise
+        if bbox and len(bbox) == 4 and all(val <= 1.0 for val in bbox):
+            center_x = int((bbox[0] + bbox[2]) / 2 * device_size["width"])
+            center_y = int((bbox[1] + bbox[3]) / 2 * device_size["height"])
+        else:
+            center_x = int((bbox[0] + bbox[2]) / 2) if bbox and len(bbox) == 4 else 0
+            center_y = int((bbox[1] + bbox[3]) / 2) if bbox and len(bbox) == 4 else 0
 
         action_params = {"device": state["device"], "action": action_type, "x": center_x, "y": center_y}
         if action_type == "text":
@@ -431,19 +658,12 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
         print(f"Executing action: {action_type} at ({center_x}, {center_y})")
         result = screen_action.invoke(action_params)
 
-        if isinstance(result, str):
-            try:
-                result_json = json.loads(result)
-                if result_json.get("status") == "success":
-                    print("✓ Action executed successfully")
-                    return True
-                else:
-                    print(f"❌ Action failed: {result_json.get('message','unknown')}")
-                    return False
-            except Exception:
-                print(f"❌ Cannot parse operation result: {result}")
-                return False
-        return False
+        success = _parse_action_result(result)
+        if success:
+            print("✓ Action executed successfully")
+        else:
+            print(f"❌ Action failed — raw result: {result!r}")
+        return success
 
     except Exception as e:
         print(f"❌ Error executing element action: {e}")
@@ -451,7 +671,7 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  React fallback  (uses Qwen for decision, ADB tool for execution)
+#  React fallback  (uses Qwen/Nemotron for decision, ADB tool for execution)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _REACT_SYSTEM = (
@@ -459,11 +679,11 @@ _REACT_SYSTEM = (
     "Observe the current screen and perform one atomic operation "
     "(tap / type text / swipe / long press / back) to progress toward the user's goal. "
     "Reply with a JSON object:\n"
-    "  {\"action\": \"<type>\", \"x\": <int>, \"y\": <int>, "
+    "  {\"action\": \"<type>\", \"element_id\": <int or str of target element>, "
     "\"input_str\": \"<text if action=text>\", "
     "\"direction\": \"<up/down/left/right if action=swipe>\", "
     "\"duration\": <ms if action=long_press>}\n"
-    "For back action omit x/y. Return JSON only."
+    "For back action omit element_id. Return JSON only."
 )
 
 
@@ -477,10 +697,26 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
         print("Unable to capture or parse screen")
         return state
 
-    screenshot_path   = state["current_page"]["screenshot"]
+    screenshot_path    = state["current_page"]["screenshot"]
     elements_json_path = state["current_page"]["elements_json"]
-    device            = state["device"]
-    device_size       = get_device_size.invoke(device)
+    device             = state["device"]
+
+    # ── Device size ───────────────────────────────────────────────────────────
+    raw_size   = get_device_size.invoke(device)
+    print(f"  [DIAG-REACT] get_device_size raw: {raw_size!r}")
+    if isinstance(raw_size, dict):
+        device_w = int(raw_size.get("width", raw_size.get("w", 1080)))
+        device_h = int(raw_size.get("height", raw_size.get("h", 2400)))
+    elif isinstance(raw_size, str):
+        try:
+            sz = json.loads(raw_size)
+            device_w = int(sz.get("width", sz.get("w", 1080)))
+            device_h = int(sz.get("height", sz.get("h", 2400)))
+        except Exception:
+            device_w, device_h = 1080, 2400
+    else:
+        device_w, device_h = 1080, 2400
+    print(f"  [DIAG-REACT] device size: {device_w}x{device_h}")
 
     with open(elements_json_path, "r", encoding="utf-8") as f:
         elements_data = json.load(f)
@@ -488,13 +724,38 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
     img_b64 = _img_to_b64(screenshot_path)
     images  = [img_b64] if img_b64 else []
 
+    # ── Build element index for coordinate lookup ─────────────────────────────
+    # Tell the LLM to refer to elements by their ID so we can resolve coordinates
+    # from the parsed bbox — this avoids the model guessing pixel coordinates.
+    element_index = {}
+    elements_for_prompt = []
+    for el in elements_data:
+        eid  = el.get("ID", el.get("id", "?"))
+        bbox = el.get("bbox", [])
+        element_index[str(eid)] = bbox
+        elements_for_prompt.append({
+            "id":      eid,
+            "type":    el.get("type", ""),
+            "content": el.get("content", ""),
+        })
+
     user_prompt = (
-        f"Device: {device}  Size: {device_size}\n"
+        f"Device: {device}  Size: {device_w}x{device_h} pixels\n"
         f"Task: {task}\n\n"
-        f"Current screen elements (bbox values are relative 0-1):\n"
-        f"{json.dumps(elements_data, ensure_ascii=False, indent=2)}\n\n"
-        "Determine the next single operation and return JSON."
+        f"Current screen elements:\n"
+        f"{json.dumps(elements_for_prompt, ensure_ascii=False, indent=2)}\n\n"
+        "Reply with JSON specifying the next single action.\n"
+        "IMPORTANT: You must specify the 'element_id' from the elements list above for the target element.\n"
+        "Return JSON only."
     )
+
+    # ── Swipe up after any previous tap (escape immediately on 1st retry) ────
+    _last_taps = [h for h in state.get("history", [])[-1:] if h.get("action") == "tap"]
+    if _last_taps:
+        print(f"  [DIAG-REACT] ⚠️  Previous action was a tap — injecting swipe-up to refresh screen before next LLM call")
+        swipe_params = {"device": device, "action": "swipe", "x": 540, "y": 1200, "direction": "up", "dist": "medium"}
+        screen_action.invoke(swipe_params)
+        time.sleep(1.0)
 
     try:
         result_json = _sync_call_json(
@@ -503,12 +764,40 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
             images_b64=images,
             timeout=240,
         )
+        print(f"  [DIAG-REACT] LLM action JSON: {result_json}")
 
         action_type = result_json.get("action", "tap")
         action_params: Dict[str, Any] = {"device": device, "action": action_type}
+
         if action_type != "back":
-            action_params["x"] = int(result_json.get("x", 0))
-            action_params["y"] = int(result_json.get("y", 0))
+            selected_id = str(result_json.get("element_id", ""))
+            bbox = element_index.get(selected_id)
+            if not bbox or len(bbox) < 4:
+                # Fallback to coordinates if model still output x and y
+                raw_x = result_json.get("x")
+                raw_y = result_json.get("y")
+                if raw_x is not None and raw_y is not None:
+                    if isinstance(raw_x, float) and 0.0 < raw_x <= 1.0:
+                        raw_x = int(raw_x * device_w)
+                    if isinstance(raw_y, float) and 0.0 < raw_y <= 1.0:
+                        raw_y = int(raw_y * device_h)
+                    action_params["x"] = int(raw_x)
+                    action_params["y"] = int(raw_y)
+                else:
+                    print(f"  [DIAG-REACT] ❌ Selected element_id '{selected_id}' not found in screen elements")
+                    state["execution_status"] = "error"
+                    return state
+            else:
+                # Calculate coordinates conditionally: scale if relative (<= 1.0), use directly otherwise
+                if bbox and len(bbox) == 4 and all(val <= 1.0 for val in bbox):
+                    center_x = int((bbox[0] + bbox[2]) / 2 * device_w)
+                    center_y = int((bbox[1] + bbox[3]) / 2 * device_h)
+                else:
+                    center_x = int((bbox[0] + bbox[2]) / 2) if bbox and len(bbox) == 4 else 0
+                    center_y = int((bbox[1] + bbox[3]) / 2) if bbox and len(bbox) == 4 else 0
+                action_params["x"] = center_x
+                action_params["y"] = center_y
+
         if action_type == "text":
             action_params["input_str"] = result_json.get("input_str", "")
         elif action_type == "long_press":
@@ -517,20 +806,24 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
             action_params["direction"] = result_json.get("direction", "up")
             action_params["dist"]      = result_json.get("dist", "medium")
 
-        screen_action.invoke(action_params)
+        print(f"  [DIAG-REACT] Invoking screen_action with: {action_params}")
+        action_result = screen_action.invoke(action_params)
+        action_ok = _parse_action_result(action_result)
         state["current_step"] += 1
         state["history"].append({
-            "step":      state["current_step"],
+            "step":       state["current_step"],
             "screenshot": screenshot_path,
-            "action":    action_type,
-            "params":    action_params,
-            "status":    "success",
+            "action":     action_type,
+            "params":     action_params,
+            "status":     "success" if action_ok else "error",
         })
-        state["execution_status"] = "success"
-        print(f"✓ React mode: executed {action_type}")
+        state["execution_status"] = "success" if action_ok else "error"
+        print(f"{'✓' if action_ok else '❌'} React mode: executed {action_type} — result: {action_result!r}")
 
     except Exception as e:
         print(f"❌ React mode error: {e}")
+        import traceback
+        traceback.print_exc()
         state["history"].append({
             "step":   state["current_step"],
             "action": "react_mode",
@@ -542,363 +835,11 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  execute_task  (top-level, unchanged logic)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def execute_task(
     state: DeploymentState, task: str, device: str, neo4j_db: Neo4jDatabase = None
 ) -> Dict[str, Any]:
-    from data.State import create_deployment_state
-    state    = create_deployment_state(task=task, device=device)
-    neo4j_db = neo4j_db or db
-
-    all_elements = neo4j_db.get_all_actions()
-    if not all_elements:
-        print("⚠️ No element nodes in database, falling back to React mode")
-        state = fallback_to_react(state)
-        return {"status": state["execution_status"], "state": state}
-
-    high_level_actions = neo4j_db.get_high_level_actions_for_task(task)
-    if high_level_actions:
-        shortcuts = check_shortcut_associations(state, high_level_actions)
-        if shortcuts:
-            valid_shortcuts = evaluate_shortcut_execution(state, shortcuts)
-            if valid_shortcuts:
-                execution_template = generate_execution_template(state, valid_shortcuts)
-                if execution_template:
-                    prioritized = prioritize_shortcuts(state, valid_shortcuts)
-                    result = execute_high_level_action(state, prioritized, execution_template)
-                    if result.get("status") == "success":
-                        state["execution_status"] = "success"
-                        state["completed"]         = True
-                        return {"status": "success", "state": state}
-                    else:
-                        state = fallback_to_react(state)
-                        return {"status": state["execution_status"], "state": state}
-        else:
-            for action in high_level_actions:
-                action_sequence = action.get("action_sequence", [])
-                if not action_sequence:
-                    continue
-                state = capture_and_parse_screen(state)
-                if not state["current_page"]["screenshot"]:
-                    state["retry_count"] += 1
-                    if state["retry_count"] >= state["max_retries"]:
-                        state = fallback_to_react(state)
-                        return {"status": state["execution_status"], "state": state}
-                    continue
-                state["retry_count"] = 0
-                element_matches = match_screen_elements(state, action_sequence)
-                if not element_matches:
-                    state["retry_count"] += 1
-                    if state["retry_count"] >= state["max_retries"]:
-                        state = fallback_to_react(state)
-                        return {"status": state["execution_status"], "state": state}
-                    continue
-                state["retry_count"] = 0
-                best_match = element_matches[0]
-                success = execute_element_action(state, best_match)
-                if success:
-                    state["current_step"] += 1
-                    state["history"].append({
-                        "step": state["current_step"],
-                        "screenshot": state["current_page"]["screenshot"],
-                        "action": best_match.get("action_type", "tap"),
-                        "element_id": best_match.get("element_id", ""),
-                        "status": "success",
-                    })
-                    if state["current_step"] >= len(action_sequence):
-                        state["execution_status"] = "success"
-                        state["completed"]         = True
-                        return {"status": "success", "state": state}
-                else:
-                    state["retry_count"] += 1
-                    if state["retry_count"] >= state["max_retries"]:
-                        state = fallback_to_react(state)
-                        return {"status": state["execution_status"], "state": state}
-    else:
-        print("❌ No matching high-level actions found, falling back to React mode")
-        state = fallback_to_react(state)
-        return {"status": state["execution_status"], "state": state}
-
-    state = fallback_to_react(state)
-    return {"status": state["execution_status"], "state": state}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Shortcut helpers  (all Gemini prompts replaced with bridge calls)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_shortcut_associations(
-    state: DeploymentState, high_level_actions: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    print("🔍 Checking high-level action shortcut associations...")
-    shortcuts: List[Dict[str, Any]] = []
-    for action in high_level_actions:
-        action_id = action.get("action_id")
-        if not action_id:
-            continue
-        associated = state.get("neo4j_db", db).get_shortcuts_for_action(action_id)
-        for shortcut in (associated or []):
-            shortcuts.append({
-                "shortcut_id":    shortcut.get("shortcut_id"),
-                "name":           shortcut.get("name"),
-                "description":    shortcut.get("description"),
-                "action_id":      action_id,
-                "action_name":    action.get("name"),
-                "action_sequence": action.get("action_sequence", []),
-                "conditions":     shortcut.get("conditions", {}),
-                "priority":       shortcut.get("priority", 0),
-                "page_flow":      shortcut.get("page_flow", []),
-            })
-    print(f"{'✓' if shortcuts else '⚠️'} Found {len(shortcuts)} associated shortcut(s)")
-    return shortcuts
-
-
-_SHORTCUT_EVAL_SYSTEM = (
-    "You are a smartphone operation assistant that evaluates whether the current "
-    "scenario meets the conditions for executing shortcuts.\n\n"
-    "Return ONLY a JSON object:\n"
-    "  {\"valid_shortcuts\": [{\"shortcut_id\": \"...\", \"reason\": \"...\", \"confidence\": 0.0}]}\n"
-    "If no shortcuts match, return an empty list. No preamble, no markdown fences."
-)
-
-
-def evaluate_shortcut_execution(
-    state: DeploymentState, shortcuts: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    print("🧠 Evaluating shortcut execution conditions...")
-    if not shortcuts:
-        return []
-
-    screen_desc = ""
-    if state["current_page"]["elements_data"]:
-        screen_desc = "Current screen elements:\n"
-        for i, el in enumerate(state["current_page"]["elements_data"]):
-            screen_desc += f"  {i+1}. Type: {el.get('type','?')}  Content: {el.get('content','')}\n"
-
-    shortcuts_info = ""
-    for i, sc in enumerate(shortcuts):
-        shortcuts_info += f"{i+1}. ID: {sc.get('shortcut_id')}  Name: {sc.get('name')}\n"
-        shortcuts_info += f"   Description: {sc.get('description','N/A')}\n"
-        cond = sc.get("conditions", {})
-        if cond:
-            if isinstance(cond, dict):
-                shortcuts_info += "   Conditions: " + "; ".join(f"{k}={v}" for k, v in cond.items()) + "\n"
-            else:
-                shortcuts_info += f"   Conditions: {cond}\n"
-        shortcuts_info += "\n"
-
-    user_prompt = (
-        f"User task: {state['task']}\n\n"
-        f"{screen_desc}\n"
-        f"Available shortcuts:\n{shortcuts_info}\n"
-        "Evaluate which shortcuts meet execution conditions and return JSON."
-    )
-
-    try:
-        result        = _sync_call_json(_SHORTCUT_EVAL_SYSTEM, user_prompt, timeout=180)
-        valid_list    = result.get("valid_shortcuts", [])
-        valid_ids     = {v["shortcut_id"] for v in valid_list}
-        valid_objects = []
-        for sc in shortcuts:
-            if sc.get("shortcut_id") in valid_ids:
-                sc_copy = sc.copy()
-                for v in valid_list:
-                    if v["shortcut_id"] == sc.get("shortcut_id"):
-                        sc_copy["evaluation"] = {"reason": v.get("reason",""), "confidence": v.get("confidence", 0.0)}
-                        break
-                valid_objects.append(sc_copy)
-        print(f"✓ {len(valid_objects)} shortcut(s) meet execution conditions")
-        return valid_objects
-    except Exception as e:
-        print(f"❌ Error evaluating shortcuts: {e}")
-        return []
-
-
-_TEMPLATE_GEN_SYSTEM = (
-    "You are a smartphone operation assistant that generates detailed execution "
-    "templates from shortcuts and the current screen state.\n\n"
-    "Return ONLY a JSON object:\n"
-    "  {\"steps\": [{\"action_type\": \"tap|text|swipe|long_press|back\", "
-    "\"target_element_id\": <int or null>, \"parameters\": {...}}]}\n"
-    "No preamble, no markdown fences."
-)
-
-
-def generate_execution_template(
-    state: DeploymentState, shortcuts: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    print("📝 Generating execution template...")
-    if not shortcuts:
-        return {}
-
-    selected = max(shortcuts, key=lambda x: x.get("evaluation", {}).get("confidence", 0))
-
-    device_size = get_device_size.invoke(state["device"])
-    if isinstance(device_size, str):
-        device_size = {"width": 1080, "height": 1920}
-
-    shortcut_info = (
-        f"ID: {selected.get('shortcut_id')}\n"
-        f"Name: {selected.get('name')}\n"
-        f"Description: {selected.get('description','N/A')}\n"
-    )
-    seq = selected.get("action_sequence", [])
-    if seq:
-        shortcut_info += "Action sequence:\n" + "\n".join(
-            f"  {i+1}. {json.dumps(a, ensure_ascii=False)}" for i, a in enumerate(seq)
-        )
-    eval_ = selected.get("evaluation", {})
-    if eval_:
-        shortcut_info += f"\nReason: {eval_.get('reason','')}  Confidence: {eval_.get('confidence',0)}"
-
-    user_prompt = (
-        f"Shortcut:\n{shortcut_info}\n\n"
-        f"Screen elements:\n{json.dumps(state['current_page']['elements_data'], ensure_ascii=False, indent=2)}\n\n"
-        f"Device size: {json.dumps(device_size, ensure_ascii=False)}\n\n"
-        "Generate the execution template JSON now."
-    )
-
-    try:
-        result = _sync_call_json(_TEMPLATE_GEN_SYSTEM, user_prompt, timeout=240)
-        if "steps" in result and isinstance(result["steps"], list) and result["steps"]:
-            print(f"✓ Generated template with {len(result['steps'])} steps")
-            return result
-        print("❌ Generated template is invalid")
-        return {}
-    except Exception as e:
-        print(f"❌ Error generating template: {e}")
-        return {}
-
-
-def prioritize_shortcuts(
-    state: Dict[str, Any], shortcuts: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    if not shortcuts or len(shortcuts) <= 1:
-        return shortcuts
-    try:
-        page_flow = state.get("neo4j_db", db).get_page_flow()
-        if not page_flow:
-            return sorted(shortcuts, key=lambda x: x.get("element_match", {}).get("match_score", 0), reverse=True)
-        prioritized = []
-        for sc in shortcuts:
-            pos = next((i for i, n in enumerate(page_flow) if n.get("shortcut_id") == sc.get("shortcut_id")), -1)
-            prioritized.append({"shortcut": sc, "pos": pos, "score": sc.get("element_match", {}).get("match_score", 0)})
-        prioritized.sort(key=lambda x: (x["pos"] if x["pos"] >= 0 else float("inf"), -x["score"]))
-        return [p["shortcut"] for p in prioritized]
-    except Exception as e:
-        print(f"⚠️ Shortcut prioritisation failed: {e}")
-        return shortcuts
-
-
-def execute_high_level_action(
-    state: DeploymentState,
-    shortcuts: List[Dict[str, Any]],
-    execution_template: Dict[str, Any],
-) -> Dict[str, Any]:
-    print("🚀 Executing high-level operations...")
-
-    if not execution_template or "steps" not in execution_template:
-        return {"status": "error", "message": "Invalid execution template"}
-
-    steps = execution_template["steps"]
-    if not steps:
-        return {"status": "error", "message": "No steps in execution template"}
-
-    state["current_step"]    = 0
-    state["total_steps"]     = len(steps)
-    state["execution_status"] = "running"
-    state["history"]         = []
-
-    shortcut_names = ", ".join(s.get("name", "Unnamed") for s in shortcuts)
-    print(f"Executing shortcuts: {shortcut_names}  ({len(steps)} steps)")
-
-    while state["current_step"] < state["total_steps"]:
-        idx  = state["current_step"]
-        step = steps[idx]
-        print(f"\nStep {idx + 1}/{state['total_steps']}")
-
-        state = capture_and_parse_screen(state)
-        if not state["current_page"]["screenshot"]:
-            state["retry_count"] += 1
-            if state["retry_count"] >= state["max_retries"]:
-                return {"status": "error", "message": "Unable to capture screen"}
-            time.sleep(1)
-            continue
-        state["retry_count"] = 0
-
-        action_type       = step.get("action_type", "tap")
-        target_element_id = step.get("target_element_id")
-        parameters        = step.get("parameters", {})
-
-        if action_type == "back":
-            screen_action.invoke({"device": state["device"], "action": "back"})
-            state["history"].append({"step": idx, "action": "back", "status": "success"})
-            state["current_step"] += 1
-            time.sleep(1)
-            continue
-
-        if target_element_id is None:
-            return {"status": "error", "message": f"Step {idx+1} missing target_element_id"}
-
-        screen_elements = state["current_page"]["elements_data"]
-        if target_element_id < 0 or target_element_id >= len(screen_elements):
-            return {"status": "error", "message": f"Invalid target_element_id for step {idx+1}"}
-
-        element     = screen_elements[target_element_id]
-        bbox        = element.get("bbox", [0, 0, 0, 0])
-        device_size = get_device_size.invoke(state["device"])
-        if isinstance(device_size, str):
-            device_size = {"width": 1080, "height": 1920}
-
-        center_x = int((bbox[0] + bbox[2]) / 2 * device_size["width"])
-        center_y = int((bbox[1] + bbox[3]) / 2 * device_size["height"])
-
-        action_params: Dict[str, Any] = {"device": state["device"], "action": action_type, "x": center_x, "y": center_y}
-        if action_type == "text":
-            action_params["input_str"] = parameters.get("text", "")
-        elif action_type == "long_press":
-            action_params["duration"] = parameters.get("duration", 1000)
-        elif action_type == "swipe":
-            action_params["direction"] = parameters.get("direction", "up")
-            action_params["dist"]      = parameters.get("distance", "medium")
-
-        result  = screen_action.invoke(action_params)
-        success = False
-        if isinstance(result, str):
-            try:
-                success = json.loads(result).get("status") == "success"
-            except Exception:
-                pass
-
-        if success:
-            print(f"✓ Step {idx + 1} OK")
-            state["history"].append({"step": idx, "action": action_type, "target": target_element_id, "status": "success"})
-            state["current_step"] += 1
-            state["retry_count"]   = 0
-            time.sleep(1.5)
-        else:
-            print(f"❌ Step {idx + 1} failed")
-            state["history"].append({"step": idx, "action": action_type, "target": target_element_id, "status": "error"})
-            state["retry_count"] += 1
-            if state["retry_count"] >= state["max_retries"]:
-                return {"status": "error", "message": f"Step {idx+1} failed after {state['max_retries']} retries"}
-            time.sleep(1)
-
-    state = capture_and_parse_screen(state)
-    state["execution_status"] = "success"
-    state["completed"]         = True
-    print(f"\n✨ High-level execution complete — {state['current_step']} steps done")
-    return {
-        "status":            "success",
-        "message":           "Successfully executed high-level operations",
-        "steps_completed":   state["current_step"],
-        "total_steps":       state["total_steps"],
-        "final_screenshot":  state["current_page"]["screenshot"],
-        "execution_history": state["history"],
-    }
+    """Thin wrapper kept for backward-compat. Real execution is in run_task()."""
+    return run_task(task=task, device=device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -918,31 +859,79 @@ _JUDGE_SYSTEM = (
 
 
 def check_task_completion(state: DeploymentState) -> DeploymentState:
-    if state["current_step"] < 2:
+    _log = state.get("log_callback") or print
+
+    if state.get("execution_status") == "no_match":
+        state["completed"] = True
         return state
 
-    print("🔍 Evaluating if task is completed...")
+    # Fetch matched high-level action and the target page description from Neo4j
+    matched_action = state.get("current_action")
+    last_page_id = None
+    last_page_description = None
+
+    if matched_action:
+        element_sequence = matched_action.get("element_sequence", [])
+        if isinstance(element_sequence, str):
+            try:
+                element_sequence = json.loads(element_sequence)
+            except Exception:
+                element_sequence = []
+        if element_sequence:
+            last_step = element_sequence[-1]
+            last_element_id = last_step.get("element_id")
+            if last_element_id:
+                try:
+                    query = """
+                    MATCH (e:Element {element_id: $eid})-[:LEADS_TO]->(p:Page)
+                    RETURN p.page_id as page_id, p.description as description
+                    """
+                    with db.driver.session(database=db.database) as session:
+                        res = session.run(query, eid=last_element_id)
+                        record = res.single()
+                        if record:
+                            last_page_id = record["page_id"]
+                            last_page_description = record["description"]
+                            _log(f"🔍 Found task completion page in Neo4j. Page ID: {last_page_id}, Description: '{last_page_description}'")
+                except Exception as exc:
+                    _log(f"⚠️ Error querying Neo4j task completion page: {exc}")
+
+    # If already marked completed and we have no Neo4j page description to verify, return early.
+    # Otherwise, proceed to match the live page semantics against last_page_description.
+    if state.get("completed") and not last_page_description:
+        _log("✓ Task already completed successfully by action sequence execution.")
+        return state
+
+    history = state.get("history") or []
+    has_screenshot = bool(state.get("current_page", {}).get("screenshot"))
+
+    if not history and not has_screenshot:
+        _log("🔍 check_task_completion: skipping — no actions taken yet")
+        return state
+
+    _log(f"🔍 Evaluating if task is completed... (history_len={len(history)}, step={state.get('current_step')})")
     task = state["task"]
 
-    # Generate criteria
-    try:
-        completion_criteria = _sync_call_text(
-            system_prompt=_CRITERIA_SYSTEM,
-            user_prompt=f"The user's task is: {task}\nDescribe clear, checkable completion criteria.",
-            timeout=120,
-        )
-    except Exception as e:
-        print(f"⚠️ Could not generate criteria: {e}")
-        return state
+    if last_page_description:
+        completion_criteria = f"The current screen is a final page which should match the semantic description: {last_page_description}"
+    else:
+        try:
+            completion_criteria = _sync_call_text(
+                system_prompt=_CRITERIA_SYSTEM,
+                user_prompt=f"The user's task is: {task}\nDescribe clear, checkable completion criteria.",
+                timeout=120,
+            )
+        except Exception as e:
+            _log(f"⚠️ Could not generate criteria: {e}")
+            return state
 
-    # Collect recent screenshots
     recent_screenshots: List[str] = [
         step["screenshot"] for step in state["history"][-3:] if step.get("screenshot")
     ]
     if not recent_screenshots and state["current_page"]["screenshot"]:
         recent_screenshots = [state["current_page"]["screenshot"]]
     if not recent_screenshots:
-        print("⚠️ No screenshots available")
+        _log("⚠️ No screenshots available")
         return state
 
     images_b64: List[str] = []
@@ -966,16 +955,42 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
             timeout=180,
         ).strip().lower()
     except Exception as e:
-        print(f"⚠️ Completion check error: {e}")
+        _log(f"⚠️ Completion check error: {e}")
         return state
 
-    if "yes" in answer or "complete" in answer:
+    _log(f"  [DIAG-COMPLETION] Full judgement answer: {answer!r}")
+
+    def _is_affirmative(text: str) -> bool:
+        negative_phrases = [
+            "not complete", "not yet", "not done", "not finished",
+            "incomplete", "no,", "no.", "no\n", "task is not", "hasn't been",
+            "have not", "has not", "cannot confirm", "not confirmed",
+            "not set", "not shown", "not visible", "does not show",
+        ]
+        for phrase in negative_phrases:
+            if phrase in text:
+                return False
+        positive_phrases = ["yes,", "yes.", "yes\n", "task is complete",
+                            "task has been completed", "alarm has been set",
+                            "alarm is set", "task complete", "completed successfully"]
+        for phrase in positive_phrases:
+            if phrase in text:
+                return True
+        if text.startswith("yes") and len(text) < 15:
+            return True
+        return False
+
+    is_complete = _is_affirmative(answer)
+    if is_complete:
         state["completed"]        = True
         state["execution_status"] = "completed"
-        print(f"✓ Task completed: {answer}")
+        _log(f"✓ Task completed: {answer[:100]}")
     else:
         state["completed"] = False
-        print(f"⚠️ Task not completed: {answer}")
+        _log(f"⚠️ Task not yet complete: {answer[:100]}")
+        if matched_action:
+            _log("⚠️ Verification failed for high-level action sequence. Routing to React fallback mode.")
+            state["should_fallback"] = True
 
     state["history"].append({
         "step":               state["current_step"],
@@ -993,157 +1008,174 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def capture_screen_node(state: DeploymentState) -> DeploymentState:
-    print("📸 Capturing and parsing current screen...")
-    state_dict   = dict(state)
-    updated      = capture_and_parse_screen(state_dict)
+    _log = state.get("log_callback") or print
+    _log("📸 Capturing and parsing current screen...")
+    state_dict = dict(state)
+    updated    = capture_and_parse_screen(state_dict)
     for k, v in updated.items():
         if k in state:
             state[k] = v
     if not state["current_page"]["screenshot"]:
         state["should_fallback"] = True
-        print("❌ Unable to capture screen, marking for fallback")
+        _log("❌ Unable to capture screen, marking for fallback")
     else:
-        print("✓ Screen captured successfully")
+        _log(f"✓ Screen captured — {len(state['current_page'].get('elements_data') or [])} elements")
     return state
 
 
 def match_elements_node(state: DeploymentState) -> DeploymentState:
-    print("🔍 Matching current screen elements...")
-    all_elements = db.get_all_actions()
-    if not all_elements:
+    """Semantically match the user task to a stored Neo4j high-level action."""
+    _log = state.get("log_callback") or print
+
+    if state.get("force_fallback"):
+        _log("⚡ Force fallback requested — routing directly to React fallback mode")
         state["should_fallback"] = True
+        state["close_actions"]   = []
         return state
 
-    action_sequence: List[Dict[str, Any]] = []
-    for element in all_elements:
-        if "element_id" in element:
-            action_sequence.append({"element_id": element["element_id"], "atomic_action": "tap", "action_params": {}})
-        else:
-            element_id = element.get("id") or element.get("node_id") or str(hash(str(element)))
-            action_sequence.append({"element_id": element_id, "atomic_action": "tap", "action_params": {}})
+    _log(f"🔍 Matching task to high-level action: '{state['task']}'")
 
     state_dict = dict(state)
-    element_matches = match_screen_elements(state_dict, action_sequence)
-    state["matched_elements"] = element_matches
+    is_matched, matched_action = match_task_to_action(state_dict, state["task"])
 
-    if not state["matched_elements"]:
-        is_matched, matched_action = match_task_to_action(state_dict, state["task"])
-        if is_matched and matched_action:
-            state["current_action"] = matched_action
-            element_sequence = matched_action.get("element_sequence", [])
-            if isinstance(element_sequence, str):
-                try:
-                    element_sequence = json.loads(element_sequence)
-                except Exception:
-                    state["should_fallback"] = True
-                    return state
-            if not element_sequence:
-                state["should_fallback"] = True
-                return state
-            state["current_step"]  = 0
-            state["total_steps"]   = len(element_sequence)
-            updated = capture_and_parse_screen(state_dict)
-            for k, v in updated.items():
-                if k in state:
-                    state[k] = v
-            state["matched_elements"] = match_screen_elements(state_dict, element_sequence)
-            if not state["matched_elements"]:
-                state["should_fallback"] = True
-        else:
+    if is_matched and matched_action:
+        element_sequence = matched_action.get("element_sequence", [])
+        if isinstance(element_sequence, str):
+            try:
+                element_sequence = json.loads(element_sequence)
+            except Exception:
+                element_sequence = []
+
+        if not element_sequence:
+            _log("  [MATCH] ⚠️  element_sequence is empty — no steps to execute")
             state["should_fallback"] = True
+            state["close_actions"]   = get_close_high_level_actions(state["task"])
+            return state
+
+        state["current_action"]  = matched_action
+        state["current_step"]    = 0
+        state["total_steps"]     = len(element_sequence)
+        state["should_fallback"] = False
+        _log(f"  [MATCH] ✓ Matched '{matched_action.get('name')}' — {len(element_sequence)} step(s)")
     else:
-        print(f"✓ Found {len(state['matched_elements'])} matching elements")
-    return state
+        _log("  [MATCH] ❌ No high-level action found — early termination for popup modal")
+        state["execution_status"] = "no_match"
+        state["completed"]        = True
+        state["should_fallback"]  = False
+        state["close_actions"]    = get_close_high_level_actions(state["task"])
 
-
-def check_shortcuts_node(state: DeploymentState) -> DeploymentState:
-    print("🔍 Checking element associations with shortcuts...")
-    if not state["matched_elements"]:
-        state["should_fallback"] = True
-        return state
-    state_dict = dict(state)
-    associated = check_shortcut_associations(state_dict, state["matched_elements"])
-    if associated:
-        state["associated_shortcuts"] = prioritize_shortcuts(state_dict, associated)
-        print(f"✓ Found {len(state['associated_shortcuts'])} associated shortcut node(s)")
-    else:
-        print("📝 No associated shortcut nodes found")
-        state["associated_shortcuts"] = []
-    return state
-
-
-def shortcut_evaluation_node(state: DeploymentState) -> DeploymentState:
-    print("🧠 Evaluating whether to execute shortcut operations...")
-    if not state["associated_shortcuts"]:
-        return state
-    state_dict = dict(state)
-    # evaluate_shortcut_execution returns a list, not a dict — handle both shapes
-    result = evaluate_shortcut_execution(state_dict, state["associated_shortcuts"])
-    if isinstance(result, list) and result:
-        state["should_execute_shortcut"] = True
-        state["current_shortcut"]        = result[0]
-    elif isinstance(result, dict):
-        state["should_execute_shortcut"] = result.get("should_execute", False)
-        if "shortcut" in result:
-            state["current_shortcut"] = result["shortcut"]
-    print(f"{'✓' if state.get('should_execute_shortcut') else '⚠️'} Execute shortcut: {state.get('should_execute_shortcut')}")
-    return state
-
-
-def generate_template_node(state: DeploymentState) -> DeploymentState:
-    print("📝 Generating execution template...")
-    if not state.get("should_execute_shortcut") or "current_shortcut" not in state:
-        return state
-    state_dict = dict(state)
-    shortcuts  = [state["current_shortcut"]] if isinstance(state["current_shortcut"], dict) else state["associated_shortcuts"]
-    state["execution_template"] = generate_execution_template(state_dict, shortcuts)
-    steps = len(state.get("execution_template", {}).get("steps", []))
-    print(f"✓ Template generated with {steps} step(s)")
     return state
 
 
 def execute_action_node(state: DeploymentState) -> DeploymentState:
-    state_dict = dict(state)
-    if state.get("should_execute_shortcut") and state.get("execution_template"):
-        print("🚀 Executing high-level operation...")
-        result = execute_high_level_action(state_dict, state["associated_shortcuts"], state["execution_template"])
-        if result["status"] == "success":
-            state["execution_status"] = "success"
-            state["completed"]         = True
-            if "execution_history" in result:
-                state["history"] = result["execution_history"]
-            if "final_screenshot" in result:
-                state["current_page"]["screenshot"] = result["final_screenshot"]
+    """
+    Pinecone-primary execution:
+      1. Walk element_sequence from current_action.
+      2. For each step: fetch Pinecone embedding → cosine match → execute.
+      3. If cosine fails: LLM picks best element from description/content.
+      4. React fallback is NOT triggered here — only when no HL action was found.
+    """
+    _log = state.get("log_callback") or print
+
+    if state.get("execution_status") == "no_match":
+        return state
+
+    _log(f"\n{'='*60}")
+    _log("⚙️  execute_action_node (Pinecone-primary)")
+
+    matched_action = state.get("current_action")
+    if not matched_action:
+        _log("  ❌ No current_action in state")
+        return state
+
+    element_sequence = matched_action.get("element_sequence", [])
+    if isinstance(element_sequence, str):
+        try:
+            element_sequence = json.loads(element_sequence)
+        except Exception:
+            element_sequence = []
+
+    if not element_sequence:
+        _log("  ❌ element_sequence empty — cannot execute")
+        return state
+
+    action_name = matched_action.get("name", "?")
+    _log(f"🚀 Executing '{action_name}' — {len(element_sequence)} step(s) via Pinecone matching")
+    state["total_steps"] = len(element_sequence)
+    state["execution_status"] = "running"
+    all_steps_ok = True
+
+    for step_idx, step_info in enumerate(element_sequence):
+        _log(f"  ── Step {step_idx+1}/{len(element_sequence)} ──────────────────")
+        state["current_step"] = step_idx
+        state_dict = dict(state)
+        state_dict["current_step"] = step_idx
+
+        # Capture fresh screen for each step
+        updated = capture_and_parse_screen(state_dict)
+        for k, v in updated.items():
+            if k in state:
+                state[k] = v
+        state_dict = dict(state)
+        state_dict["current_step"] = step_idx
+
+        if not state["current_page"]["screenshot"]:
+            _log(f"  ❌ Step {step_idx+1}: screen capture failed")
+            all_steps_ok = False
+            break
+
+        element_id = step_info.get("element_id")
+        if not element_id:
+            _log(f"  ❌ Step {step_idx+1}: no element_id in step_info")
+            all_steps_ok = False
+            break
+
+        # Pinecone cosine match
+        matches = match_element_via_pinecone(element_id, step_info, state_dict)
+        if not matches:
+            _log(f"  ❌ Step {step_idx+1}: could not identify element on screen")
+            all_steps_ok = False
+            break
+
+        best_match = matches[0]
+        _log(f"  [EXEC] best_match screen_el={best_match.get('screen_element_id')} "
+             f"action={best_match.get('action_type')} score={best_match.get('match_score', 0):.3f}")
+
+        success = execute_element_action(state_dict, best_match)
+        _log(f"  {'✓' if success else '❌'} Step {step_idx+1}/{len(element_sequence)} ADB result: {success}")
+
+        if success:
+            state["current_step"] = step_idx + 1
+            state["history"].append({
+                "step":       step_idx,
+                "action":     best_match.get("action_type", "tap"),
+                "element_id": element_id,
+                "status":     "success",
+                "screenshot": state["current_page"]["screenshot"],
+            })
+            time.sleep(1.5)
         else:
-            state["should_fallback"] = True
-    else:
-        print("📝 Attempting to match task with high-level actions...")
-        is_matched, matched_action = match_task_to_action(state_dict, state["task"])
-        if is_matched and matched_action:
-            state["current_action"] = matched_action
-            element_sequence = matched_action.get("element_sequence", [])
-            if isinstance(element_sequence, str):
-                try:
-                    element_sequence = json.loads(element_sequence)
-                except Exception:
-                    state["should_fallback"] = True
-                    return state
-            if not element_sequence:
-                state["should_fallback"] = True
-                return state
-            state["current_step"]    = 0
-            state["total_steps"]     = len(element_sequence)
-            state["execution_status"] = "running"
-            state["execution_template"] = {"steps": element_sequence}
-        else:
-            state["should_fallback"] = True
+            _log(f"  ❌ Step {step_idx+1}: ADB returned failure")
+            all_steps_ok = False
+            break
+
+    if all_steps_ok:
+        state["execution_status"] = "success"
+        state["completed"]         = True
+        _log(f"✨ '{action_name}' complete — {len(element_sequence)} step(s) done")
+
     return state
 
 
 def fallback_node(state: DeploymentState) -> DeploymentState:
-    print("⚠️ Falling back to basic operation space")
+    print("\n⚠️  fallback_node entered")
+    print(f"  [DIAG-FALLBACK] execution_status={state.get('execution_status')}")
+    print(f"  [DIAG-FALLBACK] current_step={state.get('current_step')}  history_len={len(state.get('history') or [])}")
     state = fallback_to_react(state)
-    state["completed"] = True
+    print(f"  [DIAG-FALLBACK] after fallback_to_react: execution_status={state.get('execution_status')}")
+
+    state["completed"] = False
+    print(f"  [DIAG-FALLBACK] completed forced to False — check_task_completion will judge")
     return state
 
 
@@ -1152,52 +1184,103 @@ def fallback_node(state: DeploymentState) -> DeploymentState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def should_fallback(state: DeploymentState) -> str:
-    return "fallback" if state.get("should_fallback") else "continue"
+    _log = state.get("log_callback") or print
+    result = "fallback" if state.get("should_fallback") else "continue"
+    _log(f"  [ROUTE] should_fallback → '{result}'")
+    return result
 
-def should_execute_shortcut(state: DeploymentState) -> str:
-    return "execute_shortcut" if state.get("should_execute_shortcut") else "match_task"
 
 def is_task_completed(state: DeploymentState) -> str:
-    return "end" if state.get("completed") else "continue"
+    _log = state.get("log_callback") or print
+    if state.get("completed"):
+        _log(f"  [ROUTE] is_task_completed → 'end'  (status={state.get('execution_status')})")
+        return "end"
+
+    workflow_iter = state.get("_workflow_iterations", 0) + 1
+    state["_workflow_iterations"] = workflow_iter
+    max_iters = state.get("max_workflow_iterations", 10)
+    _log(f"  [ROUTE] is_task_completed → 'continue'  (iter={workflow_iter}/{max_iters})")
+
+    if workflow_iter >= max_iters:
+        _log(f"⚠️  Workflow iteration cap ({max_iters}) reached — ending")
+        state["completed"] = True
+        state["execution_status"] = "timeout"
+        return "end"
+
+    return "continue"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LangGraph workflow  (unchanged)
+#  LangGraph workflow
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_workflow() -> StateGraph:
     workflow = StateGraph(DeploymentState)
 
-    workflow.add_node("capture_screen",    capture_screen_node)
-    workflow.add_node("match_elements",    match_elements_node)
-    workflow.add_node("check_shortcuts",   check_shortcuts_node)
-    workflow.add_node("evaluate_shortcut", shortcut_evaluation_node)
-    workflow.add_node("generate_template", generate_template_node)
-    workflow.add_node("execute_action",    execute_action_node)
-    workflow.add_node("fallback",          fallback_node)
-    workflow.add_node("check_completion",  check_task_completion)
+    workflow.add_node("capture_screen",   capture_screen_node)
+    workflow.add_node("match_elements",   match_elements_node)
+    workflow.add_node("execute_action",   execute_action_node)
+    workflow.add_node("fallback",         fallback_node)
+    workflow.add_node("check_completion", check_task_completion)
 
     workflow.set_entry_point("capture_screen")
-
-    workflow.add_conditional_edges("capture_screen",    should_fallback, {"fallback": "fallback", "continue": "match_elements"})
-    workflow.add_conditional_edges("match_elements",    should_fallback, {"fallback": "fallback", "continue": "check_shortcuts"})
-    workflow.add_edge("check_shortcuts", "evaluate_shortcut")
-    workflow.add_conditional_edges("evaluate_shortcut", should_execute_shortcut, {"execute_shortcut": "generate_template", "match_task": "execute_action"})
-    workflow.add_edge("generate_template", "execute_action")
+    # screen capture failure → fallback
+    workflow.add_conditional_edges(
+        "capture_screen", should_fallback,
+        {"fallback": "fallback", "continue": "match_elements"},
+    )
+    # no HL action found → fallback, else execute
+    workflow.add_conditional_edges(
+        "match_elements", should_fallback,
+        {"fallback": "fallback", "continue": "execute_action"},
+    )
     workflow.add_edge("execute_action",    "check_completion")
-    workflow.add_conditional_edges("check_completion",  is_task_completed, {"end": END, "continue": "capture_screen"})
-    workflow.add_edge("fallback", "check_completion")
+    workflow.add_edge("fallback",          "check_completion")
+    workflow.add_conditional_edges(
+        "check_completion", is_task_completed,
+        {"end": END, "continue": "capture_screen"},
+    )
 
     return workflow
 
 
-def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
-    print(f"🚀 Starting task execution: {task}")
+def run_task(
+    task: str,
+    device: str = "emulator-5554",
+    max_workflow_iterations: int = 10,
+    log_callback=None,
+    force_fallback: bool = False,
+) -> Dict[str, Any]:
+    """
+    Execute a high-level task on an Android device.
+
+    Args:
+        task:                    Natural-language task description.
+        device:                  ADB device serial.
+        max_workflow_iterations: Hard cap on graph loop iterations.
+        log_callback:            Callable(str) for real-time log streaming.
+                                 Defaults to print() if not provided.
+        force_fallback:          Whether to automatically route to React fallback mode.
+    """
+    _log = log_callback or print
+    _log(f"\n{'#'*60}")
+    _log(f"# deployment.py  v3  (Pinecone-primary)")
+    _log(f"# task='{task}'  device='{device}'  max_iters={max_workflow_iterations}  force_fallback={force_fallback}")
+    _log(f"{'#'*60}\n")
     try:
         from data.State import create_deployment_state
-        state   = create_deployment_state(task=task, device=device, max_retries=3)
-        app     = build_workflow().compile()
-        result  = app.invoke(state)
+        state = create_deployment_state(task=task, device=device, max_retries=3)
+        state["_workflow_iterations"]    = 0
+        state["max_workflow_iterations"] = max_workflow_iterations
+        state["log_callback"]            = log_callback   # propagated to all nodes
+        state["close_actions"]           = []             # populated on no-match
+        state["force_fallback"]          = force_fallback
+
+        recursion_limit = max(50, max_workflow_iterations * 6)
+        app    = build_workflow().compile()
+        result = app.invoke(state, config={"recursion_limit": recursion_limit})
+
+        close_actions = result.get("close_actions", [])
 
         if result["execution_status"] == "success" and result["current_page"]["screenshot"]:
             try:
@@ -1206,12 +1289,18 @@ def run_task(task: str, device: str = "emulator-5554") -> Dict[str, Any]:
             except Exception:
                 pass
 
+        message = "Task execution completed"
+        if result["execution_status"] == "no_match":
+            message = "Add test cases in the exploration tab or navigate to fallback mechanism"
+
         return {
             "status":          result["execution_status"],
-            "message":         "Task execution completed",
+            "message":         message,
             "steps_completed": result["current_step"],
             "total_steps":     result["total_steps"],
+            "close_actions":   close_actions,
         }
     except Exception as e:
-        print(f"❌ Error executing task: {e}")
-        return {"status": "error", "message": str(e), "error": str(e)}
+        _log(f"❌ Error executing task: {e}")
+        import traceback; traceback.print_exc()
+        return {"status": "error", "message": str(e), "error": str(e), "close_actions": []}

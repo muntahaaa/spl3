@@ -429,18 +429,19 @@ Run these notebooks with a **T4 GPU** enabled runtime:
 
 | Component | Tool/Technology |
 |---|---|
-| Frontend | React (JavaScript) |
+| Frontend | Gradio (Python) |
 | Backend | FastAPI (Python) |
-| ML Framework | Hugging Face Transformers |
-| NLP Framework | spaCy, TextBlob, Hugging Face Tokenizers |
-| Bias Mitigation Method | Word Replacement, Fairness Constraints, Attention Mechanism |
-| ML Model | BERT, RoBERTa (for text classification) |
-| DL Model | T5, XLNet, DeBERTa |
-| Dataset | Custom Dataset from Bengali News Sources |
-| Preprocessing Tool | NLTK, spaCy |
+| ML Framework | Hugging Face Transformers, PyTorch |
+| Multimodal Model | Qwen2.5-VL (vision + text) |
+| UI Parser | OmniParser (YOLO + captioning) |
+| Vector Store | Pinecone |
+| Graph Database | Neo4j |
+| Task Queue | Firebase Realtime Database |
+| Device Control | Android ADB |
+| Workflow Orchestration | LangGraph |
+| Image Processing | Pillow (PIL) |
 | Version Control | Git, GitHub |
-| Database | PostgreSQL |
-| Environment | Visual studio/ Jupyter notebook |
+| Environment | VS Code, Jupyter/Colab (T4 GPU) |
 
 ---
 

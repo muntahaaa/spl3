@@ -58,7 +58,6 @@ Fallback → Reactive LLM-driven UI agent
 
 | Component          | Responsibility                                     |
 | ------------------ | -------------------------------------------------- |
-| FirebaseLLMBridge  | Connects local/remote Qwen model through Firebase  |
 | Neo4jDatabase      | Stores actions, shortcuts, page flows, UI metadata |
 | VectorStore        | Semantic vector retrieval using Pinecone           |
 | OmniParser         | Parses screen elements from screenshots            |
@@ -116,27 +115,7 @@ This behaves similarly to an autonomous smartphone agent.
 
 # Major Modules Explained
 
-# 1. FirebaseLLMBridge
 
-## Purpose
-
-Replaces direct Gemini/OpenAI calls.
-
-The bridge communicates with a Qwen2.5-VL worker through Firebase Realtime Database.
-
-## Why this architecture?
-
-This decouples:
-
-* UI automation runtime
-* LLM inference runtime
-
-Useful for:
-
-* Colab-hosted models
-* Distributed inference
-* Cheap deployment
-* Async inference workers
 
 ## Key Wrapper Functions
 

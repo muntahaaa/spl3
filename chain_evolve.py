@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import config
 from data.graph_db import Neo4jDatabase
 from llm_rate_limit import wait_for_llm_slot
-from firebase_llm_bridge import FirebaseLLMBridge
+from nvidia_llm_bridge import NvidiaBridge
 
 # ── LangSmith tracing ────────────────────────────────────────────────────────
 os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
@@ -19,11 +19,8 @@ os.environ["LANGCHAIN_PROJECT"]    = "ChainEvolve"
 # ── Database ─────────────────────────────────────────────────────────────────
 db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH, database=config.Neo4j_DB)
 
-# ── Firebase bridge ───────────────────────────────────────────────────────────
-bridge = FirebaseLLMBridge(
-    firebase_url=config.CHAIN_FIREBASE_URL,
-    firebase_secret=config.CHAIN_FIREBASE_SECRET,
-)
+# ── NVIDIA NIM bridge (direct — no Firebase worker needed) ────────────────────
+bridge = NvidiaBridge()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,10 +188,10 @@ async def evaluate_chain_templateability(
 
     try:
         await wait_for_llm_slot()
+        print("    [chain_evolve] Calling NVIDIA NIM for templateability eval...")
         result = await bridge.call_json(
             system_prompt=_EVAL_SYSTEM,
             user_prompt=user_prompt,
-            timeout=240,
         )
         if "is_templateable" in result:
             return bool(result["is_templateable"]), result
@@ -221,10 +218,10 @@ async def generate_action_node(
 
     try:
         await wait_for_llm_slot()
+        print("    [chain_evolve] Calling NVIDIA NIM for action node generation...")
         result = await bridge.call_json(
             system_prompt=_GEN_SYSTEM,
             user_prompt=user_prompt,
-            timeout=300,
         )
         if isinstance(result, dict) and "action_id" in result:
             return result

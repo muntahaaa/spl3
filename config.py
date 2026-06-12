@@ -5,6 +5,7 @@
 import os
 from pathlib import Path
 
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 
@@ -50,3 +51,8 @@ LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
+
+# ── NVIDIA NIM (direct inference — no Firebase worker needed) ─────────────
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_API_KEY  = os.getenv("NVIDIA_API_KEY",  "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")
+NVIDIA_MODEL    = os.getenv("NVIDIA_MODEL",    "nvidia/llama-3.1-nemotron-nano-vl-8b-v1")

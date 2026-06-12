@@ -3,7 +3,9 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+# pyrefly: ignore [missing-import]
 from neo4j import GraphDatabase
+# pyrefly: ignore [missing-import]
 from neo4j.exceptions import ServiceUnavailable
 
 
@@ -551,12 +553,10 @@ class Neo4jDatabase:
             return None
 
     def get_all_high_level_actions(self) -> List[Dict[str, Any]]:
-        """Get all high-level Action nodes (is_high_level, high_level, or type='high_level')."""
+        """Get all high-level Action nodes (identified by is_high_level = true)."""
         query = """
         MATCH (a:Action)
           WHERE coalesce(a.is_high_level, false) = true
-              OR coalesce(a.high_level, false) = true
-              OR (a.type IS NOT NULL AND a.type = 'high_level')
         RETURN a
         """
         try:
@@ -583,12 +583,8 @@ class Neo4jDatabase:
         """
         query = """
         MATCH (a:Action)
-                WHERE (
-                        coalesce(a.is_high_level, false) = true
-                        OR coalesce(a.high_level, false) = true
-                    OR (a.type IS NOT NULL AND a.type = 'high_level')
-                )
-          AND (a.name CONTAINS $task OR a.description CONTAINS $task)
+          WHERE coalesce(a.is_high_level, false) = true
+            AND (a.name CONTAINS $task OR a.description CONTAINS $task)
         RETURN a
         """
         try:

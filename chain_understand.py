@@ -1,8 +1,8 @@
 """
-chain_understand.py  (Firebase/Qwen edition)
---------------------------------------------
-Replaces direct Gemini calls with Firebase Realtime DB round-trips so
-that a Colab notebook running Qwen2.5-VL-7B-Instruct handles inference.
+chain_understand.py  (NVIDIA NIM edition)
+-----------------------------------------
+Replaces Firebase round-trips with direct NVIDIA NIM API calls
+(nvidia/llama-3.1-nemotron-nano-vl-8b-v1) via the OpenAI-compatible client.
 
 Public API is unchanged:
     await process_and_update_chain(start_page_id)  →  List[Dict]
@@ -23,7 +23,7 @@ from PIL import Image
 import config
 from data.graph_db import Neo4jDatabase
 from llm_rate_limit import wait_for_llm_slot
-from firebase_llm_bridge import FirebaseLLMBridge
+from nvidia_llm_bridge import NvidiaBridge
 
 # ── LangSmith tracing (kept for observability) ───────────────────────────────
 os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
@@ -34,11 +34,8 @@ os.environ["LANGCHAIN_PROJECT"] = "ChainEvolve"
 # ── Database ─────────────────────────────────────────────────────────────────
 db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH, database=config.Neo4j_DB)
 
-# ── Firebase bridge (replaces ChatGoogleGenerativeAI) ────────────────────────
-bridge = FirebaseLLMBridge(
-    firebase_url=config.CHAIN_FIREBASE_URL,
-    firebase_secret=config.CHAIN_FIREBASE_SECRET,
-)
+# ── NVIDIA NIM bridge (direct — no Firebase worker needed) ────────────────────
+bridge = NvidiaBridge()
 
 _LLM_ACCESS_DENIED = False
 
@@ -206,14 +203,13 @@ async def process_triplet(triplet: Dict[str, Any]) -> Dict[str, Any]:
     print(f"    [triplet] Waiting for LLM slot...")
     try:
         await wait_for_llm_slot()
-        print(f"    [triplet] Pushing task to Firebase (images={len(images_b64)})...")
+        print(f"    [triplet] Calling NVIDIA NIM (images={len(images_b64)})...")
         reasoning_result = await bridge.call_json(
             system_prompt=_TRIPLET_SYSTEM,
             user_prompt=user_prompt,
             images_b64=images_b64 if images_b64 else None,
-            timeout=600,
         )
-        print(f"    [triplet] Got result from Firebase OK")
+        print(f"    [triplet] Got result from NVIDIA NIM OK")
 
         triplet["reasoning"] = reasoning_result
 
@@ -276,7 +272,6 @@ async def merge_node_descriptions(
             merged_desc = await bridge.call_text(
                 system_prompt=_MERGE_SYSTEM,
                 user_prompt=user_prompt,
-                timeout=500,
             )
             current["target_page"]["description"] = merged_desc
             nxt["source_page"]["description"]     = merged_desc

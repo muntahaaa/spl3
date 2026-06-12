@@ -12,8 +12,17 @@ or
     uvicorn main:app --host 0.0.0.0 --port 7860 --reload
 """
 
+import sys
 import os
 from pathlib import Path
+
+# Enable UTF-8 encoding for standard streams to prevent UnicodeEncodeError on Windows
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
 
 import uvicorn
 from fastapi import FastAPI

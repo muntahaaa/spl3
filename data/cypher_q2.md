@@ -11,9 +11,7 @@ RETURN
 ## To check high level action description 
 ```cypher
 MATCH (a:Action)
-WHERE a.is_high_level = true 
-   OR a.high_level = true 
-   OR a.type = 'high_level'
+WHERE coalesce(a.is_high_level, false) = true
 RETURN a.action_id, a.name, a.description
 ```
 ## To check the count of reasoning with elements 
