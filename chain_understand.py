@@ -104,8 +104,8 @@ def _print_exception_details(prefix: str, exc: Exception) -> None:
 _TRIPLET_SYSTEM = (
     "You are an AI assistant specialized in understanding and reasoning about UI "
     "operation chains. Analyse the given page-element-page triplet and perform deep "
-    "reasoning. The action may be tap, text input, long press, swipe, or back. "
-    "For swipe/back, the element describes the interaction target. "
+    "reasoning. The action may be tap, text input, long press, swipe_short, swipe_long, or back. "
+    "For swipe_short/swipe_long/back, the element describes the interaction target. "
     "You receive textual descriptions and optionally screenshots — analyse both.\n\n"
     "Return ONLY a JSON object with these exact keys:\n"
     "  context, user_intent, state_change, task_relation,\n"

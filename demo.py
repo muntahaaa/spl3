@@ -5,13 +5,13 @@ import threading
 from queue import Queue
 import gradio as gr
 import config
-from explor_auto import run_task
+from explore_auto import run_task
 from chain_evolve import evolve_chain_to_action
 from chain_understand import process_and_update_chain, Neo4jDatabase
 from data.State import State
 from data.data_storage import state2json, json2db
 from explor_human import single_human_explor, capture_and_parse_page
-from tool.screen_content import list_all_devices, get_device_size
+from tool.adb_tools import list_all_devices, get_device_size
 
 auto_log_storage = []  # Global log storage for automatic exploration
 auto_page_storage = []  # Global page history storage for automatic exploration
@@ -33,7 +33,7 @@ def update_inputs(action):
             gr.update(visible=True),
             gr.update(visible=False),
         )
-    elif action == "swipe":
+    elif action == "swipe_short" or action == "swipe_long":
         return (
             gr.update(visible=True),
             gr.update(visible=False),
@@ -165,8 +165,8 @@ def user_exploration(action, element_number, text_input, swipe_direction):
         log_entry += f" on element {element_number}"
     elif action == "text":
         log_entry += f" with text input '{text_input}' on element {element_number}"
-    elif action == "swipe":
-        log_entry += f" swiped {swipe_direction} on element {element_number}"
+    elif action in ("swipe_short", "swipe_long"):
+        log_entry += f" swiped ({action.split('_')[1]}) {swipe_direction} on element {element_number}"
 
     # Check task completion status
     if temp_state.get("completed", False):
@@ -327,7 +327,7 @@ with gr.Blocks(
                             "Stop Session", elem_id="stop-button", interactive=False
                         )
                     action = gr.Radio(
-                        ["tap", "text", "long press", "swipe", "wait"],
+                        ["tap", "text", "long press", "swipe_short", "swipe_long", "wait"],
                         label="Action",
                         interactive=False,
                     )

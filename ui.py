@@ -83,9 +83,9 @@ def _get_devices():
 
 
 def _action_visibility(action: str):
-    show_elem  = action in ("tap", "text", "long_press", "swipe", "back")
+    show_elem  = action in ("tap", "text", "long_press", "swipe_short", "swipe_long", "back")
     show_text  = action == "text"
-    show_swipe = action == "swipe"
+    show_swipe = action in ("swipe_short", "swipe_long")
     return (
         gr.update(visible=show_elem),
         gr.update(visible=show_text),
@@ -363,11 +363,11 @@ def build_ui() -> gr.Blocks:
 
                 start_btn    = gr.Button("▶ Start session (take initial screenshot)")
                 action_radio = gr.Radio(
-                    ["tap", "text", "long_press", "swipe", "back"], label="Action"
+                    ["tap", "text", "long_press", "swipe_short", "swipe_long", "back"], label="Action"
                 )
                 element_num = gr.Number(
                     label="Element ID",
-                    info="Required for tap / long_press / swipe. Optional for text and back.",
+                    info="Required for tap / long_press / swipe_short / swipe_long. Optional for text and back.",
                     precision=0, visible=False,
                 )
                 text_in   = gr.Textbox(label="Text input", visible=False)

@@ -14,6 +14,7 @@ import subprocess
 import config
 from time import sleep
 
+# pyrefly: ignore [missing-import]
 from langchain_core.tools import tool
 
 
@@ -204,18 +205,23 @@ def screen_action(
             cmd = f"adb -s {device} shell input swipe {x} {y} {x} {y} {duration}"
             result["long_press"] = {"x": x, "y": y, "duration": duration}
 
-        elif action == "swipe":
+        elif action in ("swipe", "swipe_short", "swipe_long"):
             if x is None or y is None or direction is None:
                 return json.dumps({**result, "status": "error", "message": "x, y, direction required"})
             unit = 160  # Increased swipe base distance
             dx, dy = 0, 0
-            dist_key = (dist or "medium").lower()
-            factor_map = {"short": 2, "medium": 3, "long": 4}
-            factor = factor_map.get(dist_key, 3)
-            if direction == "up":    dy = -factor * unit
-            elif direction == "down":  dy =  factor * unit
-            elif direction == "left":  dx = -factor * unit
-            elif direction == "right": dx =  factor * unit
+            if action == "swipe_short":
+                factor = 1.5
+            elif action == "swipe_long":
+                factor = 3.0
+            else:
+                dist_key = (dist or "medium").lower()
+                factor_map = {"short": 2, "medium": 3, "long": 4}
+                factor = factor_map.get(dist_key, 3)
+            if direction == "up":    dy = -int(factor * unit)
+            elif direction == "down":  dy =  int(factor * unit)
+            elif direction == "left":  dx = -int(factor * unit)
+            elif direction == "right": dx =  int(factor * unit)
             else:
                 return json.dumps({**result, "status": "error", "message": f"Unknown direction: {direction}"})
             dur = 100 if quick else 400

@@ -224,7 +224,7 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
     x = y = None
 
     # wait removed: it produces no element interaction and no navigation.
-    VALID_ACTIONS = {"tap", "text", "long_press", "swipe", "swipe_precise", "back"}
+    VALID_ACTIONS = {"tap", "text", "long_press", "swipe", "swipe_short", "swipe_long", "swipe_precise", "back"}
 
     if action not in VALID_ACTIONS:
         msg = f"Unsupported action: {action}"
@@ -236,7 +236,7 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
     # tap, long_press, swipe all need element coords (required).
     # back also accepts an optional element_number to identify the back
     # button/icon as the interacted element in the graph.
-    if action in ("tap", "long_press", "swipe"):
+    if action in ("tap", "long_press", "swipe", "swipe_short", "swipe_long"):
         elem_num = kwargs.get("element_number")
         if elem_num is None:
             msg = f"element_number required for {action}."
@@ -277,11 +277,12 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
     elif action == "long_press":
         params.update({"x": x, "y": y, "duration": kwargs.get("duration", 1000)})
         action_result = screen_action.invoke(params)
-    elif action == "swipe":
+    elif action in ("swipe", "swipe_short", "swipe_long"):
         sd = kwargs.get("swipe_direction")
         if sd:
+            dist_val = "short" if action == "swipe_short" else ("long" if action == "swipe_long" else kwargs.get("dist", "medium"))
             params.update({"x": x, "y": y, "direction": sd,
-                           "dist": kwargs.get("dist", "medium"),
+                           "dist": dist_val,
                            "quick": kwargs.get("quick", False)})
             action_result = screen_action.invoke(params)
         else:
@@ -317,14 +318,14 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
         #     portable relative path like  "log/screenshots/human_exploration/...png"
         #     with forward slashes.  This way json2db can open the file on any
         #     platform as long as it runs from the same project root directory.
-
+ 
         state["history_steps"].append({
             "step":               state["step"],
             "recommended_action": f"Executing {action} with params {kwargs}",
             "tool_result": {
                 "action":  action,
                 "device":  state.get("device", "emulator"),
-                "clicked_element": ({"x": x, "y": y} if action in ("tap", "long_press", "text", "swipe", "back") and x is not None and y is not None else None),
+                "clicked_element": ({"x": x, "y": y} if action in ("tap", "long_press", "text", "swipe", "swipe_short", "swipe_long", "back") and x is not None and y is not None else None),
                 "status":  "success" if action_result else "failed",
                 **action_dict,
             },

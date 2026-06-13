@@ -651,7 +651,7 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
             action_params["input_str"] = parameters.get("text", "")
         elif action_type == "long_press":
             action_params["duration"] = parameters.get("duration", 1000)
-        elif action_type == "swipe":
+        elif action_type in ("swipe", "swipe_short", "swipe_long"):
             action_params["direction"] = parameters.get("direction", "up")
             action_params["dist"]      = parameters.get("distance", "medium")
 
@@ -802,7 +802,7 @@ def fallback_to_react(state: DeploymentState) -> DeploymentState:
             action_params["input_str"] = result_json.get("input_str", "")
         elif action_type == "long_press":
             action_params["duration"] = int(result_json.get("duration", 1000))
-        elif action_type == "swipe":
+        elif action_type in ("swipe", "swipe_short", "swipe_long"):
             action_params["direction"] = result_json.get("direction", "up")
             action_params["dist"]      = result_json.get("dist", "medium")
 

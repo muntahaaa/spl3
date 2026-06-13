@@ -117,7 +117,7 @@ def extract_reasoning_results(chain: List[Dict[str, Any]]) -> str:
 _EVAL_SYSTEM = (
     "You are an AI assistant specialized in evaluating whether UI operation chains "
     "can be templated into reusable high-level actions. The chain may include tap, "
-    "text input, long press, swipe, and back navigation steps.\n\n"
+    "text input, long press, swipe_short, swipe_long, and back navigation steps.\n\n"
     "Return ONLY a JSON object with exactly these keys:\n"
     "  is_templateable (bool), confidence_score (float 0-1), "
     "reason (str), suggested_name (str)\n"
@@ -142,7 +142,7 @@ def _build_eval_user_prompt(task_description: str, chain_operations: str) -> str
 _GEN_SYSTEM = (
     "You are an AI assistant specialized in generating high-level UI operation nodes. "
     "Generate a complete description of a high-level action node based on the chain "
-    "information.  The chain may include tap, text input, long press, swipe, and back "
+    "information.  The chain may include tap, text input, long press, swipe_short, swipe_long, and back "
     "navigation — treat all as first-class actions.\n\n"
     "Return ONLY a JSON object with exactly these keys:\n"
     "  action_id (str, format: 'high_level_action_xxx'),\n"

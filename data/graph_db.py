@@ -422,7 +422,7 @@ class Neo4jDatabase:
         action_name comes from the LEADS_TO.action_name property.
 
         """
-        # ── Element-mediated hops (tap / text / long_press / swipe / back) ───
+        # ── Element-mediated hops (tap / text / long_press / swipe_short / swipe_long / back) ───
         elem_query = """
         MATCH (start:Page {page_id: $start_page_id})
         MATCH (src:Page)-[:HAS_ELEMENT]->(e:Element)-[lt:LEADS_TO]->(tgt:Page)

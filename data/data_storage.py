@@ -569,7 +569,7 @@ def _resolve_element_for_action(
     if not elements_data:
         return None
     # tap, long_press, swipe, back: prefer coords from clicked_elem
-    if action_type in ("tap", "long_press", "swipe", "back"):
+    if action_type in ("tap", "long_press", "swipe", "swipe_short", "swipe_long", "back"):
         if clicked_elem and elements_path:
             resolved = pos2id(
                 clicked_elem["x"],
