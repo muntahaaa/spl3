@@ -122,7 +122,7 @@ class NvidiaBridge:
         self,
         *,
         max_tokens_text: int = 512,
-        max_tokens_json: int = 1024,
+        max_tokens_json: int = 4096,
         max_tokens_vision: int = 1024,
     ) -> None:
         self._max_text   = max_tokens_text

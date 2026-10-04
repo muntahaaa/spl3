@@ -22,8 +22,14 @@ from langchain_core.tools import tool
 
 def _resolve_adb() -> str:
     """Resolve adb executable from PATH or common Android SDK locations."""
-    if os.environ.get("ADB_PATH"):
-        return os.environ["ADB_PATH"]
+    env_adb = os.environ.get("ADB_PATH")
+    if env_adb:
+        if os.path.isdir(env_adb):
+            for candidate in ("adb.exe", "adb"):
+                full_path = os.path.join(env_adb, candidate)
+                if os.path.isfile(full_path):
+                    return full_path
+        return env_adb
 
     found = shutil.which("adb") or shutil.which("adb.exe")
     if found:
@@ -32,9 +38,10 @@ def _resolve_adb() -> str:
     for var in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
         root = os.environ.get(var)
         if root:
-            candidate = os.path.join(root, "platform-tools", "adb.exe")
-            if os.path.isfile(candidate):
-                return candidate
+            for candidate in ("adb.exe", "adb"):
+                candidate_path = os.path.join(root, "platform-tools", candidate)
+                if os.path.isfile(candidate_path):
+                    return candidate_path
 
     return "adb"
 

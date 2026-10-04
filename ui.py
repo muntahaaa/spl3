@@ -306,6 +306,60 @@ def store_to_db(json_path: str):
         return f"Error: {exc}"
 
 
+def get_high_level_actions_with_app():
+    query = """
+    MATCH (a:Action)
+    WHERE coalesce(a.is_high_level, false) = true
+    OPTIONAL MATCH (p:Page)-[:HAS_ELEMENT]->(e:Element)<-[:COMPOSED_OF]-(a)
+    RETURN a, collect(p.description) as page_descriptions
+    """
+    try:
+        from data.graph_db import Neo4jDatabase
+        import config
+        temp_db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH)
+        actions = []
+        with temp_db.driver.session(database=temp_db.database) as session:
+            result = session.run(query)
+            for record in result:
+                action = dict(record["a"])
+                page_descs = record["page_descriptions"]
+                
+                app_name = "human_exploration"
+                for desc in page_descs:
+                    if desc and " — Step " in desc:
+                        app_name = desc.split(" — Step ")[0]
+                        break
+                
+                actions.append({
+                    "app_name": app_name,
+                    "name": action.get("name", "N/A"),
+                    "description": action.get("description", "N/A")
+                })
+        temp_db.close()
+        return actions
+    except Exception as exc:
+        print(f"Error fetching high-level actions(test cases) with app: {exc}")
+        return []
+
+
+def load_and_filter_actions(search_query=""):
+    actions = get_high_level_actions_with_app()
+    search_query = (search_query or "").strip().lower()
+    
+    rows = []
+    for act in actions:
+        app = act["app_name"]
+        task = act["name"]
+        
+        if search_query:
+            if search_query not in app.lower() and search_query not in task.lower():
+                continue
+                
+        rows.append([app, task])
+        
+    return rows
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Gradio layout
 # ─────────────────────────────────────────────────────────────────────────────
@@ -600,6 +654,43 @@ def build_ui() -> gr.Blocks:
                     _run_high_level_fallback,
                     inputs=[hl_task_input, hl_device_radio],
                     outputs=[hl_reasoning, hl_outcome, popup_col, close_actions_df],
+                )
+
+            # ── Tab 6 : High-Level Actions ────────────────────────────────────────
+            with gr.Tab("⑥ Stored test cases", id=6) as actions_tab:
+                gr.Markdown(
+                    "View and search all test cases stored in database."
+                )
+                with gr.Row():
+                    search_input = gr.Textbox(
+                        label="Search Action",
+                        placeholder="Type app name or task description to filter...",
+                    )
+                    refresh_actions_btn = gr.Button("🔄 Refresh list")
+                
+                actions_df = gr.Dataframe(
+                    headers=["App name", "Task description"],
+                    datatype=["str", "str"],
+                    interactive=False,
+                )
+                
+                search_input.change(
+                    load_and_filter_actions,
+                    inputs=[search_input],
+                    outputs=[actions_df],
+                    queue=False,
+                )
+                refresh_actions_btn.click(
+                    load_and_filter_actions,
+                    inputs=[search_input],
+                    outputs=[actions_df],
+                    queue=False,
+                )
+                actions_tab.select(
+                    load_and_filter_actions,
+                    inputs=[search_input],
+                    outputs=[actions_df],
+                    queue=False,
                 )
 
     return demo.queue()
