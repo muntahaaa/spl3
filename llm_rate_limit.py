@@ -28,4 +28,5 @@ async def wait_for_llm_slot(max_requests_per_minute: int = MAX_REQUESTS_PER_MINU
             # Need to wait until the oldest request leaves the window.
             sleep_for = window - (now - _timestamps[0]) + 0.01
 
+        print(f"[LLM-RATE-LIMIT] {max_requests_per_minute} requests/minute limit reached; waiting {max(0.01, sleep_for):.1f}s for a slot.")
         await asyncio.sleep(max(0.01, sleep_for))

@@ -7,7 +7,6 @@ Utilities for cropping UI-element images and calling the external
 
 import json
 import os
-import tempfile
 from io import BytesIO
 from typing import IO, List, Union, Dict
 
@@ -41,38 +40,29 @@ def extract_features(
         else f"{config.Feature_URI}/extract_batch/?model_name={model_name}"
     )
 
-    key       = "file" if is_single else "files"
-    files     = []
-    tmp_paths = []
-
+    key = "file" if is_single else "files"
+    files = []
+    owned = []
+    streams = []
     try:
         for item in inputs:
             if isinstance(item, str):
-                files.append((key, open(item, "rb")))
+                handle = open(item, "rb")
+                owned.append(handle)
+                files.append((key, handle))
             else:
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                tmp_paths.append(tmp.name)
                 item.seek(0)
-                tmp.write(item.read())
-                tmp.close()
-                item.seek(0)
-                files.append((key, open(tmp.name, "rb")))
-
+                streams.append(item)
+                files.append((key, ("crop.png", item, "image/png")))
         resp = requests.post(url, files=files, timeout=120)
         resp.raise_for_status()
         return resp.json()
-
     finally:
-        for _, fp in files:
-            try:
-                fp.close()
-            except Exception:
-                pass
-        for p in tmp_paths:
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
+        for handle in owned:
+            handle.close()
+        for stream in streams:
+            stream.seek(0)
+
 # -- element similarity ────────────────────────────────────────────────────────────────
 @tool
 def element_similarity(
@@ -208,6 +198,7 @@ def _extract_element_features(
         # print(f"Processing image: {page_path}, size: {width}x{height}")
 
         features = []
+        crops = []
         for i, element in enumerate(elements):
             try:
                 # Get and normalize the bounding box
@@ -235,23 +226,30 @@ def _extract_element_features(
                 element_image.save(img_byte_arr, format="PNG")
                 img_byte_arr.seek(0)
 
-                # Extract features
-                # print(f"Starting feature extraction for element {i}...")
-                element_feature = extract_features(img_byte_arr, feature_model)
-                # print(f"Feature extraction for element {i} succeeded")
-
-                # Ensure the feature vector shape is correct
-                feature_vector = np.array(element_feature["features"])
-                if len(feature_vector.shape) > 1:
-                    feature_vector = feature_vector.flatten()
-
-                features.append(feature_vector)
+                crops.append(img_byte_arr)
 
             except Exception as e:
                 print(f"Warning: Error processing element {i}: {str(e)}")
                 print(f"Error type: {type(e)}")
                 continue
 
+        batch_size = max(1, int(os.getenv("FEATURE_BATCH_SIZE", "8")))
+        for start in range(0, len(crops), batch_size):
+            chunk = crops[start:start + batch_size]
+            try:
+                vectors = extract_features(chunk, feature_model)["features"]
+                if len(vectors) != len(chunk):
+                    raise ValueError("Feature batch returned the wrong vector count")
+                features.extend(np.asarray(vector).flatten() for vector in vectors)
+            except Exception as exc:
+                # Keep the former per-element error isolation if a batch fails.
+                print(f"Warning: Feature batch failed; retrying individual crops: {exc}")
+                for crop in chunk:
+                    try:
+                        features.append(np.asarray(extract_features(crop, feature_model)["features"]).flatten())
+                    except Exception as error:
+                        print(f"Warning: Error processing element crop: {error}")
+        image.close()
         print(f"Successfully extracted features for {len(features)} elements")
         if not features:
             raise Exception("No element features were successfully extracted")

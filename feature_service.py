@@ -11,6 +11,12 @@ Response format:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import os
+import time
+from collections import OrderedDict
+from threading import RLock
 from io import BytesIO
 from typing import List
 
@@ -35,9 +41,14 @@ app = FastAPI(title="ResNet50 Feature Service", version="1.0.0")
 
 _MODEL = None
 _PREPROCESS = None
+_MODEL_LOCK = RLock()
+_INFERENCE_GATE = asyncio.Semaphore(1)
+_CACHE = OrderedDict()
+_CACHE_SIZE = max(0, int(os.getenv("FEATURE_CACHE_SIZE", "512")))
+_BATCH_SIZE = max(1, int(os.getenv("FEATURE_BATCH_SIZE", "8")))
 
 
-def _ensure_model_ready() -> None:
+def _initialize_model() -> None:
 	global _MODEL, _PREPROCESS
 
 	if torch is None or models is None or transforms is None:
@@ -47,6 +58,8 @@ def _ensure_model_ready() -> None:
 		)
 
 	if _MODEL is None:
+		# Bound CPU thread contention; configurable for this machine.
+		torch.set_num_threads(max(1, int(os.getenv("FEATURE_CPU_THREADS", str(torch.get_num_threads())))))
 		# Use torchvision defaults and strip classification head to get 2048-dim vectors.
 		weights = models.ResNet50_Weights.DEFAULT
 		base = models.resnet50(weights=weights)
@@ -73,16 +86,59 @@ def _bytes_to_rgb_image(data: bytes) -> Image.Image:
 		raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}") from exc
 
 
-def _embed_images(images: List[Image.Image]) -> List[List[float]]:
-	_ensure_model_ready()
+def _ensure_model_ready() -> None:
+    with _MODEL_LOCK:
+        _initialize_model()
 
-	with torch.no_grad():
-		batch = torch.stack([_PREPROCESS(img) for img in images], dim=0)
-		feats = _MODEL(batch).squeeze(-1).squeeze(-1)
-		if feats.ndim == 1:
-			feats = feats.unsqueeze(0)
-		arr = feats.cpu().numpy().astype(np.float32)
-		return arr.tolist()
+
+def _embed_images(images: List[Image.Image]) -> List[List[float]]:
+    # Serialize model/cache access; concurrent callers cannot duplicate a cache miss.
+    with _MODEL_LOCK:
+        _ensure_model_ready()
+        keys = [("resnet50-default-rgb-resize256-crop224-v1", img.size,
+                 hashlib.sha256(img.tobytes()).digest()) for img in images]
+        missing = OrderedDict()
+        for key, image in zip(keys, images):
+            if key not in _CACHE:
+                missing.setdefault(key, image)
+        computed = {}
+        items = list(missing.items())
+        with torch.inference_mode():
+            for start in range(0, len(items), _BATCH_SIZE):
+                chunk = items[start:start + _BATCH_SIZE]
+                batch = torch.stack([_PREPROCESS(img) for _, img in chunk], dim=0)
+                vectors = _MODEL(batch).flatten(1).cpu().numpy().astype(np.float32).tolist()
+                computed.update((key, vector) for (key, _), vector in zip(chunk, vectors))
+        result = []
+        for key in keys:
+            vector = computed[key] if key in computed else _CACHE[key]
+            result.append(list(vector))
+        for key, vector in zip(keys, result):
+            if key in _CACHE:
+                _CACHE.move_to_end(key)
+            elif _CACHE_SIZE:
+                _CACHE[key] = tuple(vector)
+            while len(_CACHE) > _CACHE_SIZE:
+                _CACHE.popitem(last=False)
+        print(f"[FEATURE] images={len(images)}; unique cache misses={len(missing)}; batch limit={_BATCH_SIZE}; threads={torch.get_num_threads()}.")
+        return result
+
+
+@app.on_event("startup")
+async def warm_up() -> None:
+    started = time.monotonic()
+    try:
+        # Use the real preprocessing and model; no change to weights or vectors.
+        await asyncio.to_thread(_embed_images, [Image.new("RGB", (224, 224))])
+        print(f"[FEATURE] Model loaded and warmed in {time.monotonic()-started:.2f}s.")
+    except Exception as exc:
+        # Preserve the previous lazy-load retry behavior if startup loading fails.
+        print(f"[FEATURE] Warm-up failed; extraction will retry loading: {exc}")
+
+
+async def _embed_async(images):
+    async with _INFERENCE_GATE:
+        return await asyncio.to_thread(_embed_images, images)
 
 
 @app.get("/health")
@@ -101,7 +157,7 @@ async def extract_single(model_name: str, file: UploadFile = File(...)) -> dict:
 
 	try:
 		img = _bytes_to_rgb_image(content)
-		vectors = _embed_images([img])
+		vectors = await _embed_async([img])
 		return {"features": vectors}
 	except HTTPException:
 		raise
@@ -124,7 +180,7 @@ async def extract_batch(model_name: str, files: List[UploadFile] = File(...)) ->
 				raise HTTPException(status_code=400, detail=f"Uploaded file is empty: {fp.filename}")
 			images.append(_bytes_to_rgb_image(content))
 
-		vectors = _embed_images(images)
+		vectors = await _embed_async(images)
 		return {"features": vectors}
 	except HTTPException:
 		raise

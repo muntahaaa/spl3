@@ -11,10 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
+import difflib
+import hashlib
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+# pyrefly: ignore [missing-import]
+from PIL import Image
 
 # pyrefly: ignore [missing-import]
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -34,6 +40,22 @@ from tool.adb_tools import *
 from OmniParser.client import run as omniparser_run
 from nvidia_llm_bridge import NvidiaBridge
 
+# ── Plan-Reuse Constants (v3) ────────────────────────────────────────────────
+USE_PLAN_REUSE        = os.getenv("USE_PLAN_REUSE", "1") == "1"
+SCREENSHOT_SETTLE_SEC = float(os.getenv("SCREENSHOT_SETTLE_SEC", "2.0"))
+PLAN_MIN_CONF         = 0.6     # below: whole task goes to ReAct
+JUDGE_MIN_CONF        = 0.7     # below: escalate text judge to vision judge
+TEXT_MATCH_MIN        = 0.85    # raw-text similarity for the no-LLM element accept
+MAX_REACT_STEPS_SEG   = 6
+MAX_RETRY_REACT_STEPS = 4
+STUCK_WINDOW          = 3
+CATALOG_PREFILTER_OVER = 25
+CATALOG_TOP_K         = 12
+CATALOG_TTL_SEC       = 60
+SAFE_TEXT_RE          = r"^[A-Za-z0-9 :.,@+\-_/]*$"
+
+LLM_CALLS = collections.Counter()
+
 # ── LangSmith tracing ────────────────────────────────────────────────────────
 os.environ["LANGCHAIN_TRACING_V2"] = "true" if config.LANGCHAIN_TRACING_V2 else "false"
 os.environ["LANGCHAIN_ENDPOINT"]   = config.LANGCHAIN_ENDPOINT
@@ -42,15 +64,15 @@ os.environ["LANGCHAIN_PROJECT"]    = "DeploymentExecution"
 
 # ── NVIDIA NIM bridge (direct — no Firebase worker needed) ────────────────────
 bridge = NvidiaBridge(
-    max_tokens_text=4096,   # task matching responses include full action JSON (900+ tokens)
-    max_tokens_json=4096,
-    max_tokens_vision=2048,
+    max_tokens_text=1024 if USE_PLAN_REUSE else 4096,
+    max_tokens_json=1024 if USE_PLAN_REUSE else 4096,
+    max_tokens_vision=1024 if USE_PLAN_REUSE else 2048,
 )
 
 # ── Database / vector store ──────────────────────────────────────────────────
 URI  = config.Neo4j_URI
 AUTH = config.Neo4j_AUTH
-db   = Neo4jDatabase(URI, AUTH)
+db   = Neo4jDatabase(URI, AUTH, database=config.Neo4j_DB)
 vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
 
 
@@ -59,8 +81,9 @@ vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
 #  can invoke the bridge without restructuring.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sync_call_text(system_prompt: str, user_prompt: str, timeout: float = 300.0) -> str:
+def _sync_call_text(system_prompt: str, user_prompt: str, timeout: float = 300.0, kind: str = "text") -> str:
     """Call NVIDIA NIM synchronously from any thread context."""
+    LLM_CALLS[kind] += 1
     return asyncio.run(
         bridge.call_text(system_prompt=system_prompt, user_prompt=user_prompt)
     )
@@ -71,7 +94,9 @@ def _sync_call_json(
     user_prompt: str,
     images_b64: Optional[List[str]] = None,
     timeout: float = 300.0,
+    kind: str = "json",
 ) -> Dict[str, Any]:
+    LLM_CALLS[kind] += 1
     return asyncio.run(
         bridge.call_json(
             system_prompt=system_prompt,
@@ -86,7 +111,9 @@ def _sync_call_vision(
     user_prompt: str,
     images_b64: List[str],
     timeout: float = 300.0,
+    kind: str = "vision",
 ) -> str:
+    LLM_CALLS[kind] += 1
     return asyncio.run(
         bridge.call_vision(
             system_prompt=system_prompt,
@@ -273,8 +300,41 @@ def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Screen capture / OmniParser  (unchanged)
+#  Screen capture / OmniParser & Device helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _device_size(state: DeploymentState) -> Dict[str, int]:
+    """Retrieve and cache device dimensions in state."""
+    if state.get("device_size"):
+        return state["device_size"]
+    raw_size = get_device_size.invoke(state.get("device", "emulator"))
+    if isinstance(raw_size, dict) and "width" in raw_size and "height" in raw_size:
+        size = {"width": int(raw_size["width"]), "height": int(raw_size["height"])}
+    elif isinstance(raw_size, str):
+        try:
+            sz = json.loads(raw_size)
+            size = {"width": int(sz.get("width", sz.get("w", 1080))), "height": int(sz.get("height", sz.get("h", 2400)))}
+        except Exception:
+            size = {"width": 1080, "height": 2400}
+    else:
+        size = {"width": 1080, "height": 2400}
+    state["device_size"] = size
+    return size
+
+
+def screen_hash(path: str) -> str:
+    """Hash the cropped (top ~6% cropped out to ignore status bar / clock), 64x64 grayscale screenshot."""
+    try:
+        if not path or not os.path.exists(path):
+            return ""
+        with Image.open(path) as img:
+            w, h = img.size
+            crop_box = (0, int(h * 0.06), w, h)
+            cropped = img.crop(crop_box).convert("L").resize((64, 64))
+            return hashlib.md5(cropped.tobytes()).hexdigest()
+    except Exception:
+        return ""
+
 
 def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
     try:
@@ -282,6 +342,7 @@ def capture_and_parse_screen(state: DeploymentState) -> DeploymentState:
             "device":    state["device"],
             "app_name":  "deployment",
             "step":      state["current_step"],
+            "settle":    SCREENSHOT_SETTLE_SEC,
         })
         if not screenshot_path or not os.path.exists(screenshot_path):
             print("❌ Screenshot failed")
@@ -347,14 +408,15 @@ def match_element_via_pinecone(
     step_info: Dict[str, Any],
     state: DeploymentState,
     threshold: float = 0.7,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Element-matching strategy:
-      1. Fetch the stored Pinecone vector metadata of the corresponding element ID.
-      2. Find the candidate live element with the closest spatial bounding box (spatial matching).
-      3. Use LLM to verify if stored vector content and live candidate content matches (similarity > 0.7).
-      4. If verified, return this candidate.
-      5. Otherwise, check which live element has the closest semantic matching (excluding bounding boxes from metadata).
+      1. Fetch the stored Neo4j/Pinecone details (raw text & type from other_info).
+      2. Guard: if element missing everywhere, abort immediately (0 LLM calls).
+      3. Fast No-LLM accept: if spatial candidate has text ratio >= TEXT_MATCH_MIN, accept directly.
+      4. If strict: skip distance shortcut and semantic fallback (entry check).
+      5. Otherwise, verify via LLM or rank candidates and fallback to semantic matching.
     """
     _log = lambda msg: _log_both(state, msg)
     screen_elements = state["current_page"]["elements_data"]
@@ -366,14 +428,23 @@ def match_element_via_pinecone(
 
     # ── 1. Fetch stored details from Neo4j & Pinecone ───────────────────────────
     stored_content = ""
+    raw_content = ""
+    raw_type = ""
     stored_type = ""
     stored_bbox: Optional[List[float]] = None
 
-    # Retrieve from Neo4j first (we prioritize Neo4j description)
     neo4j_element = db.get_element_by_id(element_id) or {}
     neo4j_desc = neo4j_element.get("description") or ""
     neo4j_reasoning = neo4j_element.get("reasoning") or ""
-    stored_type = neo4j_element.get("element_type") or ""
+    other_info = neo4j_element.get("other_info") or {}
+    if isinstance(other_info, str):
+        try:
+            other_info = json.loads(other_info)
+        except Exception:
+            other_info = {}
+    raw_content = other_info.get("content", "")
+    raw_type = other_info.get("type", "")
+    stored_type = raw_type or neo4j_element.get("element_type", "")
     bbox_raw = neo4j_element.get("bounding_box")
     if isinstance(bbox_raw, str):
         try:
@@ -383,52 +454,43 @@ def match_element_via_pinecone(
     elif isinstance(bbox_raw, list):
         stored_bbox = bbox_raw
 
-    stored_content = neo4j_desc
+    # Fallback to Pinecone if needed
+    if not raw_content or not stored_type or not stored_bbox:
+        _log(f"[ACTION MATCHING] Fetching stored metadata for element {element_id[:8]} from Pinecone...")
+        try:
+            fetch_result = vector_db.index.fetch(ids=[element_id], namespace="element")
+            vec_data = (fetch_result.get("vectors") or {}).get(element_id)
+            if vec_data:
+                stored_meta = vec_data.get("metadata", {})
+                if not raw_content:
+                    raw_content = stored_meta.get("content", "")
+                if not stored_type:
+                    stored_type = stored_meta.get("type", "")
+                if not stored_bbox:
+                    bbox_raw_pc = stored_meta.get("bbox")
+                    if isinstance(bbox_raw_pc, str):
+                        try:
+                            stored_bbox = json.loads(bbox_raw_pc)
+                        except Exception:
+                            stored_bbox = None
+                    elif isinstance(bbox_raw_pc, list):
+                        stored_bbox = bbox_raw_pc
+        except Exception as exc:
+            _log(f"  [ACTION MATCHING] Pinecone fetch error: {exc}")
 
-    # Fallback/merge with Pinecone if needed
-    _log(f"[ACTION MATCHING] Fetching stored metadata for element {element_id[:8]}...")
-    try:
-        fetch_result = vector_db.index.fetch(ids=[element_id], namespace="element")
-        vec_data = (fetch_result.get("vectors") or {}).get(element_id)
-        if vec_data:
-            stored_meta = vec_data.get("metadata", {})
-            if not stored_content:
-                stored_content = stored_meta.get("content", "")
-            if not stored_type:
-                stored_type = stored_meta.get("type", "")
-            
-            # Parse stored bbox if not already resolved from Neo4j
-            if not stored_bbox:
-                bbox_raw_pc = stored_meta.get("bbox")
-                if isinstance(bbox_raw_pc, str):
-                    try:
-                        stored_bbox = json.loads(bbox_raw_pc)
-                    except Exception:
-                        stored_bbox = None
-                elif isinstance(bbox_raw_pc, list):
-                    stored_bbox = bbox_raw_pc
-        else:
-            _log(f"  [ACTION MATCHING] ⚠️ element_id {element_id[:8]} not found in Pinecone.")
-    except Exception as exc:
-        _log(f"  [ACTION MATCHING] Pinecone fetch error: {exc}")
+    # Guard (Step 10.2 / Fact D6)
+    if not neo4j_element and not raw_content and not stored_bbox:
+        _log(f"  [ACTION MATCHING] ⚠️ Element details missing from both Neo4j and Pinecone for {element_id[:8]}. Aborting match.")
+        return []
 
-    if not stored_content:
-        # Final fallback: step info parameters
-        params = step_info.get("action_params", {})
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except Exception:
-                params = {}
-        stored_content = params.get("element") or ""
-
-    _log(f"[ACTION MATCHING] Stored element: content='{stored_content}' type='{stored_type}' bbox={stored_bbox}")
+    stored_content = neo4j_desc or raw_content
+    _log(f"[ACTION MATCHING] Stored element: raw='{raw_content}' type='{stored_type}' bbox={stored_bbox}")
 
     # ── 2. Spatial match candidate search ───────────────────────────────
     corresponding_live_element = None
     spatial_idx = -1
+    min_dist = float("inf")
     if stored_bbox and len(stored_bbox) == 4:
-        min_dist = float("inf")
         for idx, el in enumerate(screen_elements):
             el_bbox = el.get("bbox")
             if el_bbox and len(el_bbox) == 4:
@@ -438,14 +500,27 @@ def match_element_via_pinecone(
                     corresponding_live_element = el
                     spatial_idx = idx
 
-    # ── 3. Match verification using LLM ──────────────────────────────────
+    # ── 3. Match verification ──────────────────────────────────────────
     if corresponding_live_element:
         candidate_content = corresponding_live_element.get("content", "")
         candidate_type = corresponding_live_element.get("type", "")
         _log(f"[ACTION MATCHING] Found spatial candidate at index {spatial_idx}: content='{candidate_content}' type='{candidate_type}' (dist: {min_dist:.4f})")
-        
-        # If spatial match is extremely close (exact spatial match slot), accept it directly and bypass similarity check
-        if min_dist < 0.03:
+
+        # Step 10.3: Fast No-LLM accept via string ratio
+        if raw_content and candidate_content:
+            ratio = difflib.SequenceMatcher(None, raw_content.strip().lower(), candidate_content.strip().lower()).ratio()
+            if ratio >= TEXT_MATCH_MIN and (not raw_type or not candidate_type or raw_type == candidate_type):
+                _log(f"[ACTION MATCHING] ✓ Spatial match verified via raw text match ({ratio:.2f} >= {TEXT_MATCH_MIN}) [0 LLM calls]")
+                return [{
+                    "element_id":        element_id,
+                    "match_score":       ratio,
+                    "screen_element_id": spatial_idx,
+                    "action_type":       step_info.get("atomic_action", "tap"),
+                    "parameters":        step_info.get("action_params", {}),
+                }]
+
+        # Distance shortcut (if not strict)
+        if not strict and min_dist < 0.03:
             _log(f"[ACTION MATCHING] ✓ Spatial match verified dynamically via distance ({min_dist:.4f} < 0.03)")
             return [{
                 "element_id":        element_id,
@@ -455,6 +530,7 @@ def match_element_via_pinecone(
                 "parameters":        step_info.get("action_params", {}),
             }]
 
+        # LLM Verification
         user_prompt = (
             f"Stored Template Element:\n"
             f"  Description: {stored_content}\n"
@@ -466,13 +542,13 @@ def match_element_via_pinecone(
             f"Return JSON only."
         )
         try:
-            res = _sync_call_json(_VERIFY_MATCH_SYSTEM, user_prompt, timeout=120)
+            res = _sync_call_json(_VERIFY_MATCH_SYSTEM, user_prompt, timeout=120, kind="verify_spatial")
             similarity = float(res.get("similarity", 0.0))
             reason = res.get("reason", "")
-            _log(f"[ACTION MATCHING] LLM verify similarity score (description): {similarity:.2f} (threshold: {threshold}) — Reason: {reason}")
-            
+            _log(f"[ACTION MATCHING] LLM verify similarity score: {similarity:.2f} (threshold: {threshold}) — Reason: {reason}")
+
             if similarity > threshold:
-                _log(f"[ACTION MATCHING] ✓ Spatial match verified via description (score {similarity:.2f} > {threshold})")
+                _log(f"[ACTION MATCHING] ✓ Spatial match verified via LLM (score {similarity:.2f} > {threshold})")
                 return [{
                     "element_id":        element_id,
                     "match_score":       similarity,
@@ -480,41 +556,16 @@ def match_element_via_pinecone(
                     "action_type":       step_info.get("atomic_action", "tap"),
                     "parameters":        step_info.get("action_params", {}),
                 }]
-            else:
-                _log(f"[ACTION MATCHING] ⚠️ Spatial verification failed with description (score {similarity:.2f} <= {threshold}). Trying fallback with reasoning...")
-                if neo4j_reasoning:
-                    user_prompt_reasoning = (
-                        f"Stored Template Element Reasoning Details:\n"
-                        f"  Reasoning: {neo4j_reasoning}\n"
-                        f"  Type: {stored_type}\n\n"
-                        f"Candidate Live Screen Element:\n"
-                        f"  Content: {candidate_content}\n"
-                        f"  Type: {candidate_type}\n\n"
-                        f"Do they represent the same UI element? Rate the similarity from 0.0 to 1.0. "
-                        f"Return JSON only."
-                    )
-                    res_reasoning = _sync_call_json(_VERIFY_MATCH_SYSTEM, user_prompt_reasoning, timeout=120)
-                    similarity_reasoning = float(res_reasoning.get("similarity", 0.0))
-                    reason_reasoning = res_reasoning.get("reason", "")
-                    _log(f"[ACTION MATCHING] LLM verify reasoning similarity score: {similarity_reasoning:.2f} (threshold: {threshold}) — Reason: {reason_reasoning}")
-                    
-                    if similarity_reasoning > threshold:
-                        _log(f"[ACTION MATCHING] ✓ Spatial match verified via reasoning details (score {similarity_reasoning:.2f} > {threshold})")
-                        return [{
-                            "element_id":        element_id,
-                            "match_score":       similarity_reasoning,
-                            "screen_element_id": spatial_idx,
-                            "action_type":       step_info.get("atomic_action", "tap"),
-                            "parameters":        step_info.get("action_params", {}),
-                        }]
-                else:
-                    _log("[ACTION MATCHING] No reasoning details available in Neo4j element for fallback verification.")
         except Exception as exc:
             _log(f"  [ACTION MATCHING] LLM verification error: {exc}")
 
+    if strict:
+        _log("  [ACTION MATCHING] Strict check failed — aborting without semantic fallback")
+        return []
+
     # ── 4. Fallback to semantic matching across all live elements ─────
-    _log("[ACTION MATCHING] Spatial match verification failed or scored <= threshold. Falling back to semantic matching...")
-    return llm_bbox_fallback(element_id, step_info, state, stored_content, stored_type)
+    _log("[ACTION MATCHING] Spatial match verification failed. Falling back to semantic matching...")
+    return llm_bbox_fallback(element_id, step_info, state, stored_content, stored_type, raw_content=raw_content)
 
 
 def llm_bbox_fallback(
@@ -523,17 +574,33 @@ def llm_bbox_fallback(
     state: DeploymentState,
     stored_content: str,
     stored_type: str,
+    raw_content: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    Ask the LLM to choose the best semantic match from all live elements
-    without including any bounding boxes in the metadata.
+    Ask the LLM to choose the best semantic match from all live elements.
+    Ranks candidates and selects top 15 to preserve context window.
     """
     _log = lambda msg: _log_both(state, msg)
     screen_elements = state["current_page"]["elements_data"]
+    if not screen_elements:
+        return []
 
-    # Format list of live elements without bounding boxes (User Comment 1: "Remove bounding box from metadata")
-    live_elements_list = ""
+    # Pre-rank candidate live elements
+    ranked = []
     for idx, el in enumerate(screen_elements):
+        cnt = el.get("content", "").strip()
+        typ = el.get("type", "")
+        score = 0.0
+        if raw_content and cnt:
+            score += difflib.SequenceMatcher(None, raw_content.lower(), cnt.lower()).ratio()
+        if stored_type and typ == stored_type:
+            score += 0.2
+        ranked.append((score, idx, el))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    top_candidates = ranked[:15]
+
+    live_elements_list = ""
+    for _, idx, el in top_candidates:
         live_elements_list += f"{idx}: type={el.get('type','?')}  content='{el.get('content','')}'\n"
 
     user_prompt = (
@@ -545,7 +612,7 @@ def llm_bbox_fallback(
     )
 
     try:
-        result = _sync_call_json(_SEMANTIC_MATCH_SYSTEM, user_prompt, timeout=120)
+        result = _sync_call_json(_SEMANTIC_MATCH_SYSTEM, user_prompt, timeout=120, kind="match_semantic")
         sid = int(result.get("screen_element_id", -1))
         reason = result.get("reason", "")
         if sid >= 0 and sid < len(screen_elements):
@@ -634,9 +701,7 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
 
         element     = state["current_page"]["elements_data"][screen_element_id]
         bbox        = element.get("bbox", [0, 0, 0, 0])
-        device_size = get_device_size.invoke(state["device"])
-        if isinstance(device_size, str):
-            device_size = {"width": 1080, "height": 2400}
+        device_size = _device_size(state)
 
         # Calculate coordinates conditionally: scale if relative (<= 1.0), use directly otherwise
         if bbox and len(bbox) == 4 and all(val <= 1.0 for val in bbox):
@@ -648,7 +713,7 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
 
         action_params = {"device": state["device"], "action": action_type, "x": center_x, "y": center_y}
         if action_type == "text":
-            action_params["input_str"] = parameters.get("text", "")
+            action_params["input_str"] = parameters.get("text") or parameters.get("input_str", "")
         elif action_type == "long_press":
             action_params["duration"] = parameters.get("duration", 1000)
         elif action_type in ("swipe", "swipe_short", "swipe_long"):
@@ -668,6 +733,136 @@ def execute_element_action(state: DeploymentState, element_match: Dict[str, Any]
     except Exception as e:
         print(f"❌ Error executing element action: {e}")
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bounded ReAct step & segment runner (Steps 11 & 12)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REACT_STEP_SYSTEM = (
+    "You are an intelligent smartphone operation assistant. "
+    "Observe the current screen elements and perform one atomic operation "
+    "(tap / type text / swipe / long press / back) to progress toward the sub-goal. "
+    "If the sub-goal is already satisfied on the current screen, reply {\"action\": \"done\"}.\n"
+    "Reply with a JSON object:\n"
+    "  {\"action\": \"<tap/text/swipe/long_press/back/done>\", "
+    "\"element_id\": <int or str of target element>, "
+    "\"input_str\": \"<text if action=text>\", "
+    "\"direction\": \"<up/down/left/right if action=swipe>\", "
+    "\"duration\": <ms if action=long_press>}\n"
+    "Return JSON only."
+)
+
+
+def react_step(state: DeploymentState, goal: str) -> str:
+    """Execute one bounded ReAct step towards a goal. Returns 'done' | 'acted' | 'error'."""
+    elements_data = state["current_page"].get("elements_data") or []
+    if not elements_data:
+        return "error"
+
+    elem_lines = []
+    element_index = {}
+    for el in elements_data[:60]:
+        eid = el.get("ID", el.get("id", "?"))
+        bbox = el.get("bbox", [])
+        element_index[str(eid)] = bbox
+        cnt = el.get("content", "").strip()
+        typ = el.get("type", "")
+        if cnt or typ:
+            elem_lines.append(f"{eid}|{typ}|{cnt}")
+
+    recent_history = [
+        f"{h.get('action', '?')} on {h.get('element_id', '')} status={h.get('status')}"
+        for h in (state.get("history") or [])[-5:]
+    ]
+
+    user_prompt = (
+        f"Goal: {goal}\n\n"
+        f"Recent actions:\n" + ("\n".join(recent_history) if recent_history else "None") + "\n\n"
+        f"Current Screen Elements (ID|type|content):\n" + "\n".join(elem_lines) + "\n\n"
+        f"What action should be taken next?"
+    )
+
+    try:
+        res = _sync_call_json(_REACT_STEP_SYSTEM, user_prompt, kind="react")
+        action_type = res.get("action", "").lower().strip()
+        if action_type == "done":
+            _log_both(state, "  [REACT] Goal reached — model reported 'done'")
+            return "done"
+
+        device_sz = _device_size(state)
+        action_params = {"device": state["device"], "action": action_type}
+
+        if action_type == "back":
+            pass
+        elif action_type in ("tap", "long_press"):
+            target_id = str(res.get("element_id", ""))
+            bbox = element_index.get(target_id)
+            if not bbox or len(bbox) != 4:
+                _log_both(state, f"  [REACT] ❌ Invalid element_id {target_id}")
+                return "error"
+            if all(v <= 1.0 for v in bbox):
+                cx = int((bbox[0] + bbox[2]) / 2 * device_sz["width"])
+                cy = int((bbox[1] + bbox[3]) / 2 * device_sz["height"])
+            else:
+                cx = int((bbox[0] + bbox[2]) / 2)
+                cy = int((bbox[1] + bbox[3]) / 2)
+            action_params["x"] = cx
+            action_params["y"] = cy
+            if action_type == "long_press":
+                action_params["duration"] = int(res.get("duration", 1000))
+        elif action_type == "text":
+            input_str = res.get("input_str", "")
+            if not re.fullmatch(SAFE_TEXT_RE, input_str):
+                _log_both(state, f"  [REACT] ❌ Unsafe text in input_str: {input_str}")
+                return "error"
+            action_params["input_str"] = input_str
+        elif action_type in ("swipe", "swipe_short", "swipe_long"):
+            action_params["direction"] = res.get("direction", "up")
+            action_params["x"] = device_sz["width"] // 2
+            action_params["y"] = device_sz["height"] // 2
+        else:
+            _log_both(state, f"  [REACT] ❌ Unknown action: {action_type}")
+            return "error"
+
+        result = screen_action.invoke(action_params)
+        success = _parse_action_result(result)
+        state["history"].append({
+            "step": state["current_step"],
+            "action": action_type,
+            "params": action_params,
+            "status": "success" if success else "error",
+            "screenshot": state["current_page"].get("screenshot"),
+        })
+        state["react_steps"] = state.get("react_steps", 0) + 1
+        return "acted" if success else "error"
+    except Exception as e:
+        _log_both(state, f"  [REACT] Error in react_step: {e}")
+        return "error"
+
+
+def run_react_segment(state: DeploymentState, goal: str, cap: int = MAX_REACT_STEPS_SEG) -> str:
+    """Run a bounded ReAct segment with stuck detection. Returns 'done' | 'stuck' | 'error' | 'cap'."""
+    _log_both(state, f"🔄 Running bounded ReAct segment: '{goal}' (cap={cap})")
+    for step_num in range(cap):
+        state = capture_and_parse_screen(state)
+        curr_shot = state["current_page"].get("screenshot")
+        if not curr_shot or not os.path.exists(curr_shot):
+            return "error"
+        h = screen_hash(curr_shot)
+        hashes = state.get("screen_hashes", [])
+        hashes.append(h)
+        state["screen_hashes"] = hashes
+        if len(hashes) >= STUCK_WINDOW and all(x == hashes[-1] and x != "" for x in hashes[-STUCK_WINDOW:]):
+            _log_both(state, "  [REACT] ⚠️ Screen is stuck (identical visual hashes) — stopping segment")
+            return "stuck"
+
+        r = react_step(state, goal)
+        if r == "done":
+            return "done"
+        if r == "error":
+            return "error"
+    return "cap"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -843,7 +1038,7 @@ def execute_task(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Task completion check  (vision + text via Qwen)
+#  Task completion check  (Legacy & Two-tier v3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CRITERIA_SYSTEM = (
@@ -858,14 +1053,13 @@ _JUDGE_SYSTEM = (
 )
 
 
-def check_task_completion(state: DeploymentState) -> DeploymentState:
+def check_task_completion_legacy(state: DeploymentState) -> DeploymentState:
     _log = state.get("log_callback") or print
 
     if state.get("execution_status") == "no_match":
         state["completed"] = True
         return state
 
-    # Fetch matched high-level action and the target page description from Neo4j
     matched_action = state.get("current_action")
     last_page_id = None
     last_page_description = None
@@ -896,8 +1090,6 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
                 except Exception as exc:
                     _log(f"⚠️ Error querying Neo4j task completion page: {exc}")
 
-    # If already marked completed and we have no Neo4j page description to verify, return early.
-    # Otherwise, proceed to match the live page semantics against last_page_description.
     if state.get("completed") and not last_page_description:
         _log("✓ Task already completed successfully by action sequence execution.")
         return state
@@ -1003,8 +1195,681 @@ def check_task_completion(state: DeploymentState) -> DeploymentState:
     return state
 
 
+def _normalize_text_for_match(s: str) -> str:
+    digits = re.sub(r"\D", "", s)
+    if digits:
+        return digits
+    return s.strip().lower()
+
+
+def texts_present(expected_texts: List[str], elements: List[Dict[str, Any]]) -> Optional[bool]:
+    """
+    Checks if expected typed texts appear on screen.
+    Returns True if all expected texts found, False if absent, or None if OCR text count < 5 (unknown).
+    """
+    if not expected_texts:
+        return True
+
+    on_screen_texts = []
+    for el in elements:
+        txt = (el.get("content") or el.get("text") or "").strip()
+        if txt:
+            on_screen_texts.append(txt)
+
+    if len(on_screen_texts) < 5:
+        return None
+
+    for exp in expected_texts:
+        norm_exp = _normalize_text_for_match(exp)
+        found = False
+        for ost in on_screen_texts:
+            norm_ost = _normalize_text_for_match(ost)
+            if norm_exp in norm_ost or (norm_exp.isdigit() and norm_ost.isdigit() and norm_exp == norm_ost):
+                found = True
+                break
+            if exp.strip().lower() in ost.lower():
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+_TWO_TIER_JUDGE_SYSTEM = (
+    "You are an accurate, strict UI task completion verifier.\n"
+    "Evaluate if the user's task was successfully completed based on the current screen elements and recent actions.\n"
+    "Reply with a JSON object strictly following this schema:\n"
+    "{\n"
+    "  \"complete\": <true/false>,\n"
+    "  \"confidence\": <float between 0.0 and 1.0>,\n"
+    "  \"evidence\": \"<concise reason or visible text/element confirming status>\",\n"
+    "  \"missing\": \"<what is still missing if incomplete, otherwise empty>\"\n"
+    "}\n"
+    "Return JSON only."
+)
+
+
+def check_task_completion(state: DeploymentState) -> DeploymentState:
+    """Two-tier JSON judge with text check as router (Steps 7 & 9)."""
+    if not USE_PLAN_REUSE:
+        return check_task_completion_legacy(state)
+
+    _log = state.get("log_callback") or print
+    _log("\n🔍 [JUDGE] Evaluating task completion (two-tier)...")
+
+    # Step 7: Capture final screen first
+    updated = capture_and_parse_screen(dict(state))
+    for k, v in updated.items():
+        if k in state:
+            state[k] = v
+
+    screenshot = state["current_page"].get("screenshot")
+    elements = state["current_page"].get("elements_data") or []
+    state["final_screenshot"] = screenshot
+    state["final_elements"] = elements
+
+    if not screenshot or not os.path.exists(screenshot):
+        _log("  ❌ Screen capture failed during completion check")
+        state["completed"] = False
+        state["finished"] = True
+        state["execution_status"] = "error"
+        return state
+
+    if state.get("execution_status") == "stuck":
+        _log("  ⚠️ Execution marked as stuck — task is not complete")
+        state["completed"] = False
+        state["finished"] = True
+        return state
+
+    # Step 9.1: Collect expected_texts from replayed/acted text steps
+    expected_texts = []
+    for h in state.get("history") or []:
+        if h.get("action") == "text":
+            val = (h.get("params") or {}).get("input_str") or h.get("input_str") or h.get("text")
+            if val:
+                expected_texts.append(val)
+
+    # Step 9.2: Text check router
+    tp = texts_present(expected_texts, elements)
+    _log(f"  [JUDGE] texts_present check: {tp} (expected_texts={expected_texts})")
+
+    task = state["task"]
+    recent_actions = [
+        f"{h.get('action', '?')} on {h.get('element_id', '')} status={h.get('status')}"
+        for h in (state.get("history") or [])[-3:]
+    ]
+    recent_actions_str = "\n".join(recent_actions) if recent_actions else "None"
+
+    judge_res = None
+    # If a value is absent -> skip text judge and go straight to vision judge
+    if tp is not False:
+        # Step 9.3: Text judge
+        elem_lines = []
+        for el in elements[:60]:
+            eid = el.get("ID", el.get("id", "?"))
+            cnt = (el.get("content") or el.get("text") or "").strip()
+            if cnt:
+                elem_lines.append(f"{eid}|{cnt}")
+
+        prompt_text = (
+            f"Task: {task}\n"
+            f"Expected typed values: {expected_texts if expected_texts else 'None'}\n"
+            f"Last 3 actions:\n{recent_actions_str}\n\n"
+            f"On-screen text elements:\n" + ("\n".join(elem_lines) if elem_lines else "None") + "\n\n"
+            "Is the task complete?"
+        )
+        try:
+            judge_res = _sync_call_json(
+                system_prompt=_TWO_TIER_JUDGE_SYSTEM,
+                user_prompt=prompt_text,
+                kind="judge_text",
+            )
+            _log(f"  [JUDGE-TEXT] result: {judge_res}")
+        except Exception as e:
+            _log(f"  ⚠️ Text judge error: {e}")
+            judge_res = None
+
+    # Step 9.4 & 9.5: Vision judge fallback if text judge was skipped or confidence < JUDGE_MIN_CONF
+    conf = float(judge_res.get("confidence", 0.0)) if judge_res else 0.0
+    if judge_res is None or conf < JUDGE_MIN_CONF:
+        _log(f"  [JUDGE] Escalating to vision judge (conf={conf:.2f} < {JUDGE_MIN_CONF})")
+        b64 = _img_to_b64(screenshot)
+        if b64:
+            prompt_vision = (
+                f"Task: {task}\n"
+                f"Expected typed values: {expected_texts if expected_texts else 'None'}\n"
+                f"Last 3 actions:\n{recent_actions_str}\n\n"
+                "Evaluate the screen image. Is the task complete?"
+            )
+            try:
+                judge_res = _sync_call_json(
+                    system_prompt=_TWO_TIER_JUDGE_SYSTEM,
+                    user_prompt=prompt_vision,
+                    images_b64=[b64],
+                    kind="judge_vision",
+                )
+                _log(f"  [JUDGE-VISION] result: {judge_res}")
+            except Exception as e:
+                _log(f"  ⚠️ Vision judge error: {e}")
+                judge_res = {"complete": False, "confidence": 0.0, "evidence": str(e), "missing": "judge error"}
+
+    if not judge_res:
+        judge_res = {"complete": False, "confidence": 0.0, "evidence": "no response", "missing": "unknown"}
+
+    complete = bool(judge_res.get("complete", False))
+    confidence = float(judge_res.get("confidence", 0.0))
+    missing = str(judge_res.get("missing", ""))
+    evidence = str(judge_res.get("evidence", ""))
+
+    state["history"].append({
+        "step": state.get("current_step", 0),
+        "action": "task_completion_check",
+        "judgement": judge_res,
+        "status": "success" if complete else "incomplete",
+        "completed": complete,
+    })
+
+    # Step 9.8: Route completion outcome
+    if complete and confidence >= JUDGE_MIN_CONF:
+        state["completed"] = True
+        state["finished"] = True
+        state["execution_status"] = "completed"
+        _log(f"✨ Task judged complete! Evidence: {evidence}")
+    else:
+        state["completed"] = False
+        if state.get("retries", 0) < 1:
+            state["retries"] = state.get("retries", 0) + 1
+            retry_goal = f"{task}. Still missing: {missing or 'task unconfirmed'}"
+            _log(f"⚠️ Task incomplete. Scheduling ReAct retry segment (retry {state['retries']}/1): '{retry_goal}'")
+            state["plan"] = {
+                "action_id": None,
+                "confidence": 1.0,
+                "segments": [{"type": "react", "goal": retry_goal, "cap": MAX_RETRY_REACT_STEPS}],
+                "text_overrides": {},
+            }
+            state["seg_index"] = 0
+            state["finished"] = False
+        else:
+            state["execution_status"] = "failed"
+            state["finished"] = True
+            _log(f"❌ Task failed after retries. Missing: {missing}")
+
+    return state
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  LangGraph node wrappers  (unchanged structure)
+#  Action catalog for planner (Step 13)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_catalog_cache = {"timestamp": 0.0, "catalog_text": "", "actions_by_id": {}}
+
+
+def build_action_catalog(task: str) -> Tuple[str, Dict[str, Any]]:
+    """Build compact Action catalog for the planner with caching (Step 13)."""
+    global _catalog_cache
+    now = time.time()
+    if now - _catalog_cache["timestamp"] < CATALOG_TTL_SEC and _catalog_cache["catalog_text"]:
+        return _catalog_cache["catalog_text"], _catalog_cache["actions_by_id"]
+
+    actions = db.get_all_high_level_actions()
+    if not actions:
+        _catalog_cache = {"timestamp": now, "catalog_text": "No stored actions available.", "actions_by_id": {}}
+        return _catalog_cache["catalog_text"], _catalog_cache["actions_by_id"]
+
+    actions_by_id = {act["action_id"]: act for act in actions if act.get("action_id")}
+
+    all_elem_ids = set()
+    first_elem_ids = set()
+    for act in actions:
+        seq = act.get("element_sequence") or []
+        if isinstance(seq, str):
+            try:
+                seq = json.loads(seq)
+            except Exception:
+                seq = []
+        act["element_sequence"] = seq
+        for idx, step in enumerate(seq):
+            eid = step.get("element_id")
+            if eid:
+                all_elem_ids.add(eid)
+                if idx == 0:
+                    first_elem_ids.add(eid)
+
+    elements_info = {}
+    if all_elem_ids:
+        try:
+            with db.driver.session(database=db.database) as session:
+                q = """
+                MATCH (e:Element) WHERE e.element_id IN $ids
+                RETURN e.element_id AS id, e.other_info AS oi, e.description AS d
+                """
+                res = session.run(q, ids=list(all_elem_ids))
+                for rec in res:
+                    oi_raw = rec["oi"] or "{}"
+                    try:
+                        oi = json.loads(oi_raw) if isinstance(oi_raw, str) else oi_raw
+                    except Exception:
+                        oi = {}
+                    elements_info[rec["id"]] = {
+                        "content": oi.get("content", ""),
+                        "description": rec["d"] or "",
+                    }
+        except Exception as exc:
+            print(f"⚠️ Error querying element catalog info: {exc}")
+
+    first_page_tasks = {}
+    if first_elem_ids:
+        try:
+            with db.driver.session(database=db.database) as session:
+                q_p = """
+                MATCH (p:Page)-[:HAS_ELEMENT]->(e:Element)
+                WHERE e.element_id IN $first_ids
+                RETURN e.element_id AS eid, p.other_info AS info
+                """
+                res = session.run(q_p, first_ids=list(first_elem_ids))
+                for rec in res:
+                    info_raw = rec["info"] or "{}"
+                    try:
+                        info = json.loads(info_raw) if isinstance(info_raw, str) else info_raw
+                    except Exception:
+                        info = {}
+                    desc = info.get("task_info", {}).get("description")
+                    if desc:
+                        first_page_tasks[rec["eid"]] = desc
+        except Exception as exc:
+            print(f"⚠️ Error querying first-page task info: {exc}")
+
+    action_entries = []
+    task_tokens = set(re.findall(r"\w+", task.lower()))
+
+    for act in actions:
+        aid = act.get("action_id", "")
+        seq = act.get("element_sequence") or []
+        first_eid = seq[0].get("element_id") if seq else None
+
+        source_task = act.get("source_task")
+        if not source_task and first_eid and first_eid in first_page_tasks:
+            source_task = first_page_tasks[first_eid]
+        if not source_task:
+            source_task = act.get("name", "Unnamed Action")
+
+        act["_resolved_source_task"] = source_task
+
+        step_labels = []
+        for idx, step in enumerate(seq, 1):
+            atomic = step.get("atomic_action", "tap")
+            params = step.get("action_params", {})
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except Exception:
+                    params = {}
+            eid = step.get("element_id", "")
+            e_info = elements_info.get(eid, {})
+
+            if atomic in ("tap", "long_press"):
+                cnt = e_info.get("content", "")
+                lbl = cnt if cnt else (e_info.get("description", "")[:50] or "element")
+                step_labels.append(f"{idx} {atomic} \"{lbl}\"")
+            elif atomic == "text":
+                txt = params.get("text") or params.get("input_str") or ""
+                step_labels.append(f"{idx} text \"{txt}\"")
+            elif atomic == "back":
+                step_labels.append(f"{idx} back")
+            elif atomic.startswith("swipe"):
+                direction = params.get("direction", "screen")
+                step_labels.append(f"{idx} swipe {direction}")
+            else:
+                step_labels.append(f"{idx} {atomic}")
+
+        act["_step_labels_str"] = " · ".join(step_labels)
+        entry_text = f"[id={aid}] recorded as: \"{source_task}\" | name: {act.get('name', '')}\n  {act['_step_labels_str']}"
+
+        entry_tokens = set(re.findall(r"\w+", f"{source_task} {act.get('name', '')} {act['_step_labels_str']}".lower()))
+        overlap = len(task_tokens & entry_tokens)
+        action_entries.append((overlap, aid, entry_text))
+
+    if len(action_entries) > CATALOG_PREFILTER_OVER:
+        action_entries.sort(key=lambda x: x[0], reverse=True)
+        action_entries = action_entries[:CATALOG_TOP_K]
+
+    catalog_text = "\n\n".join(e[2] for e in action_entries)
+    _catalog_cache = {
+        "timestamp": now,
+        "catalog_text": catalog_text,
+        "actions_by_id": actions_by_id,
+    }
+    return catalog_text, actions_by_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Planner & Plan Executor (Steps 14, 15, 15a)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PLAN_SYSTEM = (
+    "Plan how to do the TASK using stored actions. Reply JSON only:\n"
+    "{\n"
+    "  \"action_id\": \"<action_id or null>\",\n"
+    "  \"confidence\": <float 0.0 to 1.0>,\n"
+    "  \"segments\": [\n"
+    "    {\"type\": \"replay\", \"from\": <1-based int>, \"to\": <1-based int>},\n"
+    "    {\"type\": \"react\", \"goal\": \"<short sub-goal>\"}\n"
+    "  ],\n"
+    "  \"text_overrides\": {\"<step_number>\": \"<new text>\"}\n"
+    "}\n"
+    "Rules:\n"
+    "- A 'replay' segment uses step numbers 'from'..'to' (1-based, inclusive, increasing, no overlap) of that one action, "
+    "only for steps that serve the task unchanged.\n"
+    "- Use 'text_overrides' ({step_number: new text}) only for steps shown as 'text'.\n"
+    "- Anything the stored steps do not cover becomes a 'react' segment with a short goal.\n"
+    "- Same app but a different goal: replay only the shared opening steps, then react.\n"
+    "- Nothing related: action_id null and one react segment with the whole task.\n"
+    "- Never copy step contents."
+)
+
+
+def plan_task(state: DeploymentState) -> DeploymentState:
+    """Generate execution plan from action catalog or degrade to ReAct (Step 14)."""
+    _log = state.get("log_callback") or print
+
+    if state.get("plan"):
+        return state
+
+    task = state["task"]
+    _log(f"\n📋 [PLANNER] Planning execution for: '{task}'")
+
+    if state.get("force_fallback"):
+        _log("⚡ Force fallback requested — single ReAct segment")
+        state["plan"] = {
+            "action_id": None,
+            "confidence": 1.0,
+            "segments": [{"type": "react", "goal": task}],
+            "text_overrides": {},
+        }
+        state["seg_index"] = 0
+        return state
+
+    catalog_text, actions_by_id = build_action_catalog(task)
+
+    # Step 14.1: Exact repeat check (0 LLM calls)
+    norm_task = re.sub(r"[^a-z0-9]", "", task.lower())
+    for aid, act in actions_by_id.items():
+        src = act.get("_resolved_source_task", "")
+        if norm_task and re.sub(r"[^a-z0-9]", "", src.lower()) == norm_task:
+            seq_len = len(act.get("element_sequence") or [])
+            if seq_len > 0:
+                _log(f"🎯 [PLANNER] Exact task match found with '{src}' (0 LLM calls)")
+                state["plan"] = {
+                    "action_id": aid,
+                    "confidence": 1.0,
+                    "segments": [{"type": "replay", "from": 1, "to": seq_len}],
+                    "text_overrides": {},
+                }
+                state["seg_index"] = 0
+                return state
+
+    # Step 14.2: LLM planner
+    user_prompt = f"TASK: {task}\n\nStored actions catalog:\n{catalog_text}"
+    try:
+        raw_plan = _sync_call_json(
+            system_prompt=_PLAN_SYSTEM,
+            user_prompt=user_prompt,
+            kind="plan",
+        )
+        _log(f"  [PLANNER] Raw plan from LLM: {raw_plan}")
+    except Exception as e:
+        _log(f"⚠️ Planner error: {e} — falling back to single ReAct segment")
+        raw_plan = None
+
+    # Step 14.3: Plan validation in code
+    valid_plan = False
+    plan = None
+    if isinstance(raw_plan, dict):
+        aid = raw_plan.get("action_id")
+        conf = float(raw_plan.get("confidence", 0.0))
+        segments = raw_plan.get("segments") or []
+        overrides = raw_plan.get("text_overrides") or {}
+
+        if conf >= PLAN_MIN_CONF and segments:
+            if aid is None:
+                # Valid pure react plan
+                if all(s.get("type") == "react" and s.get("goal") for s in segments):
+                    valid_plan = True
+                    plan = {"action_id": None, "confidence": conf, "segments": segments, "text_overrides": {}}
+            elif aid in actions_by_id:
+                act = actions_by_id[aid]
+                seq = act.get("element_sequence") or []
+                seq_len = len(seq)
+                curr_step = 0
+                seg_ok = True
+                cleaned_segments = []
+
+                for s in segments:
+                    stype = s.get("type")
+                    if stype == "replay":
+                        f_idx = int(s.get("from", 0))
+                        t_idx = int(s.get("to", 0))
+                        if 1 <= f_idx <= t_idx <= seq_len and f_idx > curr_step:
+                            cleaned_segments.append({"type": "replay", "from": f_idx, "to": t_idx})
+                            curr_step = t_idx
+                        else:
+                            seg_ok = False
+                            break
+                    elif stype == "react":
+                        goal = str(s.get("goal", "")).strip()
+                        if goal:
+                            cleaned_segments.append({"type": "react", "goal": goal})
+                        else:
+                            seg_ok = False
+                            break
+                    else:
+                        seg_ok = False
+                        break
+
+                cleaned_overrides = {}
+                for k, v in overrides.items():
+                    try:
+                        step_num = int(k)
+                        if 1 <= step_num <= seq_len:
+                            target_step = seq[step_num - 1]
+                            if target_step.get("atomic_action") == "text":
+                                if re.fullmatch(SAFE_TEXT_RE, str(v)):
+                                    cleaned_overrides[str(step_num)] = str(v)
+                    except Exception:
+                        pass
+
+                if seg_ok and cleaned_segments:
+                    valid_plan = True
+                    plan = {
+                        "action_id": aid,
+                        "confidence": conf,
+                        "segments": cleaned_segments,
+                        "text_overrides": cleaned_overrides,
+                    }
+
+    if not valid_plan or not plan:
+        _log("⚠️ Plan validation failed or low confidence — using single ReAct segment")
+        plan = {
+            "action_id": None,
+            "confidence": 1.0,
+            "segments": [{"type": "react", "goal": task}],
+            "text_overrides": {},
+        }
+
+    state["plan"] = plan
+    state["seg_index"] = 0
+    _log(f"✓ [PLANNER] Final plan: {plan}")
+    return state
+
+
+def execute_plan_node(state: DeploymentState) -> DeploymentState:
+    """Execute plan segments (Replay + ReAct) with entry check (Steps 15 & 15a)."""
+    _log = state.get("log_callback") or print
+    plan = state.get("plan")
+
+    if not plan or not plan.get("segments"):
+        _log("  ❌ No plan to execute")
+        state["execution_status"] = "error"
+        state["finished"] = True
+        return state
+
+    segments = plan["segments"]
+    aid = plan.get("action_id")
+    overrides = plan.get("text_overrides") or {}
+
+    catalog_text, actions_by_id = build_action_catalog(state["task"])
+    act = actions_by_id.get(aid, {}) if aid else {}
+    seq = act.get("element_sequence") or []
+
+    _log(f"\n⚙️ [EXECUTE-PLAN] Starting execution from segment {state.get('seg_index', 0)+1}/{len(segments)}")
+
+    while state.get("seg_index", 0) < len(segments):
+        idx = state["seg_index"]
+        seg = segments[idx]
+        stype = seg.get("type")
+        _log(f"\n▶ Segment {idx+1}/{len(segments)}: {seg}")
+
+        if stype == "replay":
+            f_idx = seg["from"]
+            t_idx = seg["to"]
+
+            # Step 15a: Entry check before first replay step that is tap/long_press
+            if not state.get("_entry_check_done"):
+                first_tap_step = None
+                for s_i in range(f_idx - 1, t_idx):
+                    if seq[s_i].get("atomic_action") in ("tap", "long_press"):
+                        first_tap_step = seq[s_i]
+                        break
+
+                if first_tap_step:
+                    first_eid = first_tap_step.get("element_id")
+                    state = capture_and_parse_screen(state)
+                    m = match_element_via_pinecone(first_eid, first_tap_step, state, strict=True)
+                    if not m:
+                        _log("  ⚠️ Strict entry check: element not found on current screen. Pressing HOME...")
+                        press_home(state["device"])
+                        state = capture_and_parse_screen(state)
+                        m = match_element_via_pinecone(first_eid, first_tap_step, state, strict=True)
+
+                    if not m:
+                        _log("  ❌ Strict entry check failed after HOME. Degrading to ReAct for full task.")
+                        state["plan"] = {
+                            "action_id": None,
+                            "confidence": 1.0,
+                            "segments": [{"type": "react", "goal": state["task"]}],
+                            "text_overrides": {},
+                        }
+                        state["seg_index"] = 0
+                        state["_entry_check_done"] = True
+                        return execute_plan_node(state)
+
+                state["_entry_check_done"] = True
+
+            # Walk steps
+            step_failed = False
+            for step_num in range(f_idx, t_idx + 1):
+                step_idx = step_num - 1
+                step = seq[step_idx]
+                atomic = step.get("atomic_action", "tap")
+                params = step.get("action_params", {})
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except Exception:
+                        params = {}
+                text = overrides.get(str(step_num)) or params.get("text") or params.get("input_str") or ""
+                eid = step.get("element_id", "")
+
+                _log(f"  -- Replay step {step_num} ({atomic}) --")
+
+                if atomic == "back":
+                    ok = screen_action.invoke({"device": state["device"], "action": "back"})
+                    step_ok = _parse_action_result(ok)
+                elif atomic == "text":
+                    if not text or not re.fullmatch(SAFE_TEXT_RE, text):
+                        _log(f"  ❌ Invalid or unsafe text: '{text}'")
+                        step_ok = False
+                    else:
+                        ok = screen_action.invoke({"device": state["device"], "action": "text", "input_str": text})
+                        step_ok = _parse_action_result(ok)
+                elif atomic == "swipe_precise" or (atomic.startswith("swipe") and params.get("start") and params.get("end")):
+                    ok = screen_action.invoke({
+                        "device": state["device"],
+                        "action": "swipe_precise",
+                        "start": tuple(params["start"]),
+                        "end": tuple(params["end"]),
+                        "duration": params.get("duration", 400),
+                    })
+                    step_ok = _parse_action_result(ok)
+                elif atomic.startswith("swipe"):
+                    sz = _device_size(state)
+                    ok = screen_action.invoke({
+                        "device": state["device"],
+                        "action": atomic,
+                        "x": sz["width"] // 2,
+                        "y": sz["height"] // 2,
+                        "direction": params.get("direction", "up"),
+                    })
+                    step_ok = _parse_action_result(ok)
+                else:  # tap, long_press
+                    if not eid:
+                        _log("  ❌ Missing element_id")
+                        step_ok = False
+                    else:
+                        state = capture_and_parse_screen(state)
+                        matches = match_element_via_pinecone(eid, step, state)
+                        if not matches:
+                            _log(f"  ❌ Could not match element {eid} on screen")
+                            step_ok = False
+                        else:
+                            step_ok = execute_element_action(state, matches[0])
+
+                if not step_ok:
+                    _log(f"  ❌ Step {step_num} execution failed")
+                    step_failed = True
+                    break
+
+                state["replayed_steps"] = state.get("replayed_steps", 0) + 1
+                state["history"].append({
+                    "step": state.get("current_step", 0) + 1,
+                    "action": atomic,
+                    "element_id": eid,
+                    "text": text,
+                    "status": "success",
+                    "screenshot": state["current_page"].get("screenshot"),
+                })
+                state["current_step"] = state.get("current_step", 0) + 1
+
+            if step_failed:
+                _log("⚠️ Replay segment failed — degrading once to ReAct for remaining task")
+                state["plan"] = {
+                    "action_id": None,
+                    "confidence": 1.0,
+                    "segments": [{"type": "react", "goal": state["task"]}],
+                    "text_overrides": {},
+                }
+                state["seg_index"] = 0
+                return execute_plan_node(state)
+
+        elif stype == "react":
+            goal = seg.get("goal") or state["task"]
+            cap = seg.get("cap", MAX_REACT_STEPS_SEG)
+            res = run_react_segment(state, goal, cap)
+            _log(f"  [REACT] Segment result: {res}")
+            if res == "stuck":
+                state["execution_status"] = "stuck"
+                state["finished"] = True
+                return state
+
+        state["seg_index"] = state.get("seg_index", 0) + 1
+
+    state["execution_status"] = "steps_done"
+    _log("✓ All plan segments executed. Proceeding to completion check.")
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LangGraph legacy node wrappers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def capture_screen_node(state: DeploymentState) -> DeploymentState:
@@ -1024,7 +1889,7 @@ def capture_screen_node(state: DeploymentState) -> DeploymentState:
 
 
 def match_elements_node(state: DeploymentState) -> DeploymentState:
-    """Semantically match the user task to a stored Neo4j high-level action."""
+    """Semantically match the user task to a stored Neo4j high-level action (legacy)."""
     _log = state.get("log_callback") or print
 
     if state.get("force_fallback"):
@@ -1047,7 +1912,7 @@ def match_elements_node(state: DeploymentState) -> DeploymentState:
                 element_sequence = []
 
         if not element_sequence:
-            _log("  [MATCH] ⚠️  element_sequence is empty — no steps to execute")
+            _log("  [MATCH] ⚠️ element_sequence is empty — no steps to execute")
             state["should_fallback"] = True
             state["close_actions"]   = get_close_high_level_actions(state["task"])
             return state
@@ -1068,13 +1933,7 @@ def match_elements_node(state: DeploymentState) -> DeploymentState:
 
 
 def execute_action_node(state: DeploymentState) -> DeploymentState:
-    """
-    Pinecone-primary execution:
-      1. Walk element_sequence from current_action.
-      2. For each step: fetch Pinecone embedding → cosine match → execute.
-      3. If cosine fails: LLM picks best element from description/content.
-      4. React fallback is NOT triggered here — only when no HL action was found.
-    """
+    """Pinecone-primary execution (legacy)."""
     _log = state.get("log_callback") or print
 
     if state.get("execution_status") == "no_match":
@@ -1111,7 +1970,6 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
         state_dict = dict(state)
         state_dict["current_step"] = step_idx
 
-        # Capture fresh screen for each step
         updated = capture_and_parse_screen(state_dict)
         for k, v in updated.items():
             if k in state:
@@ -1130,7 +1988,6 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
             all_steps_ok = False
             break
 
-        # Pinecone cosine match
         matches = match_element_via_pinecone(element_id, step_info, state_dict)
         if not matches:
             _log(f"  ❌ Step {step_idx+1}: could not identify element on screen")
@@ -1153,7 +2010,6 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
                 "status":     "success",
                 "screenshot": state["current_page"]["screenshot"],
             })
-            time.sleep(1.5)
         else:
             _log(f"  ❌ Step {step_idx+1}: ADB returned failure")
             all_steps_ok = False
@@ -1168,20 +2024,11 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
 
 
 def fallback_node(state: DeploymentState) -> DeploymentState:
-    print("\n⚠️  fallback_node entered")
-    print(f"  [DIAG-FALLBACK] execution_status={state.get('execution_status')}")
-    print(f"  [DIAG-FALLBACK] current_step={state.get('current_step')}  history_len={len(state.get('history') or [])}")
+    print("\n⚠️ fallback_node entered")
     state = fallback_to_react(state)
-    print(f"  [DIAG-FALLBACK] after fallback_to_react: execution_status={state.get('execution_status')}")
-
     state["completed"] = False
-    print(f"  [DIAG-FALLBACK] completed forced to False — check_task_completion will judge")
     return state
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Routing functions  (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def should_fallback(state: DeploymentState) -> str:
     _log = state.get("log_callback") or print
@@ -1193,16 +2040,16 @@ def should_fallback(state: DeploymentState) -> str:
 def is_task_completed(state: DeploymentState) -> str:
     _log = state.get("log_callback") or print
     if state.get("completed"):
-        _log(f"  [ROUTE] is_task_completed → 'end'  (status={state.get('execution_status')})")
+        _log(f"  [ROUTE] is_task_completed → 'end' (status={state.get('execution_status')})")
         return "end"
 
-    workflow_iter = state.get("_workflow_iterations", 0) + 1
-    state["_workflow_iterations"] = workflow_iter
+    workflow_iter = state.get("workflow_iterations", 0) + 1
+    state["workflow_iterations"] = workflow_iter
     max_iters = state.get("max_workflow_iterations", 10)
-    _log(f"  [ROUTE] is_task_completed → 'continue'  (iter={workflow_iter}/{max_iters})")
+    _log(f"  [ROUTE] is_task_completed → 'continue' (iter={workflow_iter}/{max_iters})")
 
     if workflow_iter >= max_iters:
-        _log(f"⚠️  Workflow iteration cap ({max_iters}) reached — ending")
+        _log(f"⚠️ Workflow iteration cap ({max_iters}) reached — ending")
         state["completed"] = True
         state["execution_status"] = "timeout"
         return "end"
@@ -1210,26 +2057,66 @@ def is_task_completed(state: DeploymentState) -> str:
     return "continue"
 
 
+def after_judge(state: DeploymentState) -> str:
+    """Route after completion check in the plan-reuse workflow (Step 16)."""
+    _log = state.get("log_callback") or print
+    if state.get("finished"):
+        _log(f"  [ROUTE] after_judge → 'end' (status={state.get('execution_status')}, completed={state.get('completed')})")
+        return "end"
+    _log("  [ROUTE] after_judge → 'retry'")
+    return "retry"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  LangGraph workflow
+#  LangGraph Workflows (v3 Plan Reuse & Legacy)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_workflow() -> StateGraph:
+def build_workflow_plan_reuse() -> StateGraph:
+    """New plan-reuse graph (Step 16)."""
+    workflow = StateGraph(DeploymentState)
+
+    workflow.add_node("capture_screen",   capture_screen_node)
+    workflow.add_node("plan_task",        plan_task)
+    workflow.add_node("execute_plan",     execute_plan_node)
+    workflow.add_node("check_completion", check_task_completion)
+
+    workflow.set_entry_point("capture_screen")
+
+    def after_initial_capture(state: DeploymentState) -> str:
+        if not state.get("current_page", {}).get("screenshot"):
+            return "end"
+        return "plan"
+
+    workflow.add_conditional_edges(
+        "capture_screen",
+        after_initial_capture,
+        {"end": END, "plan": "plan_task"},
+    )
+    workflow.add_edge("plan_task", "execute_plan")
+    workflow.add_edge("execute_plan", "check_completion")
+    workflow.add_conditional_edges(
+        "check_completion",
+        after_judge,
+        {"end": END, "retry": "execute_plan"},
+    )
+    return workflow
+
+
+def build_workflow_legacy() -> StateGraph:
+    """Legacy 5-node graph with fallback."""
     workflow = StateGraph(DeploymentState)
 
     workflow.add_node("capture_screen",   capture_screen_node)
     workflow.add_node("match_elements",   match_elements_node)
     workflow.add_node("execute_action",   execute_action_node)
     workflow.add_node("fallback",         fallback_node)
-    workflow.add_node("check_completion", check_task_completion)
+    workflow.add_node("check_completion", check_task_completion_legacy)
 
     workflow.set_entry_point("capture_screen")
-    # screen capture failure → fallback
     workflow.add_conditional_edges(
         "capture_screen", should_fallback,
         {"fallback": "fallback", "continue": "match_elements"},
     )
-    # no HL action found → fallback, else execute
     workflow.add_conditional_edges(
         "match_elements", should_fallback,
         {"fallback": "fallback", "continue": "execute_action"},
@@ -1240,8 +2127,14 @@ def build_workflow() -> StateGraph:
         "check_completion", is_task_completed,
         {"end": END, "continue": "capture_screen"},
     )
-
     return workflow
+
+
+def build_workflow() -> StateGraph:
+    """Master workflow router controlled by USE_PLAN_REUSE."""
+    if USE_PLAN_REUSE:
+        return build_workflow_plan_reuse()
+    return build_workflow_legacy()
 
 
 def run_task(
@@ -1252,28 +2145,26 @@ def run_task(
     force_fallback: bool = False,
 ) -> Dict[str, Any]:
     """
-    Execute a high-level task on an Android device.
-
-    Args:
-        task:                    Natural-language task description.
-        device:                  ADB device serial.
-        max_workflow_iterations: Hard cap on graph loop iterations.
-        log_callback:            Callable(str) for real-time log streaming.
-                                 Defaults to print() if not provided.
-        force_fallback:          Whether to automatically route to React fallback mode.
+    Execute a high-level task on an Android device (Step 17).
     """
+    if USE_PLAN_REUSE:
+        return _run_verified_task(task, device, max_workflow_iterations, log_callback, force_fallback)
+
     _log = log_callback or print
     _log(f"\n{'#'*60}")
-    _log(f"# deployment.py  v3  (Pinecone-primary)")
-    _log(f"# task='{task}'  device='{device}'  max_iters={max_workflow_iterations}  force_fallback={force_fallback}")
+    _log(f"# deployment.py (Plan Reuse: {'ENABLED' if USE_PLAN_REUSE else 'DISABLED'})")
+    _log(f"# task='{task}' device='{device}' max_iters={max_workflow_iterations} force_fallback={force_fallback}")
     _log(f"{'#'*60}\n")
+
+    LLM_CALLS.clear()
+
     try:
         from data.State import create_deployment_state
         state = create_deployment_state(task=task, device=device, max_retries=3)
-        state["_workflow_iterations"]    = 0
+        state["workflow_iterations"]     = 0
         state["max_workflow_iterations"] = max_workflow_iterations
-        state["log_callback"]            = log_callback   # propagated to all nodes
-        state["close_actions"]           = []             # populated on no-match
+        state["log_callback"]            = log_callback
+        state["close_actions"]           = []
         state["force_fallback"]          = force_fallback
 
         recursion_limit = max(50, max_workflow_iterations * 6)
@@ -1282,25 +2173,169 @@ def run_task(
 
         close_actions = result.get("close_actions", [])
 
-        if result["execution_status"] == "success" and result["current_page"]["screenshot"]:
+        if result.get("completed") and result.get("final_screenshot"):
             try:
                 from PIL import Image
-                Image.open(result["current_page"]["screenshot"]).show()
+                Image.open(result["final_screenshot"]).show()
             except Exception:
                 pass
 
         message = "Task execution completed"
-        if result["execution_status"] == "no_match":
+        if result.get("execution_status") == "no_match":
             message = "Add test cases in the exploration tab or navigate to fallback mechanism"
 
+        steps_done = result.get("replayed_steps", 0) + result.get("react_steps", 0)
         return {
-            "status":          result["execution_status"],
+            "status":          result.get("execution_status", "unknown"),
+            "completed":       result.get("completed", False),
             "message":         message,
-            "steps_completed": result["current_step"],
-            "total_steps":     result["total_steps"],
+            "steps_completed": steps_done,
+            "replayed_steps":  result.get("replayed_steps", 0),
+            "react_steps":     result.get("react_steps", 0),
+            "plan":            result.get("plan"),
+            "llm_calls":       dict(LLM_CALLS),
             "close_actions":   close_actions,
         }
     except Exception as e:
         _log(f"❌ Error executing task: {e}")
         import traceback; traceback.print_exc()
-        return {"status": "error", "message": str(e), "error": str(e), "close_actions": []}
+        return {
+            "status": "error",
+            "completed": False,
+            "message": str(e),
+            "error": str(e),
+            "steps_completed": 0,
+            "replayed_steps": 0,
+            "react_steps": 0,
+            "plan": None,
+            "llm_calls": dict(LLM_CALLS),
+            "close_actions": [],
+        }
+
+
+
+def _run_verified_task(task, device, max_workflow_iterations=10, log_callback=None, force_fallback=False):
+    """Default deployment path; legacy workflow remains opt-in via USE_PLAN_REUSE=0."""
+    from replay_engine import ReplayEngine, hydrate_actions
+    from deployment_progress import run_with_progress, timeout_setting
+    _log = log_callback or print
+    from deployment_artifacts import DeploymentImages
+    run_images = DeploymentImages(_log)
+    def parser_log(message):
+        prefix = "[CLIENT] Image saved ? "
+        if message.startswith(prefix):
+            run_images.track(message[len(prefix):])
+        _log(message)
+    state = create_execution_state(device)
+    state["task"] = task
+    state["log_callback"] = log_callback
+
+    _log(f"[DEPLOYMENT] Starting on device={device}; task={task!r}.")
+
+    def capture():
+        # Retain the fresh image for vision fallback even when parsing fails.
+        page = {"screenshot": None, "elements_data": [], "elements_json": None, "parser_attempted": False}
+        state["current_page"] = page
+        _log(f"[CAPTURE] Taking screenshot; settling for {SCREENSHOT_SETTLE_SEC}s...")
+        shot = take_screenshot.invoke({"device": device, "app_name": "deployment",
+                                       "step": state["current_step"], "settle": SCREENSHOT_SETTLE_SEC})
+        if not shot or not os.path.isfile(shot):
+            _log(f"[CAPTURE] Screenshot failed: {shot}")
+            return page
+        page["screenshot"] = shot
+        run_images.track(shot)
+        _log(f"[CAPTURE] Saved screenshot: {shot}")
+        try:
+            page["parser_attempted"] = True
+            _log("[PARSER] Submitting screenshot to OmniParser; waiting for remote worker...")
+            path = run_with_progress("OmniParser", lambda: omniparser_run(_img_to_b64(shot), log_callback=parser_log),
+                                     timeout=timeout_setting("DEPLOYMENT_PARSER_TIMEOUT_SEC", 125), log=_log)
+            if path and os.path.isfile(path):
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, list):
+                    page.update(elements_data=data, elements_json=path)
+                    _log(f"[PARSER] Ready: {len(data)} elements; JSON={path}")
+                else:
+                    _log("[PARSER] Unexpected JSON structure; keeping fresh image for vision fallback.")
+            else:
+                _log("[PARSER] No parsed JSON returned; keeping fresh image for vision fallback.")
+        except Exception as exc:
+            (log_callback or print)(f"Parsing unavailable; fresh screenshot retained for vision: {exc}")
+        return page
+
+    def action(params):
+        params = dict(params)
+        bbox = params.pop("bbox", None)
+        replace = params.pop("replace", False)
+        size = _device_size(state)
+        if bbox:
+            relative = max(bbox) <= 1
+            params["x"] = int((bbox[0] + bbox[2]) / 2 * (size["width"] if relative else 1))
+            params["y"] = int((bbox[1] + bbox[3]) / 2 * (size["height"] if relative else 1))
+        if "x_relative" in params:
+            params["x"] = int(params.pop("x_relative") * size["width"])
+            params["y"] = int(params.pop("y_relative") * size["height"])
+        params["device"] = device
+        if params["action"] == "text":
+            if "x" not in params or "y" not in params:
+                return False
+            params["replace"] = replace
+        if params["action"].startswith("swipe") and params["action"] != "swipe_precise":
+            params.setdefault("x", size["width"] // 2)
+            params.setdefault("y", size["height"] // 2)
+        _log(f"[ADB] Executing {params.get('action')} on {device}; coordinates=({params.get('x')}, {params.get('y')}).")
+        raw_result = screen_action.invoke(params)
+        result = _parse_action_result(raw_result)
+        _log(f"[ADB] Result: {'success' if result else 'failure'}" + (f"; details={str(raw_result)[:500]}" if not result else ""))
+        state["current_step"] += 1
+        return result
+
+    def model(kind, system, prompt, page):
+        images = None
+        if page is not None:
+            b64 = _img_to_b64(page.get("screenshot"))
+            if not b64:
+                raise RuntimeError("Vision escalation requires a fresh screenshot")
+            images = [b64]
+        # Keep the exact prompt locally, referencing the original image without duplicating base64.
+        from pathlib import Path
+        import hashlib
+        import time
+        trace_dir = Path("log/model_requests")
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = trace_dir / f"{time.time_ns()}_{kind}.json"
+        shot_path = page.get("screenshot") if page else None
+        trace = {"kind": kind, "system_prompt": system, "user_prompt": prompt,
+                 "image_path": str(Path(shot_path).resolve()) if shot_path else None}
+        if shot_path:
+            raw = Path(shot_path).read_bytes()
+            trace.update(image_sha256=hashlib.sha256(raw).hexdigest(), image_bytes=len(raw),
+                         image_mime="image/png" if raw.startswith(b"\x89PNG") else "image/jpeg")
+        trace_path.write_text(json.dumps(trace, ensure_ascii=False, indent=2), encoding="utf-8")
+        _log(f"[MODEL-TRACE] Exact system/user prompt and image reference saved: {trace_path.resolve()}")
+        # Metrics are owned by this engine instance, not the legacy global counter.
+        timeout = timeout_setting("NVIDIA_REQUEST_TIMEOUT_SEC", 200)
+        _log(f"[MODEL-REQUEST] kind={kind}, image attached={bool(images)}, prompt characters={len(prompt)}, HTTP timeout={timeout}s; SDK retries disabled.")
+        return run_with_progress(f"NVIDIA/{kind}",
+            lambda: asyncio.run(bridge.call_json(system_prompt=system, user_prompt=prompt, images_b64=images, timeout=timeout)),
+            timeout=timeout+5, log=_log)
+
+    def load():
+        _log("[DATABASE] Fetching high-level actions from Neo4j...")
+        actions = run_with_progress("Neo4j/action catalog", lambda: db.get_all_high_level_actions(log_callback=_log),
+                                    timeout=timeout_setting("DEPLOYMENT_DB_TIMEOUT_SEC", 30), log=_log)
+        from replay_engine import decoded
+        ids = {s.get("element_id") for a in actions for s in decoded(a.get("element_sequence"), []) if s.get("element_id") and not all(s.get(k) for k in ("source", "destination", "target"))}
+        _log(f"[DATABASE] Found {len(actions)} stored task(s); {len(ids)} step(s) need legacy screen metadata.")
+        metadata = run_with_progress("Neo4j/step metadata", lambda: db.get_replay_metadata(list(ids)),
+                                     timeout=timeout_setting("DEPLOYMENT_DB_TIMEOUT_SEC", 30), log=_log) if ids else {}
+        _log(f"[DATABASE] Loaded metadata for {len(metadata)} element(s); building replay catalog.")
+        return hydrate_actions(actions, metadata)
+
+    engine = ReplayEngine(capture, action, lambda: press_home(device), model, load,
+                          max_steps=max(1, max_workflow_iterations * 3), log=log_callback or print)
+    result = engine.run(task, force_fallback)
+    result["image_cleanup"] = run_images.finish(result.get("completed") is True)
+    (log_callback or print)(f"Deployment result: {result['status']}; metrics={result['metrics']}")
+    return result

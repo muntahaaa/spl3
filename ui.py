@@ -12,6 +12,7 @@ Steps covered:
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import io
@@ -113,6 +114,7 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False):
     accumulated: list[str] = []
 
     def _log(line: str):
+        print(line, flush=True)
         log_queue.put(line)
 
     def _worker():
@@ -120,20 +122,30 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False):
             res = run_high_level_task(task=task, device=device, force_fallback=force_fallback, log_callback=_log)
             result_holder["result"] = res
         except Exception as exc:
+            _log(f"[ERROR] Deployment worker failed: {type(exc).__name__}: {exc}")
             result_holder["result"] = {"status": "error", "message": str(exc), "close_actions": []}
         finally:
             log_queue.put(None)  # sentinel
 
+    _log(f"[UI] Deployment queued: task={task!r}, device={device}, force fallback={force_fallback}.")
+    last_event_at = time.monotonic()
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
     # Stream lines until worker finishes
     while True:
-        line = log_queue.get()
+        try:
+            line = log_queue.get(timeout=5)
+        except queue.Empty:
+            idle = time.monotonic() - last_event_at
+            waiting = f"[WAIT] Background operation still running; {idle:.0f}s since the last event. Last operation: {accumulated[-1] if accumulated else 'starting worker'}"
+            yield "\n".join(accumulated + [waiting]), waiting, gr.update(visible=False), []
+            continue
+        last_event_at = time.monotonic()
         if line is None:
             break
         accumulated.append(line)
-        yield "\n".join(accumulated), "", gr.update(visible=False), []
+        yield "\n".join(accumulated), f"Running: {line}", gr.update(visible=False), []
 
     # Worker done — format final outcome
     result   = result_holder.get("result", {})
@@ -311,25 +323,96 @@ def get_high_level_actions_with_app():
     MATCH (a:Action)
     WHERE coalesce(a.is_high_level, false) = true
     OPTIONAL MATCH (p:Page)-[:HAS_ELEMENT]->(e:Element)<-[:COMPOSED_OF]-(a)
-    RETURN a, collect(p.description) as page_descriptions
+    RETURN a, collect(properties(p)) as pages_data
     """
     try:
         from data.graph_db import Neo4jDatabase
         import config
-        temp_db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH)
+        temp_db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH, database=config.Neo4j_DB)
         actions = []
         with temp_db.driver.session(database=temp_db.database) as session:
             result = session.run(query)
             for record in result:
                 action = dict(record["a"])
-                page_descs = record["page_descriptions"]
-                
-                app_name = "human_exploration"
-                for desc in page_descs:
-                    if desc and " — Step " in desc:
-                        app_name = desc.split(" — Step ")[0]
-                        break
-                
+                pages = record.get("pages_data") or []
+
+                app_name = None
+
+                # 1. Action node property directly
+                if action.get("app_name") and action["app_name"] not in ("unknown_app", "human_exploration"):
+                    app_name = action["app_name"]
+
+                # 2. Page app_name property (if already written to node)
+                if not app_name:
+                    for p in pages:
+                        pan = p.get("app_name")
+                        if pan and pan not in ("unknown_app", "human_exploration"):
+                            app_name = pan
+                            break
+
+                # 3. Extract from raw_page_url (e.g. log/screenshots/Clock/...)
+                if not app_name:
+                    for p in pages:
+                        url = p.get("raw_page_url")
+                        if url:
+                            norm_url = url.replace("\\", "/").strip()
+                            parts = norm_url.split("/")
+                            if "screenshots" in parts:
+                                idx = parts.index("screenshots")
+                                if idx + 1 < len(parts):
+                                    cand = parts[idx + 1]
+                                    if cand and cand not in ("unknown_app", "deployment", "human_exploration"):
+                                        app_name = cand
+                                        break
+
+                # 4. Check page other_info
+                if not app_name:
+                    for p in pages:
+                        oi_raw = p.get("other_info")
+                        if oi_raw:
+                            try:
+                                oi = json.loads(oi_raw) if isinstance(oi_raw, str) else oi_raw
+                                cand = oi.get("app_name")
+                                if cand and cand not in ("unknown_app", "human_exploration"):
+                                    app_name = cand
+                                    break
+                            except Exception:
+                                pass
+
+                # 5. Extract from page description
+                if not app_name:
+                    for p in pages:
+                        desc = p.get("description")
+                        if not desc:
+                            continue
+                        if " — Step " in desc:
+                            cand = desc.split(" — Step ")[0].strip()
+                            if cand and cand not in ("unknown_app", "human_exploration"):
+                                app_name = cand
+                                break
+                        m = re.search(r"['\"]([A-Za-z0-9_-]+)['\"]\s+app", desc, re.IGNORECASE)
+                        if m:
+                            app_name = m.group(1)
+                            break
+
+                # 6. Fallback inference from action name or source_task
+                if not app_name:
+                    text_corpus = f"{action.get('name', '')} {action.get('source_task', '')}".lower()
+                    if "clock" in text_corpus or "alarm" in text_corpus:
+                        app_name = "Clock"
+                    elif "photo" in text_corpus:
+                        app_name = "Photos"
+                    elif "gallery" in text_corpus:
+                        app_name = "Gallery"
+                    elif "setting" in text_corpus:
+                        app_name = "Settings"
+                    elif "weather" in text_corpus:
+                        app_name = "Weather"
+                    elif "youtube" in text_corpus:
+                        app_name = "YouTube"
+                    else:
+                        app_name = "App"
+
                 actions.append({
                     "app_name": app_name,
                     "name": action.get("name", "N/A"),
@@ -340,6 +423,7 @@ def get_high_level_actions_with_app():
     except Exception as exc:
         print(f"Error fetching high-level actions(test cases) with app: {exc}")
         return []
+
 
 
 def load_and_filter_actions(search_query=""):
@@ -604,9 +688,9 @@ def build_ui() -> gr.Blocks:
                 hl_run_btn = gr.Button("▶ Run high-level task")
 
                 hl_reasoning = gr.TextArea(
-                    label="Reasoning / process logs",
+                    label="Deployment progress / process logs",
                     interactive=False,
-                    lines=14,
+                    lines=22,
                 )
                 hl_outcome = gr.TextArea(
                     label="Outcome",

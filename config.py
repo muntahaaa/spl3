@@ -54,5 +54,9 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
 
 # ── NVIDIA NIM (direct inference — no Firebase worker needed) ─────────────
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-NVIDIA_API_KEY  = os.getenv("NVIDIA_API_KEY",  "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")
-NVIDIA_MODEL    = os.getenv("NVIDIA_MODEL",    "z-ai/glm-5.3-flash")
+NVIDIA_API_KEY  = os.getenv("NVIDIA_API_KEY",  "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")
+NVIDIA_MODEL    = os.getenv("NVIDIA_MODEL",    "meta/llama-3.2-11b-vision-instruct")
+
+CHAIN_UNDERSTAND_MODEL = os.getenv("CHAIN_UNDERSTAND_MODEL", NVIDIA_MODEL)
+
+CHAIN_EVOLVE_MODEL = os.getenv("CHAIN_EVOLVE_MODEL", NVIDIA_MODEL)

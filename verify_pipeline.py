@@ -35,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config
 from data.graph_db import Neo4jDatabase
 from chain_understand import (
-    create_triplet_reasoning_chain,
     _resolve_element,
     _resolve_action_name,
     process_triplet,
@@ -385,8 +384,7 @@ async def check_llm_reasoning(chain: List[Dict[str, Any]]) -> bool:
     info(f"  target_page : {triplet['target_page'].get('page_id', '?')}")
 
     try:
-        reasoning_chain = create_triplet_reasoning_chain()
-        processed = await process_triplet(triplet, reasoning_chain)
+        processed = await process_triplet(triplet)
 
         if "reasoning_error" in processed:
             result("LLM reasoning returned result", False, processed["reasoning_error"])

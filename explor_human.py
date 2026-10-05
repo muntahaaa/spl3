@@ -271,6 +271,8 @@ def single_human_explor(state: State, action: str, **kwargs) -> State:
         txt = kwargs.get("text_input")
         if txt:
             params.update({"input_str": txt})
+            if kwargs.get("element_number") is not None and x is not None and y is not None:
+                params.update({"x": x, "y": y})
             action_result = screen_action.invoke(params)
         else:
             state["errors"].append({"step": state["step"], "tool": "screen_action", "error_msg": "text_input missing"})

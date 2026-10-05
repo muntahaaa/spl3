@@ -40,12 +40,16 @@ async def run_understand(job_id: str, start_page_id: str) -> None:
     update_job(job_id, "running")
     try:
         triplets = await process_and_update_chain(start_page_id)
+        if not triplets or any(t.get("reasoning_error") or not t.get("reasoning") for t in triplets):
+            raise RuntimeError("Understanding returned no complete validated chain; inspect reasoning errors")
         update_job(
             job_id,
             "done",
             result={
                 "triplets_processed": len(triplets),
                 "start_page_id": start_page_id,
+                "evidence_sources": [t.get("reasoning", {}).get("evidence_source", "unknown") for t in triplets],
+                "warnings": [t["merge_warning"] for t in triplets if t.get("merge_warning")],
             },
         )
     except Exception as exc:

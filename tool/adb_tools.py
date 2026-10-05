@@ -9,13 +9,17 @@ parsed results are inserted manually via POST /api/insert_parsed_result.
 import datetime
 import json
 import os
+import re
 import shutil
+import shlex
 import subprocess
 import config
 from time import sleep
 
 # pyrefly: ignore [missing-import]
 from langchain_core.tools import tool
+
+SAFE_TEXT_RE = r"^[A-Za-z0-9 :.,@+\-_/]*$"
 
 
 # ── low-level ADB runner ──────────────────────────────────────────────────────
@@ -48,10 +52,15 @@ def _resolve_adb() -> str:
 def _adb(cmd: str) -> str:
     adb_bin = _resolve_adb()
     cmd = cmd.replace("adb", f'"{adb_bin}"', 1)
-    res = subprocess.run(
-        cmd, shell=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
+    try:
+        res = subprocess.run(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=float(os.getenv("ADB_COMMAND_TIMEOUT_SEC", "30")),
+        )
+    except subprocess.TimeoutExpired:
+        print("[ADB] Command timed out; device connection may be unresponsive.", flush=True)
+        return "ERROR"
     if res.returncode == 0:
         return res.stdout.strip()
     print(f"[ADB] command failed: {cmd}\n{res.stderr}")
@@ -106,6 +115,11 @@ def get_device_size(device: str = "emulator") -> dict:
         return {"error": str(exc)}
 
 
+def press_home(device: str = "emulator") -> bool:
+    """Send KEYCODE_HOME to device via ADB."""
+    return _adb(f"adb -s {device} shell input keyevent KEYCODE_HOME") != "ERROR"
+
+
 # ── screenshot ────────────────────────────────────────────────────────────────
 
 @tool
@@ -114,6 +128,7 @@ def take_screenshot(
     save_dir: str = "./log/screenshots",
     app_name: str = "unknown_app",
     step:     int = 0,
+    settle:   float = 2.0,
 ) -> str:
     """
     Take a screenshot via ADB and pull it to the local filesystem.
@@ -129,7 +144,7 @@ def take_screenshot(
     local    = os.path.join(app_dir, filename)
     remote   = f"/sdcard/{filename}"
 
-    sleep(2)  # let the screen settle
+    sleep(settle)  # let the screen settle
 
     if _adb(f"adb -s {device} shell screencap -p {remote}") == "ERROR":
         return "Screenshot failed: screencap error"
@@ -155,6 +170,7 @@ def screen_action(
     quick:     bool  = False,
     start:     tuple = None,
     end:       tuple = None,
+    replace:   bool  = False,
 ) -> str:
     """
     Tool name: screen_action
@@ -202,9 +218,32 @@ def screen_action(
         elif action == "text":
             if not input_str:
                 return json.dumps({**result, "status": "error", "message": "input_str required"})
-            safe = input_str.replace(" ", "%s").replace("'", "")
-            cmd  = f"adb -s {device} shell input text {safe}"
-            result["input_str"] = input_str
+            if x is not None and y is not None:
+                result["clicked_element"] = {"x": x, "y": y}
+            # Argument-list transport protects the host shell. shlex.quote protects
+            # the Android shell. Android input text supports printable ASCII only;
+            # report unsupported Unicode instead of silently corrupting the value.
+            if any(ord(c) < 32 or ord(c) > 126 for c in input_str):
+                return json.dumps({**result, "status": "error", "message": "ADB input text requires printable ASCII; Unicode/newlines need an installed input method"})
+            def send(args):
+                proc = subprocess.run([_resolve_adb(), "-s", device, "shell", *args],
+                                      capture_output=True, text=True, timeout=30)
+                return proc.returncode == 0
+            if replace:
+                if x is None or y is None:
+                    return json.dumps({**result, "status": "error", "message": "field coordinates required for replacement"})
+                if not send(["input", "tap", str(x), str(y)]):
+                    return json.dumps({**result, "status": "error", "message": "field focus failed"})
+                if not send(["input", "keycombination", "113", "29"]):
+                    return json.dumps({**result, "status": "error", "message": "select-all failed"})
+                if not send(["input", "keyevent", "67"]):
+                    return json.dumps({**result, "status": "error", "message": "clear field failed"})
+            # Usually one ADB text command, rather than one subprocess per word.
+            # Isolate literal percent signs so user text '%s' remains literal.
+            for piece in re.split(r"(%)", input_str):
+                if piece and not send(["input", "text", shlex.quote(piece.replace(" ", "%s"))]):
+                    return json.dumps({**result, "status": "error", "message": "text input failed"})
+            return json.dumps({**result, "status": "success", "input_str": input_str})
 
         elif action == "long_press":
             if x is None or y is None:

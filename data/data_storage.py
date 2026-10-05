@@ -295,7 +295,7 @@ def json2db(json_path: str) -> str:
 
             page_props = {
                 "page_id":      page_id,
-               
+                "app_name":     app_name,
                 "description":  _make_page_description(task_name, step_no,
                                                         elements_data, app_name),
                 "raw_page_url": step.get("source_page", ""),
@@ -303,6 +303,7 @@ def json2db(json_path: str) -> str:
                 "elements":     json.dumps(elements_data),
                 "other_info":   json.dumps({
                     "step": step_no,
+                    "app_name": app_name,
                     **({"task_info": {"task_id": task_id, "description": task_name}}
                        if step_no == 0 else {}),
                 }),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
@@ -20,7 +22,8 @@ os.environ["LANGCHAIN_PROJECT"]    = "ChainEvolve"
 db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH, database=config.Neo4j_DB)
 
 # ── NVIDIA NIM bridge (direct — no Firebase worker needed) ────────────────────
-bridge = NvidiaBridge()
+bridge = NvidiaBridge(max_tokens_json=1536, reasoning_effort="low", stream=True,
+                      model_name=os.getenv("CHAIN_EVOLVE_MODEL", config.NVIDIA_MODEL))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,7 +124,7 @@ _EVAL_SYSTEM = (
     "Return ONLY a JSON object with exactly these keys:\n"
     "  is_templateable (bool), confidence_score (float 0-1), "
     "reason (str), suggested_name (str)\n"
-    "No preamble, no markdown fences."
+    "Use brief factual output, no extended reasoning. No preamble, no markdown fences."
 )
 
 
@@ -135,7 +138,7 @@ def _build_eval_user_prompt(task_description: str, chain_operations: str) -> str
         "3. Does it form a complete, meaningful task flow?\n"
         "4. Can it be reused in similar tasks?\n"
         "5. Are there obvious parameterisable parts?\n\n"
-        "Return JSON only."
+        'Return JSON only: {"is_templateable": true, "confidence_score": 0.95, "reason": "brief factual reason", "suggested_name": "task name"}. Use actual evaluated values.'
     )
 
 
@@ -149,9 +152,9 @@ _GEN_SYSTEM = (
     "  name (str),\n"
     "  description (str),\n"
     "  preconditions (list[str]),\n"
-    "  element_sequence (list[dict] each with: element_id, order, atomic_action, action_params),\n"
+    "  element_sequence (empty list; code reconstructs exact recorded actions),\n"
     "  template_pattern (dict with: criteria, parameter_fields)\n"
-    "No preamble, no markdown fences."
+    "Use brief factual output, no extended reasoning. No preamble, no markdown fences."
 )
 
 
@@ -166,7 +169,7 @@ def _build_gen_user_prompt(
         f"Chain operations:\n{chain_operations}\n\n"
         f"Chain element details:\n{element_details}\n\n"
         f"Chain reasoning results:\n{reasoning_results}\n\n"
-        "Generate the high-level action node JSON now."
+        'Generate JSON using these keys: {"action_id":"high_level_action_xxx","name":"task name","description":"brief description","preconditions":[],"element_sequence":[],"template_pattern":{"criteria":{},"parameter_fields":{}}}. Fill metadata from the recorded chain; keep element_sequence empty.'
     )
 
 
@@ -188,13 +191,19 @@ async def evaluate_chain_templateability(
 
     try:
         await wait_for_llm_slot()
-        print("    [chain_evolve] Calling NVIDIA NIM for templateability eval...")
+        started = time.monotonic()
+        print("    [chain_evolve] Text-only templateability evaluation; reasoning=low, output cap=1536...")
         result = await bridge.call_json(
             system_prompt=_EVAL_SYSTEM,
             user_prompt=user_prompt,
+            timeout=200,
         )
-        if "is_templateable" in result:
-            return bool(result["is_templateable"]), result
+        print(f"    [chain_evolve] Evaluation response in {time.monotonic()-started:.1f}s")
+        if (isinstance(result.get("is_templateable"), bool)
+                and type(result.get("confidence_score")) in (int, float)
+                and 0 <= result["confidence_score"] <= 1
+                and all(isinstance(result.get(key), str) for key in ("reason", "suggested_name"))):
+            return result["is_templateable"], result
         print(f"Warning: Unexpected evaluation result format: {result}")
         return False, None
     except Exception as e:
@@ -218,12 +227,22 @@ async def generate_action_node(
 
     try:
         await wait_for_llm_slot()
-        print("    [chain_evolve] Calling NVIDIA NIM for action node generation...")
+        started = time.monotonic()
+        print("    [chain_evolve] Text-only action metadata generation; reasoning=low, sequence rebuilt by code...")
         result = await bridge.call_json(
             system_prompt=_GEN_SYSTEM,
             user_prompt=user_prompt,
+            timeout=200,
         )
-        if isinstance(result, dict) and "action_id" in result:
+        print(f"    [chain_evolve] Generation response in {time.monotonic()-started:.1f}s")
+        if (isinstance(result, dict)
+                and all(isinstance(result.get(key), str) and result[key].strip()
+                        for key in ("action_id", "name", "description"))
+                and isinstance(result.get("preconditions"), list)
+                and all(isinstance(item, str) for item in result["preconditions"])
+                and isinstance(result.get("element_sequence"), list)
+                and isinstance(result.get("template_pattern"), dict)
+                and all(key in result["template_pattern"] for key in ("criteria", "parameter_fields"))):
             return result
         print(f"Warning: Unexpected generation result format: {result}")
         return None
@@ -233,7 +252,68 @@ async def generate_action_node(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Database write helpers  (unchanged from original)
+#  Chain-derived sequence reconstruction (Step 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLOWED_ATOMIC = {
+    "tap", "text", "long_press", "swipe", "swipe_short", "swipe_long", "swipe_precise", "back"
+}
+
+def _json_val(v):
+    if isinstance(v, dict):
+        return v
+    try:
+        return json.loads(v) if v else {}
+    except Exception:
+        return {}
+
+def _source_step(t):
+    return _json_val(t.get("source_page", {}).get("other_info")).get("step", 10**9)
+
+def normalise_params(atomic: str, raw: dict) -> Optional[dict]:
+    if atomic == "text":
+        txt = raw.get("text") or raw.get("input_str") or ""
+        return {"text": txt}
+    if atomic in ("swipe", "swipe_short", "swipe_long"):
+        sw = raw.get("swipe") or {}
+        d = raw.get("direction") or sw.get("direction")
+        res = {"direction": d} if d else {"direction": "up"}
+        if sw.get("start") and sw.get("end"):
+            res["start"] = sw["start"]
+            res["end"] = sw["end"]
+        return res
+    if atomic == "swipe_precise":
+        sp = raw.get("swipe_precise") or {}
+        if sp.get("start") and sp.get("end"):
+            return {"start": sp["start"], "end": sp["end"], "duration": sp.get("duration", 400)}
+        return None
+    if atomic == "long_press":
+        lp = raw.get("long_press") or {}
+        return {"duration": raw.get("duration") or lp.get("duration", 1000)}
+    return {}  # tap, back
+
+def build_sequence_from_chain(chain: List[Dict[str, Any]]) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    seq = []
+    sorted_chain = sorted(chain, key=_source_step)
+    for i, t in enumerate(sorted_chain):
+        e = t.get("element") or {}
+        atomic = e.get("action_type") or (t.get("action") or {}).get("action_name", "")
+        if atomic not in ALLOWED_ATOMIC:
+            return None, f"step {i+1}: unsupported action '{str(atomic)[:30]}'"
+        params = normalise_params(atomic, _json_val(e.get("parameters")))
+        if params is None:
+            return None, f"step {i+1}: {atomic} has no usable parameters"
+        seq.append({
+            "element_id": e.get("element_id", ""),
+            "order": i + 1,
+            "atomic_action": atomic,
+            "action_params": params
+        })
+    return seq, "ok"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Database write helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_action_node_in_db(action_data: Dict[str, Any]) -> Optional[str]:
@@ -242,10 +322,12 @@ def create_action_node_in_db(action_data: Dict[str, Any]) -> Optional[str]:
         properties = {
             "action_id":        action_data["action_id"],
             "name":             action_data["name"],
+            "app_name":         action_data.get("app_name", ""),
             "description":      action_data["description"],
             "preconditions":    json.dumps(action_data["preconditions"]),
             "element_sequence": json.dumps(action_data["element_sequence"]),
             "template_pattern": json.dumps(action_data["template_pattern"]),
+            "source_task":      action_data.get("source_task", ""),
             "is_high_level":    True,
         }
         node_id = db.create_action(properties)
@@ -330,7 +412,30 @@ async def evolve_chain_to_action(start_page_id: str) -> Optional[str]:
         if not action_data:
             print("Failed to generate action node content")
             return None
-        print(f"Generated action node: {action_data['name']}")
+
+        # Step 3: Rebuild element_sequence faithfully from the recorded Element nodes
+        seq, why = build_sequence_from_chain(chain)
+        if seq is None:
+            print(f"Chain not storable: {why}")
+            return None
+        action_data["element_sequence"] = seq
+        action_data["action_id"] = f"high_level_action_{uuid.uuid4().hex[:8]}"
+        action_data["source_task"] = extract_task_description(chain)
+
+        # Extract app_name from chain page URLs / other_info
+        resolved_app = ""
+        for triplet in chain:
+            sp = triplet.get("source_page") or {}
+            raw_url = sp.get("raw_page_url", "")
+            if raw_url:
+                parts = raw_url.replace("\\", "/").split("/")
+                if "screenshots" in parts:
+                    idx = parts.index("screenshots")
+                    if idx + 1 < len(parts) and parts[idx + 1] not in ("unknown_app", "deployment", "human_exploration"):
+                        resolved_app = parts[idx + 1]
+                        break
+        action_data["app_name"] = resolved_app
+        print(f"Generated action node: {action_data['name']} (App: {resolved_app}, ID: {action_data['action_id']})")
 
         # 4. Persist action node
         print("Creating action node in Neo4j...")

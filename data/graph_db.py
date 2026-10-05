@@ -458,6 +458,17 @@ class Neo4jDatabase:
                     })
 
             # ── Sort, deduplicate ────────────────────────────────────────────
+            # Restore understanding output from its persisted Element property.
+            for hop in elem_hops:
+                reasoning = hop["element"].get("reasoning")
+                if isinstance(reasoning, str):
+                    try:
+                        reasoning = json.loads(reasoning)
+                    except (ValueError, TypeError):
+                        reasoning = None
+                if isinstance(reasoning, dict):
+                    hop["reasoning"] = reasoning
+
             elem_hops.sort(key=lambda h: h["_sort_key"])
 
             seen: set = set()
@@ -479,6 +490,24 @@ class Neo4jDatabase:
             return []
 
     # ── read helpers (ported from graph_db2) ─────────────────────────────────
+
+    def get_replay_metadata(self, element_ids):
+        """Batch-load stored JSON screens; no model calls or database mutations."""
+        if not element_ids:
+            return {}
+        query = """
+        MATCH (src:Page)-[:HAS_ELEMENT]->(e:Element)-[:LEADS_TO]->(dst:Page)
+        WHERE e.element_id IN $ids
+        RETURN DISTINCT e.element_id AS id, src, e, dst
+        """
+        result = {}
+        with self.driver.session(database=self.database) as session:
+            for row in session.run(query, ids=element_ids):
+                result.setdefault(row["id"], []).append({
+                    "source": dict(row["src"]), "destination": dict(row["dst"]),
+                    "element": dict(row["e"]),
+                })
+        return result
 
     def get_all_actions(self) -> List[Dict[str, Any]]:
         """Get all Action nodes from the database."""
@@ -552,7 +581,7 @@ class Neo4jDatabase:
             print(f"Error getting element by ID {element_id}: {exc}")
             return None
 
-    def get_all_high_level_actions(self) -> List[Dict[str, Any]]:
+    def get_all_high_level_actions(self, log_callback=None) -> List[Dict[str, Any]]:
         """Get all high-level Action nodes (identified by is_high_level = true)."""
         query = """
         MATCH (a:Action)
@@ -573,7 +602,7 @@ class Neo4jDatabase:
                     actions.append(action)
                 return actions
         except Exception as exc:
-            print(f"Error getting all high level actions: {exc}")
+            (log_callback or print)(f"[DATABASE] Failed to load stored tasks: {type(exc).__name__}: {exc}. Returning an empty catalog for fallback.")
             return []
 
     def get_high_level_actions_for_task(self, task: str) -> List[Dict[str, Any]]:

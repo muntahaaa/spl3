@@ -94,6 +94,20 @@ class DeploymentState(TypedDict, total=False):
     chain_status: Optional[str]  # "pending" | "running" | "done" | "error"
     force_fallback: bool  # Whether to force React fallback mode execution
 
+    # Task plan reuse fields (v3)
+    plan: Optional[Dict[str, Any]]  # Segmented execution plan
+    seg_index: int  # Current segment index
+    react_steps: int  # Count of executed ReAct steps
+    replayed_steps: int  # Count of executed replay steps
+    retries: int  # Retry counter for post-judge corrections
+    final_screenshot: Optional[str]  # Screenshot taken after execution for judging
+    final_elements: List[Dict]  # Elements extracted from final screenshot
+    screen_hashes: List[str]  # Hash history for stuck/infinite loop detection
+    device_size: Optional[Dict]  # Cached device dimensions {"width": w, "height": h}
+    finished: bool  # Whether workflow is completely finished
+    workflow_iterations: int  # Replaces undeclared _workflow_iterations
+    max_workflow_iterations: int  # Maximum iterations cap
+
 
 def create_deployment_state(
     task: str,
@@ -164,6 +178,20 @@ def create_deployment_state(
     state["chain_job_id"] = None
     state["chain_status"] = None
     state["force_fallback"] = False
+
+    # Task plan reuse defaults (v3)
+    state["plan"] = None
+    state["seg_index"] = 0
+    state["react_steps"] = 0
+    state["replayed_steps"] = 0
+    state["retries"] = 0
+    state["final_screenshot"] = None
+    state["final_elements"] = []
+    state["screen_hashes"] = []
+    state["device_size"] = None
+    state["finished"] = False
+    state["workflow_iterations"] = 0
+    state["max_workflow_iterations"] = 10
 
     return state
 
