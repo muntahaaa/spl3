@@ -100,6 +100,8 @@ class CaseDeletionTests(unittest.TestCase):
                     return Rows([{"a":{"action_id":"delete-me"}}])
                 if "RETURN a" in query:
                     return Rows([{"a":{"element_sequence":[{"element_id":"shared-element","source":{"page_id":"shared-page"}}]}}])
+                if "AS source" in query and "<>" in query:
+                    return Rows([{ "element":"shared-element", "source":"shared-page", "destination":None}])
                 if "AS source" in query:
                     return Rows([{"element":"unique-element","source":"unique-page","destination":"shared-page"},
                                  {"element":"shared-element","source":"shared-page","destination":None}])

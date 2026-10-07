@@ -55,16 +55,16 @@ def _resolve_element(triplet: Dict[str, Any]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_task_description(chain: List[Dict[str, Any]]) -> str:
-    if not chain:
-        return "Unknown task"
-    try:
-        other_info = chain[0]["source_page"].get("other_info", {})
-        if isinstance(other_info, str):
-            other_info = json.loads(other_info)
-        return other_info.get("task_info", {}).get("description", "Unknown task")
-    except Exception as e:
-        print(f"Error extracting task information: {e}")
-        return "Unknown task"
+    # Task metadata is recorded on step zero only; chain order is not guaranteed.
+    for triplet in sorted(chain,key=_source_step):
+        for key in ("source_page","target_page"):
+            page = triplet.get(key) or {}
+            info = _json_val(page.get("other_info"))
+            task_info = info.get("task_info") or {}
+            value = task_info.get("description") if isinstance(task_info,dict) else None
+            if isinstance(value,str) and value.strip() and value.strip().casefold() not in {"unknown task","unknown"}:
+                return value.strip()
+    return "Unknown task"
 
 
 def format_chain_operations(chain: List[Dict[str, Any]]) -> str:
@@ -445,7 +445,10 @@ async def evolve_chain_to_action(start_page_id: str) -> Optional[str]:
                 step["description"] = step["element_description"]
         action_data["element_sequence"] = seq
         action_data["action_id"] = f"high_level_action_{uuid.uuid4().hex[:8]}"
-        action_data["source_task"] = extract_task_description(chain)
+        recorded_task = extract_task_description(chain)
+        action_data["source_task"] = recorded_task if recorded_task != "Unknown task" else action_data["name"]
+        if recorded_task == "Unknown task":
+            print("[chain_evolve] Recorded task metadata missing; using generated action name as source_task.")
 
         # Extract app_name from chain page URLs / other_info
         resolved_app = ""

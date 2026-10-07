@@ -104,10 +104,10 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False, action
     task   = (task or "").strip()
     device = (device or "").strip()
     if not task:
-        yield "Error: provide a task description.", "", gr.update(visible=False), [], ""
+        yield "Error: provide a task description.", "", gr.update(visible=False), [], "", ""
         return
     if not device or device == "No devices found":
-        yield "Error: select a valid ADB device.", "", gr.update(visible=False), [], ""
+        yield "Error: select a valid ADB device.", "", gr.update(visible=False), [], "", ""
         return
 
     from deployment_control import Assistance, device_lock
@@ -115,7 +115,7 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False, action
     lock = device_lock(device)
     if not lock.acquire(blocking=False):
         control.close()
-        yield "Device already has an active deployment.", "", gr.update(visible=False), [], ""
+        yield "Device already has an active deployment.", "", gr.update(visible=False), [], "", ""
         return
     log_queue: queue.Queue = queue.Queue()
     result_holder: dict = {}
@@ -150,13 +150,17 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False, action
         except queue.Empty:
             idle = time.monotonic() - last_event_at
             waiting = f"[WAIT] Background operation still running; {idle:.0f}s since the last event. Last operation: {accumulated[-1] if accumulated else 'starting worker'}"
-            yield "\n".join(accumulated + [waiting]), ("Waiting for your input: " + str(control.pending.get("missing", "Missing element")) if control.pending else waiting), gr.update(visible=bool(control.pending)), [], control.token
+            pending = control.pending
+            question = str(pending.get("question") or pending.get("missing")) if pending else ""
+            yield "\n".join(accumulated + [waiting]), ("Waiting for your input: " + question if pending else waiting), gr.update(visible=bool(pending)), [], control.token, question
             continue
         last_event_at = time.monotonic()
         if line is None:
             break
         accumulated.append(line)
-        yield "\n".join(accumulated), ("Waiting for your input: " + str(control.pending.get("missing", "Missing element")) if control.pending else f"Running: {line}"), gr.update(visible=bool(control.pending)), [], control.token
+        pending = control.pending
+        question = str(pending.get("question") or pending.get("missing")) if pending else ""
+        yield "\n".join(accumulated), ("Waiting for your input: " + question if pending else f"Running: {line}"), gr.update(visible=bool(pending)), [], control.token, question
 
     # Worker done — format final outcome
     result   = result_holder.get("result", {})
@@ -173,7 +177,7 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False, action
         score = act.get("similarity_score") or act.get("score") or 0.65
         formatted_actions.append([act.get("action_id", ""), desc, score])
 
-    yield "\n".join(accumulated), outcome, gr.update(visible=show_popup), formatted_actions, ""
+    yield "\n".join(accumulated), outcome, gr.update(visible=show_popup), formatted_actions, "", ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -431,6 +435,8 @@ def get_high_level_actions_with_app():
                     except json.JSONDecodeError:
                         pass
 
+                if str(action.get("source_task") or "").strip().casefold() in {"unknown task", "unknown", "n/a"}:
+                    action["source_task"] = action.get("name") or ""
                 action["app_name"] = app_name
                 if not action.get("action_id"):
                     action["action_id"] = action.get("id") or (str(record["a"].element_id) if hasattr(record["a"], "element_id") else "")
@@ -480,8 +486,8 @@ def build_ui() -> gr.Blocks:
         assistance_token = gr.State("")
         with gr.Column(visible=False, elem_id="deployment-help") as popup_col:
             gr.Markdown("### Missing app or element: execution paused")
-            gr.Markdown("Review the latest deployment log. Provide guidance to continue with vision/ReAct, or skip and add a new test case.")
-            assistance_info = gr.Textbox(label="More information about the app, element or task")
+            assistance_question = gr.Markdown("The required question will appear here.")
+            assistance_info = gr.Textbox(label="Answer the question above")
             close_actions_df = gr.Dataframe(visible=False)
             assistance_status = gr.Textbox(label="Assistance response", interactive=False)
             with gr.Row():
@@ -741,7 +747,7 @@ def build_ui() -> gr.Blocks:
                 hl_run_btn.click(
                     _run_high_level,
                     inputs=[hl_task_input, hl_device_radio],
-                    outputs=[hl_reasoning, hl_outcome, popup_col, close_actions_df, assistance_token],
+                    outputs=[hl_reasoning, hl_outcome, popup_col, close_actions_df, assistance_token, assistance_question],
                     concurrency_id="deployment", concurrency_limit=1,
                 )
 
@@ -798,7 +804,7 @@ def build_ui() -> gr.Blocks:
                     actions = get_high_level_actions_with_app()
                     selected = next((a for a in actions if a.get("action_id") == case_id), None)
                     if selected is None:
-                        yield "Select an existing stored case.", "", gr.update(visible=False), [], "", "No case selected", [], "Select a stored test case."
+                        yield "Select an existing stored case.", "", gr.update(visible=False), [], "", "", "No case selected", [], "Select a stored test case."
                         return
                     yield from stream_case_execution([selected],device,_run_high_level,gr.update)
 
@@ -820,7 +826,7 @@ def build_ui() -> gr.Blocks:
 
                 refresh_actions_btn.click(case_choices, outputs=[case_choice],queue=False)
                 actions_tab.select(case_choices, outputs=[case_choice],queue=False)
-                execution_outputs = [cases_logs,cases_outcome,popup_col,close_actions_df,assistance_token,cases_current,cases_results,cases_report]
+                execution_outputs = [cases_logs,cases_outcome,popup_col,close_actions_df,assistance_token,assistance_question,cases_current,cases_results,cases_report]
                 run_selected_btn.click(run_selected,inputs=[case_choice,cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
                 run_all_btn.click(run_all,inputs=[cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
                 delete_case_btn.click(delete_selected,inputs=[case_choice],outputs=[case_status,case_choice,actions_df,deletion_manifest])

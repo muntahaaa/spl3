@@ -33,8 +33,31 @@ class HierarchyTests(unittest.TestCase):
                 result=capture_hierarchy("device","adb",{"width":200,"height":400},tracked.append,lambda _:None)
                 self.assertEqual(result[0]["content"],"Clock")
                 self.assertEqual(len(tracked),1)
-                self.assertEqual(calls[-1][-2],"rm")
-                self.assertTrue(calls[-1][-1].startswith("/sdcard/codex_deployment_"))
-                self.assertEqual(calls[-1][-1],calls[1][-1])
+                self.assertEqual(calls[-1][-3],"rm")
+                self.assertTrue(calls[-1][-1].startswith("/data/local/tmp/codex_deployment_"))
+                self.assertEqual(calls[-1][-1],calls[0][-1])
             finally:
                 os.chdir(old)
+
+    def test_autocomplete_is_focused_input(self):
+        xml='<hierarchy><node class="android.widget.AutoCompleteTextView" text="City/country/region" focused="true" bounds="[0,20][100,50]"/></hierarchy>'
+        element=parse_hierarchy(xml,200,400)[0]
+        self.assertEqual(element["type"],"input")
+        self.assertTrue(element["editable"])
+        self.assertTrue(element["focused"])
+
+    def test_idle_failure_falls_back_without_cat_or_retry(self):
+        calls=[];logs=[]
+        def run(args,**kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0,stderr="",stdout="ERROR: could not get idle state.")
+        with patch("deployment_hierarchy.subprocess.run",side_effect=run):
+            self.assertEqual(capture_hierarchy("device","adb",{"width":200,"height":400},lambda _:None,logs.append),[])
+        self.assertEqual(len(calls),2)
+        self.assertFalse(any("cat" in args for args in calls))
+        self.assertTrue(any("without retrying" in line for line in logs))
+
+    def test_parent_and_child_tab_have_same_control_identity(self):
+        xml='<hierarchy><node text="World clock" clickable="true" package="clock" bounds="[0,20][100,80]"><node text="World clock" bounds="[10,30][90,60]"/></node></hierarchy>'
+        result=parse_hierarchy(xml,200,400)
+        self.assertEqual(result[0]["control_id"],result[1]["control_id"])

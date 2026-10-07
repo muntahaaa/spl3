@@ -16,6 +16,10 @@ from collections import Counter
 from functools import lru_cache
 
 
+class ParameterResolutionError(RuntimeError):
+    """A stored plan was matched, but one of its input values is unresolved."""
+
+
 def decoded(value, default=None):
     if isinstance(value, str):
         try:
@@ -142,10 +146,53 @@ def screen_difference(expected, live):
             "unexpected": list((live_texts-expected_texts).elements())[:8]}
 
 
+def expanded_label_match(wanted, candidate):
+    """Whole-phrase containment for expanded result labels, never an input or command."""
+    if candidate.get("editable") or candidate.get("type") in {"input", "edittext"}:
+        return False
+    if candidate.get("enabled") is False or (candidate.get("package") and candidate.get("clickable") is False):
+        return False
+    if len(wanted) < 3 or not any(c.isalpha() for c in wanted):
+        return False
+    if wanted in NAVIGATION | COMMIT | {"start", "stop", "pause", "reset", "resume", "add", "search"}:
+        return False
+    return bool(re.search(r"(?<!\w)" + re.escape(wanted) + r"(?!\w)", content(candidate)))
+
+
+def control_role(target):
+    """Use a stored role or known descriptive intent without rewriting its label."""
+    role = normalize(target.get("role", ""))
+    label = content(target).rstrip(" .")
+    if role in {"add", "create", "add/create"} or label in {
+        "adding a new item or creating something new",
+        "add a new item", "create a new item",
+    }:
+        return "add"
+    return None
+
+
+def role_candidate_valid(role, candidate):
+    if role != "add" or candidate.get("enabled") is False or unsuitable_target(candidate):
+        return False
+    if candidate.get("editable") or candidate.get("type") in {"input", "edittext"}:
+        return False
+    # Hierarchy provides authoritative clickability; parser-only observations do not.
+    if candidate.get("clickable") is False:
+        return False
+    label = content(candidate)
+    if label in {"add", "create", "new", "+"}:
+        return True
+    return bool(re.fullmatch(r"(?:add|create|new)\s+(?:a\s+)?(?:city|alarm|contact|note|item|event|task|folder|album|timer)",label))
+
+
 def target_index(target, live):
-    """Content/type first; layout disambiguates, but never proves identity alone."""
+    """Stable identity first, then exact text, roles and finally fuzzy text."""
+    role = control_role(target)
     scores = []
+    expanded = []
     for i, e in enumerate(elements(live)):
+        if target.get("query_dependent") and (e.get("editable") or e.get("type") in {"input","edittext"} or e.get("enabled") is False or (e.get("package") and e.get("clickable") is False)):
+            continue
         if not box(e) or not content(target) or not content(e):
             continue
         target_id = target.get("resource_id") or target.get("resource-id")
@@ -156,15 +203,41 @@ def target_index(target, live):
         # Hierarchy and image-parser type names differ; label identity is primary.
         if target.get("type") == "input" and e.get("type") not in {"input", "edittext"}:
             continue
-        ratio = difflib.SequenceMatcher(None, content(target), content(e)).ratio()
+        # Exact stored evidence outranks semantic aliases. Parser descriptions
+        # are valid exact labels even when they are more verbose than the UI.
+        if content(target) == content(e):
+            scores.append((1.8,i))
+            continue
+        if role and not role_candidate_valid(role,e):
+            continue
+        if role:
+            scores.append((1.0,i))
+            continue
+        target_label = {"search function.": "search", "search function": "search"}.get(content(target), content(target))
+        ratio = difflib.SequenceMatcher(None, target_label, content(e)).ratio()
         if ratio < .93:
+            if target.get("type") not in {"input", "edittext"} and expanded_label_match(target_label,e):
+                expanded.append((.90,i))
             continue
         distance = 1.0
         a, b = box(target), box(e)
         if a and b and (max(a) <= 1) == (max(b) <= 1):
             distance = math.hypot((a[0]+a[2]-b[0]-b[2])/2, (a[1]+a[3]-b[1]-b[3])/2)
         scores.append((ratio + .05 * max(0, 1-distance*10), i))
-    scores.sort(reverse=True)
+    # Accessibility trees may expose both a clickable tab and its child label.
+    # Collapse only nodes proven to share the same clickable ancestor.
+    using_expanded = not scores
+    if using_expanded:
+        scores = expanded
+    grouped = {}
+    for score, i in scores:
+        e = elements(live)[i]
+        key = (e.get("package"), e["control_id"]) if e.get("control_id") is not None else ("index", i)
+        if key not in grouped or score > grouped[key][0]:
+            grouped[key] = (score, i)
+    scores = sorted(grouped.values(), reverse=True)
+    if using_expanded and len(scores) > 1:
+        return None
     if not scores or (len(scores) > 1 and scores[0][0] - scores[1][0] < .025):
         return None
     return scores[0][1]
@@ -304,6 +377,31 @@ def unsuitable_target(element, atomic="tap"):
             or element.get("interactable") is False or element.get("enabled") is False)
 
 
+def recovered_target_valid(target, candidate, atomic):
+    if unsuitable_target(candidate,atomic):
+        return False
+    if atomic == "text":
+        return candidate.get("type") in {"input","edittext"} or candidate.get("editable") is True
+    if candidate.get("package") and candidate.get("clickable") is False:
+        return False
+    wanted,actual=content(target),content(candidate)
+    if wanted == actual:
+        return True
+    role = control_role(target)
+    if role:
+        return role_candidate_valid(role,candidate)
+    aliases={"search function.":"search","search function":"search",
+             "adding a new item or creating something new.":"add", "kity/country/region":"search", "city/country/region":"search"}
+    wanted=aliases.get(wanted,wanted)
+    if wanted == "add":
+        return actual in {"add","add city","+","new","add alarm"}
+    if wanted == "search":
+        return "search" in actual or candidate.get("type") == "input"
+    if wanted == "stopwatch" and actual == "elapsed time":
+        return True
+    return wanted == actual or expanded_label_match(wanted,candidate) or difflib.SequenceMatcher(None,wanted,actual).ratio() >= .85
+
+
 def repair_step_target(step):
     target = step.get("target", {})
     source = step.get("source", {})
@@ -366,6 +464,27 @@ def values_present(values, page):
         if not value or not any(re.search(pattern, text) for text in texts):
             return False
     return True
+
+
+def input_value_present(value, page, target=None, index=None):
+    """Only the edited control can prove entry; a matching list row cannot."""
+    live = elements(page)
+    candidates = [e for e in live if e.get("editable") or e.get("type") in {"input","edittext"}]
+    if target:
+        resource = target.get("resource_id") or target.get("resource-id")
+        matched = [e for e in candidates if resource and resource == (e.get("resource_id") or e.get("resource-id"))]
+        if matched:
+            candidates = matched
+        elif len(candidates) > 1:
+            bounds = box(target)
+            candidates = [e for e in candidates if bounds and box(e) == bounds]
+    if not candidates and not any(e.get("editable") or e.get("type") in {"input","edittext"} for e in live):
+        # Legacy image-parser records may omit input roles. Require field geometry.
+        bounds = box(target or {})
+        candidates = [e for e in live if bounds and box(e) == bounds]
+    if index is not None and 0 <= index < len(live) and live[index] in candidates:
+        candidates = [live[index]]
+    return any(normalize(e.get("value",e.get("text",e.get("content","")))) == normalize(value) for e in candidates)
 
 
 def valid_value(field, value):
@@ -452,6 +571,13 @@ class ReplayEngine:
         self.react_final_screen = None
         self.prefix_goal_screen = None
         self.react_use_vision = False
+        self.matched_plan = None
+        self.exact_task_match = False
+        self.exact_refresh_steps = set()
+        self.assistance_attempted_steps = set()
+        self.input_extraction_cache = {}
+        self.input_extraction_calls = 0
+        self.workflow_parameter_cache = {}
 
     def ask(self, kind, system, payload, vision=False):
         if self.model_backend_error:
@@ -534,6 +660,9 @@ class ReplayEngine:
             self.metrics["retrieval_errors"] += 1
             self.actions = []
         self.log(f"[CATALOG] Loaded {len(self.actions)} stored task(s). Checking exact task intent first.")
+        for stored_action in self.actions:
+            if normalize(stored_action.get("source_task")) in {"unknown task","unknown","n/a"}:
+                stored_action["source_task"] = stored_action.get("name") or ""
         exact = [a for a in self.actions if any(normalize(text) == normalize(task) for text in (a.get("source_task"), a.get("name")) if text) and a.get("element_sequence")]
         exact = [a for a in exact if len(task_clauses(a.get("source_task") or a.get("name", ""))) <= len(task_clauses(task))]
         for action in self.actions:
@@ -544,7 +673,9 @@ class ReplayEngine:
                     self.log(f"[METADATA] Stored step {index+1}: {step['target_metadata_error']}.")
         if exact:
             # Choose by catalog order; live alignment happens after task selection.
-            self.log(f"[PLAN] Exact match: id={exact[0].get('action_id')}, task={exact[0].get('source_task')}, steps={len(exact[0]['element_sequence'])}. Planner call skipped.")
+            self.exact_task_match = True
+            self.matched_plan = (exact[0], "equivalent", len(exact[0]["element_sequence"]))
+            self.log(f"[PLAN] Exact match: id={exact[0].get('action_id')}, task={task!r}, steps={len(exact[0]['element_sequence'])}. Planner call skipped.")
             return exact[0], "equivalent", len(exact[0]["element_sequence"])
         local_equivalent = [a for a in self.actions if equivalent_navigation(task, a)]
         if local_equivalent:
@@ -592,12 +723,20 @@ class ReplayEngine:
                 return None, "none", 0
             relation = p.get("relation")
             seq = action["element_sequence"]
+            # Preserve retrieval independently from later parameter binding. If
+            # binding needs assistance, the selected recording must not vanish
+            # into the planner's ordinary "no match" fallback.
+            self.matched_plan = (action, relation, len(seq))
             if relation == "equivalent" and len(task_clauses(action.get("source_task") or action.get("name", ""))) > len(task_clauses(task)):
                 self.log("[PLAN] Equivalent replay rejected: recording contains additional task operations. Only shared navigation may replay.")
                 relation = "related"
             if relation == "equivalent":
                 # Numeric or quoted parameters must not silently change meaning.
                 significant = lambda t: re.findall(r"\d+(?::\d+)?|\bam\b|\bpm\b|[\"'][^\"']+[\"']", normalize(t))
+                adapted = self.bind_replay_text(action,task)
+                if adapted != action:
+                    action = adapted
+                    seq = action["element_sequence"]
                 recorded_values = [(decoded(st.get("action_params"), {}) or {}).get("text") or (decoded(st.get("action_params"), {}) or {}).get("input_str") for st in seq if st.get("atomic_action") == "text"]
                 changed_text = any(normalize(value) in normalize(action.get("source_task", "")) and normalize(value) not in normalize(task) for value in recorded_values if value)
                 if not changed_text and significant(task) == significant(action.get("source_task", "")):
@@ -616,6 +755,8 @@ class ReplayEngine:
                     shared += 1
                 self.log(f"[PLAN] Related task {action.get('action_id')}: replay {shared}/{len(seq)} shared steps, then ReAct for the remaining goal.")
                 return action, relation, shared
+        except ParameterResolutionError:
+            raise
         except Exception as exc:
             self.log(f"Planner unavailable or rejected: {exc}")
         return None, "none", 0
@@ -636,7 +777,7 @@ class ReplayEngine:
                 if role == "commit":
                     safe = False
                     break
-                if role == "input" and not (value and values_present([value], page)):
+                if role == "input" and not (value and input_value_present(value,page,prior.get("target",{}))):
                     safe = False
                     break
             if not safe:
@@ -661,16 +802,238 @@ class ReplayEngine:
         self.log(f"[ALIGN] Accepted stored position {candidates[0][1]+1}, score={candidates[0][0]:.3f}.")
         return candidates[0][1]
 
-    def request_assistance(self, task, missing):
+    def explicit_text_value(self, field, task=None):
+        cache_key = (normalize(field),getattr(self,"user_guidance",""),task or getattr(self,"current_task",""))
+        if cache_key in self.input_extraction_cache:
+            return self.input_extraction_cache[cache_key]
+        for instruction in (getattr(self,"user_guidance",""), task or getattr(self,"current_task","")):
+            if not instruction:
+                continue
+            labeled = re.search(re.escape(field) + r"\s*[:=]\s*(?:[\"]([^\"]+)[\"]|([^,;\n]+))",instruction,re.I) if field else None
+            if labeled:
+                return (labeled.group(1) or labeled.group(2)).strip()
+            if any(word in normalize(field) for word in ("search","city","country","region","kity")):
+                match = re.search(r"\b(?:search\s+(?:and|then)\s+add|search(?:\s+for)?|write|type|enter)\s+(?:[\"]([^\"]+)[\"]|(.+?))(?=\s+(?:and|then)\b|[,;\n]|$)",instruction,re.I)
+                if match:
+                    return (match.group(1) or match.group(2)).strip().strip(" .")
+        return None
+
+    def resolve_input_parameter(self, field, task, stored_value=None, stored_task=""):
+        """Fast parsing, then bounded text extraction grounded in user instructions."""
+        value = self.explicit_text_value(field,task)
+        guidance = getattr(self,"user_guidance","")
+        key = (normalize(field),guidance,task)
+        if key in self.input_extraction_cache:
+            return value
+        suspicious = bool(value and re.match(r"^(?:and|then|please|search|type|enter|add)\b",normalize(value)))
+        instructions = guidance or task
+        input_requested = bool(re.search(r"\b(search|find|look for|type|enter|write|named|called|query)\b",normalize(instructions)))
+        changed_request = bool(guidance) or normalize(task) != normalize(stored_task)
+        if not suspicious and (value or not input_requested or not changed_request):
+            return value
+        if self.input_extraction_calls >= 3:
+            self.log("[INPUT-EXTRACT] Model extraction budget exhausted; no repeated request.")
+            self.input_extraction_cache[key] = None
+            return None
+        self.input_extraction_calls += 1
+        self.log(f"[INPUT-EXTRACT] Deterministic value missing or suspicious for {field!r}; one text-only extraction, cached for this instruction/field.")
+        prompt = (
+            "Extract the exact user-provided input value for the requested field in ANY application. "
+            "Return JSON with found:boolean, value:string or null, confidence:number, source_quote:string. "
+            "User guidance overrides task text when it explicitly supplies this field's value. "
+            "Separate command verbs and navigation clauses from the value; preserve multiword names, punctuation, "
+            "numbers and the actual text of notes/messages. Do not invent values or copy stored defaults. "
+            "If no value is supplied or the field is ambiguous, return found:false. "
+            "source_quote must be an exact excerpt of task or guidance containing the extracted value."
+        )
+        extracted = None
+        try:
+            result = self.ask("extract_input",prompt,{"task":task,"user_guidance":guidance,"field":field,
+                "stored_value":stored_value,"deterministic_candidate":value})
+            candidate = result.get("value")
+            quote = result.get("source_quote")
+            confidence = float(result.get("confidence",0))
+            sources = (task,guidance)
+            if (result.get("found") is True and isinstance(candidate,str) and candidate.strip()
+                and isinstance(quote,str) and quote and any(quote in source for source in sources)
+                and candidate in quote and math.isfinite(confidence) and .85 <= confidence <= 1
+                and valid_value(field,candidate)):
+                extracted = candidate.strip()
+                self.log(f"[INPUT-EXTRACT] Accepted instruction-grounded value for {field!r}; cached, no image needed.")
+            else:
+                self.log("[INPUT-EXTRACT] No trustworthy explicit value; rejected invented/ambiguous extraction.")
+        except Exception as exc:
+            self.log(f"[INPUT-EXTRACT] Extraction unavailable: {type(exc).__name__}: {exc}; no automatic retry.")
+        self.input_extraction_cache[key] = extracted
+        return extracted
+
+    def extract_workflow_parameters(self, action, task):
+        """Resolve all recorded input fields together, independent of task verbs."""
+        guidance = getattr(self,"user_guidance","")
+        fields = []
+        for index, step in enumerate(action.get("element_sequence",[])):
+            if step.get("atomic_action") != "text":
+                continue
+            params = decoded(step.get("action_params"),{}) or {}
+            fields.append({"id":str(index),"field":content(step.get("target",{})),
+                           "description":step.get("description",""),
+                           "stored_value":params.get("text") or params.get("input_str")})
+        if not fields:
+            return {}
+        key = (action.get("action_id"),task,guidance,tuple((f["id"],f["field"]) for f in fields))
+        if key in self.workflow_parameter_cache:
+            cached = self.workflow_parameter_cache[key]
+            if "error" in cached:
+                raise RuntimeError("Input parameter unresolved: " + cached["error"])
+            return cached
+        mapping = {}
+        unresolved = []
+        changed = bool(guidance) or normalize(task) != normalize(action.get("source_task") or action.get("name"))
+        for field in fields:
+            value = self.explicit_text_value(field["field"],task)
+            if value and valid_value(field["field"],value) and not re.match(r"^(and|then|please|search|type|enter|add)\b",normalize(value)):
+                mapping[field["id"]] = value
+            elif changed:
+                unresolved.append(field)
+            else:
+                mapping[field["id"]] = None
+        if unresolved:
+            self.log(f"[INPUT-EXTRACT] Resolve {len(unresolved)} stored input field(s) in one text-only request; no verb whitelist.")
+            prompt = (
+                "Resolve user-provided parameters for ALL supplied stored input steps, for any application. "
+                "Return JSON {parameters:[{id:string,status:explicit|absent|ambiguous,value:string or null,"
+                "source_quote:string,confidence:number}]}. Return exactly one entry per supplied id. "
+                "Use field labels, descriptions and stored values to identify the field's role. "
+                "User guidance takes priority. Separate command/navigation words from actual input; preserve "
+                "multiword names and note/message contents. Explicit means a supplied replacement; absent means "
+                "no replacement for that field and its stored default may be retained; ambiguous means clarification "
+                "is needed. Do not guess or generate data. For explicit values source_quote must be an exact "
+                "excerpt of task or guidance containing the exact value."
+            )
+            payload = {"task":task,"user_guidance":guidance,
+                "stored_task":action.get("source_task") or action.get("name"),"fields":unresolved}
+            result = self.ask("extract_parameters",prompt,payload)
+            entries = result.get("parameters",[])
+            expected_ids = {field["id"] for field in unresolved}
+            returned_ids = {entry.get("id") for entry in entries if isinstance(entry,dict)} if isinstance(entries,list) else set()
+            if not isinstance(entries,list) or not expected_ids.issubset(returned_ids):
+                self.log("[INPUT-EXTRACT] Structured response omitted required field(s); one bounded text-only recovery.")
+                recovery_prompt = (
+                    "Repair and complete the parameter extraction. Return only a JSON object with a parameters array. "
+                    "Include exactly one entry for every supplied field id. For each entry use status explicit, absent, "
+                    "or ambiguous; value or null; confidence; and source_quote. Extract values from task/user_guidance, "
+                    "not from stored_value. A phrase such as 'add Sri Lanka' supplies the value 'Sri Lanka' when the "
+                    "stored input field is a city/country search field. Do not omit an id even when ambiguous."
+                )
+                result = self.ask("extract_parameters_recovery",recovery_prompt,
+                    {**payload,"invalid_response":result})
+                entries = result.get("parameters",[])
+            for field in unresolved:
+                matches = [e for e in entries if isinstance(e,dict) and e.get("id") == field["id"]] if isinstance(entries,list) else []
+                entry = matches[0] if len(matches) == 1 else {}
+                status = entry.get("status")
+                value,quote = entry.get("value"),entry.get("source_quote")
+                try:
+                    confidence = float(entry.get("confidence",0))
+                except (ValueError,TypeError):
+                    confidence = 0
+                trustworthy = math.isfinite(confidence) and .85 <= confidence <= 1
+                if status == "explicit" and trustworthy and isinstance(value,str) and isinstance(quote,str) and quote and any(quote in src for src in (task,guidance)) and value in quote and valid_value(field["field"],value):
+                    mapping[field["id"]] = value.strip()
+                elif status == "absent" and trustworthy:
+                    mapping[field["id"]] = None
+                else:
+                    # Cache failure too, avoiding automatic calls on unchanged instructions.
+                    self.workflow_parameter_cache[key] = {"error":field["field"]}
+                    self.request_assistance(
+                        task,
+                        "Ambiguous input parameter for stored field: " + field["field"],
+                        f"What exact value should be entered in the stored field {field['field']!r}?",
+                    )
+                    if getattr(self,"user_guidance","") != guidance and not self.failure.startswith("skipped"):
+                        return self.extract_workflow_parameters(action,task)
+                    raise ParameterResolutionError("Input parameter unresolved: " + field["field"])
+        self.workflow_parameter_cache[key] = mapping
+        for field in fields:
+            self.input_extraction_cache[(normalize(field["field"]),guidance,task)] = mapping.get(field["id"])
+        return mapping
+
+    def bind_replay_text(self, action, task):
+        if not action:
+            return action
+        bound = copy.deepcopy(action)
+        parameters = self.extract_workflow_parameters(action,task)
+        replacements = []
+        for index, step in enumerate(bound.get("element_sequence",[])):
+            if step.get("atomic_action") != "text":
+                continue
+            params = decoded(step.get("action_params"),{}) or {}
+            old = params.get("text") or params.get("input_str")
+            value = parameters.get(str(index))
+            if value and old and normalize(value) != normalize(old):
+                replacements.append((old,value))
+                # A result selected immediately after text entry is query-dependent
+                # when its recorded label contains the old query, unlike a fixed
+                # control such as Save or Add.
+                seq = bound.get("element_sequence",[])
+                if index + 1 < len(seq):
+                    result_step = seq[index + 1]
+                    label = content(result_step.get("target",{}))
+                    fixed = NAVIGATION | COMMIT | {
+                        "add", "search", "start", "stop", "pause", "reset",
+                        "resume", "navigate up",
+                    }
+                    if result_step.get("atomic_action") == "tap" and label and label not in fixed and not result_step.get("target",{}).get("editable"):
+                        field_label = content(step.get("target",{}))
+                        search_field = any(word in field_label for word in ("search","city","country","region","query")) or "search" in str(step.get("target",{}).get("resource_id","")).lower()
+                        if normalize(old) in label or search_field:
+                            result_name = label.split("/", 1)[0].strip()
+                            if result_name and normalize(result_name) != normalize(old):
+                                replacements.insert(0, (result_name, value))
+                            result_step["target"] = {
+                                **result_step.get("target",{}),
+                                "content": value,
+                                "query_dependent": True,
+                            }
+                            result_step["target"].pop("resource_id",None)
+                            result_step["target"].pop("resource-id",None)
+                            self.log(f"[TEXT-BIND] Query-dependent result {label!r} now selects requested value {value!r}; fixed controls retained.")
+                self.log(f"[TEXT-BIND] Explicit task/guidance replaces stored text {old!r} with {value!r}; dependent targets follow the replacement.")
+        def rewrite(value):
+            if isinstance(value,str):
+                if replacements:
+                    lookup = {normalize(old):new for old,new in replacements}
+                    alternatives = "|".join(re.escape(old) for old in sorted(lookup,key=len,reverse=True))
+                    value = re.sub(r"(?<!\w)(?:" + alternatives + r")(?!\w)",
+                                   lambda match:lookup[normalize(match.group(0))],value,flags=re.I)
+                return value
+            if isinstance(value,list): return [rewrite(v) for v in value]
+            if isinstance(value,dict): return {k:(v if k in {"element_id","page_id","action_id","resource_id","screenshot","elements_json"} else rewrite(v)) for k,v in value.items()}
+            return value
+        for key in ("element_sequence","final_screen"):
+            if key in bound: bound[key] = rewrite(bound[key])
+        return bound
+
+    def request_assistance(self, task, missing, question=None):
         callback = getattr(self, "assistance_callback", None)
         if callback is None:
             return True  # Noninteractive callers retain ordinary ReAct fallback.
-        self.log(f"[ASSISTANCE] Waiting for user: {missing}. No further device actions until answered.")
-        answer = callback({"task": task, "missing": missing, "history": self.history[-8:]})
+        question = question or f"What exact information is required to continue: {missing}?"
+        self.log(f"[ASSISTANCE] Waiting for user: {question} No further device actions until answered.")
+        answer = callback({"task": task, "missing": missing, "question": question,
+                           "history": self.history[-8:]})
         if not answer or answer.get("skip"):
             self.failure = "skipped: add a new test case for this workflow"
             return False
         self.user_guidance = answer.get("info", "")
+        self.form_resolved.clear()
+        for field in list(self.form_values):
+            value = self.explicit_text_value(field,task)
+            if value:
+                self.form_values[field] = value
+        if getattr(self,"react_rejoin",None):
+            stored,limit,index = self.react_rejoin
+            self.react_rejoin = (self.bind_replay_text(stored,task),limit,index)
         self.react_use_vision = True
         return True
 
@@ -756,6 +1119,13 @@ class ReplayEngine:
                 self.failure = "restart_unmatched"
                 return False
             index = 0
+        # Alignment may legitimately resume after an input already present on screen.
+        self.verified_existing_text = getattr(self,"verified_existing_text",set())
+        for prior in seq[:index]:
+            params = decoded(prior.get("action_params"),{}) or {}
+            value = params.get("text") or params.get("input_str")
+            if prior.get("atomic_action") == "text" and value and input_value_present(value,self.observe(),prior.get("target",{})):
+                self.verified_existing_text.add(normalize(value))
         self.resume_index = index + 1
         self.log(f"Replay starts at stored step {index+1}")
         cur_idx = index
@@ -772,6 +1142,16 @@ class ReplayEngine:
             command = {"action": atomic}
             if atomic in ("tap", "long_press", "text"):
                 idx = target_index(step.get("target", {}), page)
+                # An exact stored case gets one fresh deterministic observation
+                # before model recovery. This is bounded and runs only on a miss.
+                if idx is None and self.exact_task_match and number not in self.exact_refresh_steps:
+                    self.exact_refresh_steps.add(number)
+                    self.log(f"[RECOVERY] Exact stored step {number}: refresh live UI once before model recovery.")
+                    self.page = None
+                    page = self.observe()
+                    idx = target_index(step.get("target", {}), page)
+                    if idx is not None:
+                        self.log(f"[RECOVERY] Exact stored target found after refresh at index={idx}; model call skipped.")
                 # If target is missing or screen differs from expected source, check if the screen is already at a further stored step
                 if idx is None or (step_role(step) == "navigation" and step.get("source") and screen_score(step.get("source", {}), page) < 0.60):
                     fast_forward_idx = None
@@ -785,7 +1165,7 @@ class ReplayEngine:
                             if p_role not in {"navigation", "input"}:
                                 intervening_safe = False
                                 break
-                            if p_role == "input" and not (p_val and values_present([p_val], page)):
+                            if p_role == "input" and not (p_val and input_value_present(p_val,page,prior.get("target",{}))):
                                 intervening_safe = False
                                 break
                         if not intervening_safe:
@@ -820,6 +1200,7 @@ class ReplayEngine:
                             "Return JSON with found:boolean, element_id:zero-based live index or null, x:normalized number or null, "
                             "y:normalized number or null, confidence:number, reason:concrete visible evidence. If absent return found:false.",
                             {"task":getattr(self,"current_task", ""), "stored_target":step.get("target", {}),
+                             "user_guidance":getattr(self,"user_guidance", ""),
                              "stored_step_description":step.get("description") or step.get("reasoning"),
                              "stored_page_labels":[content(e) for e in meaningful(step.get("source",{}))],
                              "live_elements":[{"index":i,"content":content(e),"type":e.get("type")} for i,e in enumerate(elements(page))]}, True)
@@ -836,9 +1217,13 @@ class ReplayEngine:
                                 valid = valid and expected_tab in proof
                             if not valid:
                                 self.log("[RECOVERY] Rejecting VLM target: it does not identify the requested tab.")
+                        if isinstance(candidate,int) and not isinstance(candidate,bool) and 0 <= candidate < len(elements(page)):
+                            valid = valid and recovered_target_valid(step.get("target",{}),elements(page)[candidate],atomic)
+                            if not valid:
+                                self.log(f"[RECOVERY] Rejected index {candidate}: label/role {content(elements(page)[candidate])!r} does not match stored target {content(step.get('target',{}))!r}.")
                         if valid and isinstance(candidate,int) and not isinstance(candidate,bool) and 0 <= candidate < len(elements(page)) and not unsuitable_target(elements(page)[candidate],atomic):
                             idx = candidate
-                        elif valid and atomic != "text" and all(isinstance(located.get(k),(int,float)) and not isinstance(located[k],bool) and math.isfinite(located[k]) and 0 <= located[k] <= 1 for k in ("x","y")) and located["y"] > .06:
+                        elif valid and not elements(page) and atomic != "text" and all(isinstance(located.get(k),(int,float)) and not isinstance(located[k],bool) and math.isfinite(located[k]) and 0 <= located[k] <= 1 for k in ("x","y")) and located["y"] > .06:
                             x,y=located["x"],located["y"]
                             visual_box=(max(0,x-.001),max(0,y-.001),min(1,x+.001),min(1,y+.001))
                         self.log(f"[RECOVERY] Visual target accepted={idx is not None or visual_box is not None}; evidence={located.get('reason','none')}.")
@@ -847,12 +1232,30 @@ class ReplayEngine:
                 if idx is None and visual_box is None:
                     self.failure = "ambiguous_target"
                     self.react_rejoin = (action, limit, number-1)
-                    self.request_assistance(getattr(self,"current_task", ""), f"Stored step {number}: {content(step.get('target', {}))}")
+                    target_label = content(step.get("target", {})) or "unlabeled control"
+                    question = (
+                        f"Stored step {number} requires the control {target_label!r}, but it was not found after "
+                        "a fresh UI parse and one visual check. What exact visible label or control should be tapped?"
+                    )
+                    first_request = number not in self.assistance_attempted_steps
+                    self.assistance_attempted_steps.add(number)
+                    previous_guidance = getattr(self,"user_guidance", "")
+                    answered = self.request_assistance(
+                        getattr(self,"current_task", ""),
+                        f"Stored step {number}: {target_label}",
+                        question,
+                    ) if first_request else False
+                    if (answered and self.exact_task_match and not self.failure.startswith("skipped")
+                            and getattr(self,"user_guidance", "") != previous_guidance):
+                        self.log(f"[REPLAY-RESUME] Guidance received for exact stored step {number}; rebind and resume the same stored plan.")
+                        rebound = self.bind_replay_text(action,getattr(self,"current_task", ""))
+                        self.page = None
+                        return self.replay(rebound,limit)
                     return False
                 command["bbox"] = visual_box or box(elements(page)[idx])
                 self.log(f"[REPLAY] Executing resolved stored target: index={idx}, bbox={command.get('bbox')}.")
             if atomic == "text":
-                text = params.get("text") or params.get("input_str")
+                text = self.explicit_text_value(content(step.get("target",{}))) or params.get("text") or params.get("input_str")
                 if not valid_value(content(step.get("target", {})), text):
                     self.failure = "missing_form_value"
                     return False
@@ -866,8 +1269,9 @@ class ReplayEngine:
             elif atomic not in ("tap", "back"):
                 self.failure = "unsupported_action"
                 return False
-            if atomic == "text" and values_present([command["input_str"]], page):
+            if atomic == "text" and input_value_present(command["input_str"],page,step.get("target",{}),idx):
                 self.log("[FORM] Recorded value already visible; skipping duplicate text entry.")
+                self.verified_existing_text.add(normalize(command["input_str"]))
                 self.metrics["already_filled"] += 1
                 cur_idx += 1
                 continue
@@ -875,6 +1279,28 @@ class ReplayEngine:
                 return False
             self.history[-1]["role"] = step_role(step)
             self.history[-1]["target"] = content(step.get("target", {}))
+            after = self.observe()
+            signature = lambda p: [(content(e),e.get("selected"),e.get("checked")) for e in meaningful(p)]
+            input_failed = atomic == "text" and not input_value_present(command["input_str"],after,step.get("target",{}),idx)
+            changed_expected = page_layout_score(step.get("source",{}),step.get("destination",{})) < .95
+            # A focus tap need not alter labels or the recorded page layout.
+            # Exempt only a proven live input followed by its stored text step.
+            focus_tap = (atomic == "tap" and idx is not None
+                         and (elements(page)[idx].get("editable") or elements(page)[idx].get("type") in {"input", "edittext"})
+                         and cur_idx + 1 < limit and seq[cur_idx + 1].get("atomic_action") == "text"
+                         and target_index(seq[cur_idx + 1].get("target", {}), after) is not None)
+            if focus_tap:
+                self.log("[REPLAY-EFFECT] Input focus tap accepted; next stored text entry must verify its value on screen.")
+            no_effect = not focus_tap and atomic in {"tap","text","long_press"} and signature(page) == signature(after) and changed_expected and page_layout_score(step.get("destination",{}),after) <= .70
+            if input_failed or no_effect:
+                self.history[-1]["status"] = "unverified"
+                self.replay_unverified = True
+                self.failure = f"uncertain: stored step {number} target={content(step.get('target',{}))!r} had no verified UI effect; text_visible={not input_failed}"
+                self.log("[REPLAY-EFFECT] " + self.failure)
+                self.react_rejoin = (action,limit,cur_idx)
+                if getattr(self,"assistance_callback",None):
+                    self.request_assistance(getattr(self,"current_task",""),self.failure)
+                return False
             cur_idx += 1
         self.log(f"[REPLAY] Finished stored step range {index+1}..{limit}; no intermediate completion judges.")
         return True
@@ -897,7 +1323,7 @@ class ReplayEngine:
         missing = []
         for f in unresolved:
             match = re.search(r"\b" + re.escape(f["label"]) + r"\s*[:=]\s*(?:\"([^\"]+)\"|([^,;\n]+))", task, re.I)
-            value = (match.group(1) or match.group(2)).strip() if match else None
+            value = self.resolve_input_parameter(f["key"],task) or ((match.group(1) or match.group(2)).strip() if match else None)
             if value and valid_value(f["key"], value):
                 self.form_values[f["key"]] = value
                 self.log(f"[FORM] {f['key']!r}: using explicit task input ({len(value)} characters).")
@@ -916,7 +1342,7 @@ class ReplayEngine:
             missing = still_missing
         if missing:
             self.log(f"[FORM] Batch-resolving {len(missing)} remaining field(s) in one text call.")
-            result = self.ask("form", FORM_PROMPT, {"task": task, "fields": [f["key"] for f in missing], "stored_values": stored, "already_resolved": self.form_values})
+            result = self.ask("form", FORM_PROMPT, {"task": task, "user_guidance":getattr(self,"user_guidance",""), "fields": [f["key"] for f in missing], "stored_values": stored, "already_resolved": self.form_values})
             values = result.get("values", {})
             if not isinstance(values, dict):
                 raise ValueError("Invalid form response")
@@ -943,7 +1369,7 @@ class ReplayEngine:
             self.log(f"[FORM] Filling {key!r} ({len(value)} characters), focus+replace enabled. No per-field model call.")
             if not self.act(command, "react"):
                 return "error"
-            if not values_present([value], self.observe()):
+            if not input_value_present(value,self.observe(),elements(page)[field["index"]]):
                 self.failure = "input_not_verified"
                 return "error"
             self.filled.add((key, value))
@@ -957,7 +1383,23 @@ class ReplayEngine:
         for entry in self.history:
             if entry.get("status") == "success" and position < len(required) and entry.get("target") == required[position]:
                 position += 1
-        return required[position:]
+        pending = required[position:]
+        typed = [normalize(h.get("params",{}).get("input_str")) for h in self.history
+                 if h.get("status") == "success" and h.get("action") == "text"]
+        for value in getattr(self, "required_text_values", []):
+            if normalize(value) not in typed and normalize(value) not in getattr(self,"verified_existing_text",set()):
+                pending.append("enter text: " + str(value))
+        city = getattr(self,"required_world_clock_city",None)
+        if city:
+            live = elements(self.observe())
+            # A visible search result or editor is not proof that the city was added.
+            search_open = any(e.get("editable") or e.get("type") in {"input","edittext"} for e in live)
+            city_visible = any(not e.get("editable") and re.search(r"(?<!\w)" + re.escape(normalize(city)) + r"(?!\w)",content(e)) for e in live)
+            labels = {content(e) for e in live}
+            world_page = "world clock" in labels and not (labels & {"add city","clear search field"})
+            if search_open or not city_visible or not world_page:
+                pending.append("verify city added to World Clock: " + str(city))
+        return pending
 
     def navigation_goal_contradicted(self, task):
         if "world clock" not in normalize(task):
@@ -1006,6 +1448,9 @@ class ReplayEngine:
         return False
 
     def verify(self, task, prefer_vision=False):
+        if getattr(self,"replay_unverified",False):
+            self.log("[VERIFY] Completion blocked: a replay action had no verified UI effect.")
+            return False
         if self.world_clock_navigation_complete(task) or self.stopwatch_reset_complete(task):
             return True
         if self.pending_operations() or self.navigation_goal_contradicted(task):
@@ -1149,13 +1594,22 @@ class ReplayEngine:
                     return False
             if atomic == "text":
                 field = normalize(result.get("field", ""))
-                value = self.form_values.get(field, result.get("input_str"))
+                value = self.resolve_input_parameter(field,task) or self.form_values.get(field, result.get("input_str"))
                 if not valid_value(field, value):
                     self.failure = "invalid_input"
                     return False
-                if (field, value) in self.filled and values_present([value], page):
-                    self.failure = "duplicate_input"
-                    return False
+                if (field, value) in self.filled and input_value_present(value,page,elements(page)[idx],idx):
+                    self.log("[TEXT] Requested value is already visible; skip repeated input and require a different next action.")
+                    self.remaining -= 1
+                    repeat_key = ("filled-input",field,normalize(value),tuple(content(e) for e in elements(page)))
+                    repeats[repeat_key] += 1
+                    if repeats[repeat_key] >= 2:
+                        self.failure = "uncertain: repeated input proposed instead of selecting the next result"
+                        self.log("[STOP] " + self.failure)
+                        return False
+                    self.failure = "uncertain: repeated input requested despite value already present"
+                    self.log("[REJOIN] Check the pending stored result before requesting another model action.")
+                    continue
                 command.update(input_str=value, replace=True)
             elif atomic == "long_press":
                 command["duration"] = min(5000, max(100, int(result.get("duration", 1000))))
@@ -1178,7 +1632,7 @@ class ReplayEngine:
             if isinstance(result.get("element_id"),int) and not isinstance(result["element_id"],bool) and 0 <= result["element_id"] < len(elements(page)):
                 self.history[-1]["target"] = content(elements(page)[result["element_id"]])
             if atomic == "text":
-                if not values_present([command["input_str"]], self.observe()):
+                if not input_value_present(command["input_str"],self.observe(),elements(page)[idx]):
                     self.failure = "input_not_verified"
                     return False
                 self.filled.add((field, command["input_str"]))
@@ -1202,6 +1656,17 @@ class ReplayEngine:
                 action, relation, limit = self.plan(task)
             else:
                 self.log("[PLAN] Forced fallback selected; stored-task matching skipped.")
+            action = self.bind_replay_text(action,task)
+            self.required_text_values = [p.get("text") or p.get("input_str")
+                for s in (action or {}).get("element_sequence",[])[:limit]
+                if s.get("atomic_action") == "text"
+                for p in [decoded(s.get("action_params"), {}) or {}]
+                if p.get("text") or p.get("input_str")]
+            self.required_world_clock_city = None
+            if "world clock" in normalize(task) and re.search(r"\badd\b",normalize(task)):
+                self.required_world_clock_city = self.explicit_text_value("City/country/region",task)
+                if not self.required_world_clock_city and self.required_text_values:
+                    self.required_world_clock_city = self.required_text_values[-1]
             self.required_operations = [content(s.get("target",{})) for s in (action or {}).get("element_sequence",[])[:limit]
                                         if content(s.get("target",{})) in {"start","stop","pause","reset","delete","save","resume"}]
             if "stopwatch" in normalize(task) and re.search(r"\bstart\b",normalize(task)) and re.search(r"\breset\b",normalize(task)):
@@ -1266,7 +1731,11 @@ class ReplayEngine:
                 # A save may have succeeded despite a changed result screen. Verify
                 # before allowing ReAct to create a duplicate item.
                 complete = self.verify(task)
-            if not complete and not self.failure.startswith("skipped"):
+            if (not complete and self.exact_task_match and self.failure == "ambiguous_target"
+                    and not self.failure.startswith("skipped")):
+                self.failure = "uncertain: exact stored step remains unresolved after bounded recovery"
+                self.log("[FALLBACK] Exact stored plan is retained; open-ended ReAct is disabled after bounded target recovery.")
+            if not complete and not self.failure.startswith("skipped") and not getattr(self,"replay_unverified",False) and not self.failure.startswith("uncertain:"):
                 if self.failure == "restart_unmatched":
                     self.react_rejoin = (action,limit,0) if action and limit else None
                     self.request_assistance(task, "Stored starting screen or target cannot be located")
@@ -1275,6 +1744,15 @@ class ReplayEngine:
                 if self.model_backend_error:
                     raise RuntimeError(f"Model request failed: {self.model_backend_error}; ReAct needs the same backend, so no duplicate request is dispatched")
                 complete = self.react(task, action)
+        except ParameterResolutionError as exc:
+            if self.failure.startswith("skipped"):
+                retained = self.matched_plan or (action,relation,limit)
+                return self._skipped_result(*retained)
+            if self.matched_plan:
+                action,relation,limit = self.matched_plan
+            self.failure = "uncertain: " + str(exc)
+            self.log(f"[PLAN-RECOVERY] Matched stored plan retained: id={(action or {}).get('action_id')}, "
+                     f"relation={relation}, steps={limit}. Full ReAct is not started without the required input.")
         except Exception as exc:
             if self.failure.startswith("skipped"):
                 return self._skipped_result(action,relation,limit)

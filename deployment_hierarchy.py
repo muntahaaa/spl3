@@ -11,6 +11,8 @@ def parse_hierarchy(xml, width, height):
         raise ValueError("Device dimensions must be positive")
     root = ElementTree.fromstring(xml)
     result = []
+    parents = {child:parent for parent in root.iter() for child in parent}
+    node_ids = {node: str(i) for i, node in enumerate(root.iter())}
     for node in root.iter("node"):
         attrs = node.attrib
         bounds = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", ""))
@@ -20,19 +22,26 @@ def parse_hierarchy(xml, width, height):
         if x2 <= x1 or y2 <= y1:
             continue
         cls = attrs.get("class", "")
-        editable = "EditText" in cls
+        editable = any(name in cls for name in ("EditText", "AutoCompleteTextView"))
         label = (attrs.get("text") or attrs.get("content-desc") or "").strip()
         resource = attrs.get("resource-id", "")
         if not label and editable:
             label = "Search" if "search" in resource.lower() else "Input field"
         if not label:
             continue
+        ancestor = node
+        clickable = attrs.get("clickable") == "true"
+        while not clickable and ancestor in parents:
+            ancestor = parents[ancestor]
+            clickable = ancestor.attrib.get("clickable") == "true"
         result.append({"ID": len(result), "content": label,
                        "bbox": [max(0,min(1,x1/width)),max(0,min(1,y1/height)),max(0,min(1,x2/width)),max(0,min(1,y2/height))],
                        "type": "input" if editable else "text", "editable": editable,
                        "resource_id": resource, "package": attrs.get("package", ""), "class": cls,
-                       "clickable": attrs.get("clickable") == "true",
+                       "control_id": node_ids[ancestor] if clickable else None,
+                       "clickable": clickable, "checked": attrs.get("checked") == "true",
                        "enabled": attrs.get("enabled", "true") == "true",
+                       "focused": attrs.get("focused") == "true",
                        "selected": attrs.get("selected") == "true"})
     return result
 
@@ -47,27 +56,32 @@ def _extract_xml(output):
 
 def capture_hierarchy(device, adb, size, track, log):
     """Return parsed elements, or [] so the caller can use OmniParser."""
-    remote = "/sdcard/codex_deployment_" + uuid.uuid4().hex + ".xml"
+    remote = "/data/local/tmp/codex_deployment_" + uuid.uuid4().hex + ".xml"
     prefix = [str(adb), "-s", str(device)]
     def run(args):
         proc = subprocess.run(prefix + args, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=15)
         if proc.returncode:
             raise RuntimeError(proc.stderr.strip() or "ADB hierarchy command failed")
+        if "could not get idle state" in proc.stderr.lower():
+            return proc.stdout + "\n" + proc.stderr
+        if proc.stderr.strip():
+            log("[HIERARCHY-ADB] " + proc.stderr.strip()[:400])
         return proc.stdout
     try:
         log("[HIERARCHY] Requesting Android UI hierarchy...")
         try:
-            xml = _extract_xml(run(["exec-out", "uiautomator", "dump", "/dev/tty"]))
-        except (RuntimeError, ValueError):
+            output = run(["shell", "uiautomator", "dump", "--compressed", remote])
+            log("[HIERARCHY-ADB] " + output.strip()[:400])
+            if "could not get idle state" in output.lower():
+                log("[HIERARCHY] UIAutomator could not obtain an idle accessibility snapshot; use OmniParser without retrying.")
+                return []
+            xml = _extract_xml(run(["exec-out", "cat", remote]))
+        finally:
             try:
-                run(["shell", "uiautomator", "dump", remote])
-                xml = _extract_xml(run(["exec-out", "cat", remote]))
-            finally:
-                try:
-                    run(["shell", "rm", remote])
-                except Exception:
-                    log("[HIERARCHY] Could not remove the temporary device XML file.")
+                run(["shell", "rm", "-f", remote])
+            except Exception as exc:
+                log(f"[HIERARCHY] Temporary XML cleanup failed: {type(exc).__name__}: {exc}")
         elements = parse_hierarchy(xml, size["width"], size["height"])
         path = Path("log/screenshots/deployment") / ("hierarchy_" + uuid.uuid4().hex + ".xml")
         path.parent.mkdir(parents=True, exist_ok=True)

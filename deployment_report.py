@@ -56,10 +56,10 @@ def stream_case_execution(cases, device, runner, update, clock=time.monotonic):
     rows = [[case["action_id"], case.get("source_task") or case.get("name") or case["action_id"], "⏳ Pending", 0.0, ""] for case in cases]
     accumulated = ""
     if not rows:
-        yield "No stored test cases available.", "", update(visible=False), [], "", "No cases to execute", [], report_summary([],True)
+        yield "No stored test cases available.", "", update(visible=False), [], "", "", "No cases to execute", [], report_summary([],True)
         return
     if not device or device == "No devices found":
-        yield "Select an ADB device before execution.", "", update(visible=False), [], "", "Device required", rows, "Select a device, then run again."
+        yield "Select an ADB device before execution.", "", update(visible=False), [], "", "", "Device required", rows, "Select a device, then run again."
         return
     for index, case in enumerate(cases):
         name = rows[index][1]
@@ -68,14 +68,14 @@ def stream_case_execution(cases, device, runner, update, clock=time.monotonic):
         started = clock()
         outcome = ""
         logs = ""
-        yield accumulated + heading, "Starting case", update(visible=False), [], "", heading, [list(row) for row in rows], report_summary(rows)
+        yield accumulated + heading, "Starting case", update(visible=False), [], "", "", heading, [list(row) for row in rows], report_summary(rows)
         try:
-            for logs,outcome,popup,table,token in runner(name,device,action_id=case["action_id"]):
+            for logs,outcome,popup,table,token,question in runner(name,device,action_id=case["action_id"]):
                 rows[index][3] = round(clock()-started,1)
                 paused = isinstance(popup,dict) and popup.get("visible") is True
                 rows[index][2] = (chr(0x23f8) + " Waiting for input") if paused else (chr(0x25b6) + " Running")
                 current = heading + " - Waiting for your input" if paused else heading
-                yield accumulated + heading + "\n" + logs, outcome, popup, table, token, current, [list(row) for row in rows], report_summary(rows)
+                yield accumulated + heading + "\n" + logs, outcome, popup, table, token, question, current, [list(row) for row in rows], report_summary(rows)
         except Exception as exc:
             outcome = json.dumps({"status":"error","message":f"{type(exc).__name__}: {exc}"})
             logs += f"\n[ERROR] {type(exc).__name__}: {exc}"
@@ -84,5 +84,5 @@ def stream_case_execution(cases, device, runner, update, clock=time.monotonic):
         rows[index][3] = round(clock()-started,1)
         rows[index][4] = message
         accumulated += heading + "\n" + logs + f"\n{rows[index][2]}: {message}\n\n"
-        yield accumulated, outcome, update(visible=False), [], "", heading + " ? " + rows[index][2], [list(row) for row in rows], report_summary(rows)
-    yield accumulated, outcome, update(visible=False), [], "", "Execution finished", rows, report_summary(rows,True)
+        yield accumulated, outcome, update(visible=False), [], "", "", heading + " ? " + rows[index][2], [list(row) for row in rows], report_summary(rows)
+    yield accumulated, outcome, update(visible=False), [], "", "", "Execution finished", rows, report_summary(rows,True)
