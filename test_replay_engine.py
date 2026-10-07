@@ -317,12 +317,14 @@ class ReplayTests(unittest.TestCase):
         b["elements"][1]["selected"] = True
         self.assertLess(screen_score(a, b), .9)
 
-    def test_same_screen_save_is_not_assumed_complete(self):
+    def test_executed_save_matching_stored_final_satisfies_threshold_policy(self):
         source = page("Save", "Contact")
         action = recording("Save contact", [step(source, source, "Save")])
         world = World([source], [{"complete": False, "confidence": .99, "evidence": "still editing"}, {"action": "done"}, {"complete": False, "confidence": .99, "evidence": "still editing"}], [action])
         result = world.engine(max_steps=2).run("Save contact")
-        self.assertFalse(result["completed"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["replayed_steps"],1)
+        self.assertEqual(world.calls,[])
 
     def test_ambiguous_screens_do_not_jump_ahead(self):
         source = page("Pictures", "Albums")
@@ -348,6 +350,24 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(result["completed"], result)
         self.assertNotIn("form", result["llm_calls"])
         self.assertEqual(world.commands, [])
+
+    def test_fast_forward_to_further_stored_step(self):
+        home = page("Home", "Clock")
+        alarm = page("Alarm", "Timer")
+        timer = page("02:00:00", "Start", "Timer")
+        running = page("01:59:59", "Pause", "Timer")
+
+        action = recording("Start timer", [
+            step(home, alarm, "Clock"),
+            step(alarm, timer, "Timer"),
+            step(timer, running, "Start")
+        ])
+
+        # Phone opens Clock and is already on Timer tab (timer screen), then runs Step 3 (Start)
+        world = World([home, timer, running], actions=[action])
+        result = world.engine().run("Start timer")
+        self.assertTrue(result["completed"], result)
+        self.assertEqual(world.home_count, 0)
 
 
 if __name__ == "__main__":

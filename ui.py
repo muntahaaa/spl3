@@ -20,6 +20,7 @@ import contextlib
 
 # pyrefly: ignore [missing-import]
 import gradio as gr
+from deployment_ui_blocks import DeploymentBlocks
 
 from data.data_storage import json2db, state2json
 from explor_human import capture_screenshot_only, single_human_explor
@@ -94,7 +95,7 @@ def _action_visibility(action: str):
     )
 
 
-def _run_high_level(task: str, device: str, force_fallback: bool = False):
+def _run_high_level(task: str, device: str, force_fallback: bool = False, action_id=None):
     """
     Generator that streams real-time log lines from run_task via log_callback.
     Yields (reasoning_text, outcome_text, popup_col_update, close_actions_df_update) tuples so the UI updates every line.
@@ -103,12 +104,19 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False):
     task   = (task or "").strip()
     device = (device or "").strip()
     if not task:
-        yield "Error: provide a task description.", "", gr.update(visible=False), []
+        yield "Error: provide a task description.", "", gr.update(visible=False), [], ""
         return
     if not device or device == "No devices found":
-        yield "Error: select a valid ADB device.", "", gr.update(visible=False), []
+        yield "Error: select a valid ADB device.", "", gr.update(visible=False), [], ""
         return
 
+    from deployment_control import Assistance, device_lock
+    control = Assistance()
+    lock = device_lock(device)
+    if not lock.acquire(blocking=False):
+        control.close()
+        yield "Device already has an active deployment.", "", gr.update(visible=False), [], ""
+        return
     log_queue: queue.Queue = queue.Queue()
     result_holder: dict = {}
     accumulated: list[str] = []
@@ -119,12 +127,15 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False):
 
     def _worker():
         try:
-            res = run_high_level_task(task=task, device=device, force_fallback=force_fallback, log_callback=_log)
+            res = run_high_level_task(task=task, device=device, force_fallback=force_fallback, log_callback=_log,
+                                      assistance_callback=control.request, action_id=action_id)
             result_holder["result"] = res
         except Exception as exc:
             _log(f"[ERROR] Deployment worker failed: {type(exc).__name__}: {exc}")
             result_holder["result"] = {"status": "error", "message": str(exc), "close_actions": []}
         finally:
+            control.close()
+            lock.release()
             log_queue.put(None)  # sentinel
 
     _log(f"[UI] Deployment queued: task={task!r}, device={device}, force fallback={force_fallback}.")
@@ -139,17 +150,18 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False):
         except queue.Empty:
             idle = time.monotonic() - last_event_at
             waiting = f"[WAIT] Background operation still running; {idle:.0f}s since the last event. Last operation: {accumulated[-1] if accumulated else 'starting worker'}"
-            yield "\n".join(accumulated + [waiting]), waiting, gr.update(visible=False), []
+            yield "\n".join(accumulated + [waiting]), ("Waiting for your input: " + str(control.pending.get("missing", "Missing element")) if control.pending else waiting), gr.update(visible=bool(control.pending)), [], control.token
             continue
         last_event_at = time.monotonic()
         if line is None:
             break
         accumulated.append(line)
-        yield "\n".join(accumulated), f"Running: {line}", gr.update(visible=False), []
+        yield "\n".join(accumulated), ("Waiting for your input: " + str(control.pending.get("missing", "Missing element")) if control.pending else f"Running: {line}"), gr.update(visible=bool(control.pending)), [], control.token
 
     # Worker done — format final outcome
     result   = result_holder.get("result", {})
-    outcome  = json.dumps({k: v for k, v in result.items() if k != "close_actions"}, ensure_ascii=False, indent=2)
+    from deployment_report import outcome_with_success_values
+    outcome = outcome_with_success_values(result, task)
     close_actions = result.get("close_actions", [])
     show_popup    = bool(close_actions)
     
@@ -161,7 +173,7 @@ def _run_high_level(task: str, device: str, force_fallback: bool = False):
         score = act.get("similarity_score") or act.get("score") or 0.65
         formatted_actions.append([act.get("action_id", ""), desc, score])
 
-    yield "\n".join(accumulated), outcome, gr.update(visible=show_popup), formatted_actions
+    yield "\n".join(accumulated), outcome, gr.update(visible=show_popup), formatted_actions, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,11 +425,17 @@ def get_high_level_actions_with_app():
                     else:
                         app_name = "App"
 
-                actions.append({
-                    "app_name": app_name,
-                    "name": action.get("name", "N/A"),
-                    "description": action.get("description", "N/A")
-                })
+                if "element_sequence" in action and isinstance(action["element_sequence"], str):
+                    try:
+                        action["element_sequence"] = json.loads(action["element_sequence"])
+                    except json.JSONDecodeError:
+                        pass
+
+                action["app_name"] = app_name
+                if not action.get("action_id"):
+                    action["action_id"] = action.get("id") or (str(record["a"].element_id) if hasattr(record["a"], "element_id") else "")
+
+                actions.append(action)
         temp_db.close()
         return actions
     except Exception as exc:
@@ -432,8 +450,8 @@ def load_and_filter_actions(search_query=""):
     
     rows = []
     for act in actions:
-        app = act["app_name"]
-        task = act["name"]
+        app = act.get("app_name", "App")
+        task = act.get("source_task") or act.get("name", "N/A")
         
         if search_query:
             if search_query not in app.lower() and search_query not in task.lower():
@@ -449,7 +467,7 @@ def load_and_filter_actions(search_query=""):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Human Explorer") as demo:
+    with DeploymentBlocks(title="Human Explorer", css="#deployment-help {position:fixed; top:15%; left:15%; width:70%; max-height:70vh; overflow:auto; z-index:1000; background:white; padding:24px; border:2px solid #777; box-shadow:0 4px 40px #555;}") as demo:
         gr.Markdown(
             "# 📱 Vision QA - Automate your testing process\n"
             "**3-step pipeline:** "
@@ -457,6 +475,23 @@ def build_ui() -> gr.Blocks:
             "② Save session to JSON → "
             "③ Push to Neo4j + Pinecone"
         )
+
+
+        assistance_token = gr.State("")
+        with gr.Column(visible=False, elem_id="deployment-help") as popup_col:
+            gr.Markdown("### Missing app or element: execution paused")
+            gr.Markdown("Review the latest deployment log. Provide guidance to continue with vision/ReAct, or skip and add a new test case.")
+            assistance_info = gr.Textbox(label="More information about the app, element or task")
+            close_actions_df = gr.Dataframe(visible=False)
+            assistance_status = gr.Textbox(label="Assistance response", interactive=False)
+            with gr.Row():
+                provide_info_btn = gr.Button("Provide information and continue")
+                skip_task_btn = gr.Button("Skip task - add a new test case")
+        from deployment_control import answer_request
+        provide_info_btn.click(lambda token,info: answer_request(token,info),
+            inputs=[assistance_token,assistance_info], outputs=[assistance_status], queue=False)
+        skip_task_btn.click(lambda token: answer_request(token,skip=True),
+            inputs=[assistance_token], outputs=[assistance_status], queue=False)
 
 
         with gr.Tabs() as tabs_container:
@@ -698,19 +733,6 @@ def build_ui() -> gr.Blocks:
                     lines=8,
                 )
 
-                # --- POPUP REDESIGN (Tab 5) ---
-                with gr.Column(visible=False) as popup_col:
-                    gr.Markdown("### ⚠️ No exact high-level match found!")
-                    gr.Markdown("Here are the closest actions from the database:")
-                    close_actions_df = gr.Dataframe(
-                        headers=["Task ID", "Task Description", "Similarity Score"],
-                        datatype=["str", "str", "number"],
-                        interactive=False,
-                    )
-                    with gr.Row():
-                        goto_explore_btn = gr.Button("Go to Exploration Tab", variant="secondary")
-                        use_fallback_btn = gr.Button("Use Fallback Mechanism (React)", variant="primary")
-
                 hl_refresh_btn.click(
                     lambda: gr.update(choices=_get_devices()),
                     outputs=[hl_device_radio],
@@ -719,25 +741,8 @@ def build_ui() -> gr.Blocks:
                 hl_run_btn.click(
                     _run_high_level,
                     inputs=[hl_task_input, hl_device_radio],
-                    outputs=[hl_reasoning, hl_outcome, popup_col, close_actions_df],
-                )
-
-                def _go_to_exploration():
-                    return gr.Tabs(selected=2), gr.update(visible=False)
-
-                goto_explore_btn.click(
-                    _go_to_exploration,
-                    outputs=[tabs_container, popup_col],
-                    queue=False,
-                )
-
-                def _run_high_level_fallback(task: str, device: str):
-                    yield from _run_high_level(task, device, force_fallback=True)
-
-                use_fallback_btn.click(
-                    _run_high_level_fallback,
-                    inputs=[hl_task_input, hl_device_radio],
-                    outputs=[hl_reasoning, hl_outcome, popup_col, close_actions_df],
+                    outputs=[hl_reasoning, hl_outcome, popup_col, close_actions_df, assistance_token],
+                    concurrency_id="deployment", concurrency_limit=1,
                 )
 
             # ── Tab 6 : High-Level Actions ────────────────────────────────────────
@@ -758,6 +763,76 @@ def build_ui() -> gr.Blocks:
                     interactive=False,
                 )
                 
+                case_choice = gr.Dropdown(label="Select stored test case", choices=[])
+                with gr.Row():
+                    run_selected_btn = gr.Button("Run selected test case")
+                    run_all_btn = gr.Button("Run all test cases")
+                    delete_case_btn = gr.Button("Delete selected test case")
+                case_status = gr.Textbox(label="Case management result", interactive=False)
+                deletion_manifest = gr.State("")
+                retry_deletion_btn = gr.Button("Retry incomplete vector cleanup")
+
+                def case_choices():
+                    actions = get_high_level_actions_with_app()
+                    choices = []
+                    for a in actions:
+                        act_id = a.get("action_id")
+                        if not act_id:
+                            continue
+                        label = a.get("source_task") or a.get("name") or act_id
+                        choices.append((label, act_id))
+                    return gr.update(choices=choices)
+
+                cases_device = gr.Radio(label="ADB device for stored test cases", choices=_get_devices())
+                cases_device_refresh = gr.Button("Refresh execution devices")
+                cases_current = gr.Textbox(label="Currently executing", interactive=False)
+                cases_results = gr.Dataframe(headers=["Case ID", "Test case", "Status", "Time (s)", "Result"],
+                    datatype=["str", "str", "str", "number", "str"], interactive=False)
+                cases_report = gr.Markdown("Run a case to see its execution report.")
+                cases_logs = gr.TextArea(label="Stored test case execution logs", lines=24, interactive=False)
+                cases_outcome = gr.TextArea(label="Current case outcome", lines=8, interactive=False)
+                cases_device_refresh.click(lambda: gr.update(choices=_get_devices()),outputs=[cases_device],queue=False)
+
+                from deployment_report import stream_case_execution
+                def run_selected(case_id, device):
+                    actions = get_high_level_actions_with_app()
+                    selected = next((a for a in actions if a.get("action_id") == case_id), None)
+                    if selected is None:
+                        yield "Select an existing stored case.", "", gr.update(visible=False), [], "", "No case selected", [], "Select a stored test case."
+                        return
+                    yield from stream_case_execution([selected],device,_run_high_level,gr.update)
+
+                def run_all(device):
+                    cases = [c for c in get_high_level_actions_with_app() if c.get("action_id")]
+                    yield from stream_case_execution(cases,device,_run_high_level,gr.update)
+
+                def delete_selected(case_id):
+                    from deployment import db, vector_db
+                    from deployment_cases import delete_case
+                    try:
+                        from deployment_control import deployment_active
+                        if deployment_active():
+                            raise RuntimeError("Wait for active deployment to finish before deleting a test case")
+                        result = delete_case(db,vector_db,case_id)
+                        return json.dumps(result,indent=2),case_choices(),load_and_filter_actions(""),result.get("cleanup_manifest", "")
+                    except Exception as exc:
+                        return f"Deletion failed: {exc}",case_choices(),load_and_filter_actions(""),""
+
+                refresh_actions_btn.click(case_choices, outputs=[case_choice],queue=False)
+                actions_tab.select(case_choices, outputs=[case_choice],queue=False)
+                execution_outputs = [cases_logs,cases_outcome,popup_col,close_actions_df,assistance_token,cases_current,cases_results,cases_report]
+                run_selected_btn.click(run_selected,inputs=[case_choice,cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
+                run_all_btn.click(run_all,inputs=[cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
+                delete_case_btn.click(delete_selected,inputs=[case_choice],outputs=[case_status,case_choice,actions_df,deletion_manifest])
+                def retry_deletion(manifest):
+                    from deployment import vector_db
+                    from deployment_cases import retry_case_cleanup
+                    try:
+                        return json.dumps(retry_case_cleanup(vector_db,manifest),indent=2)
+                    except Exception as exc:
+                        return f"Cleanup retry failed: {exc}"
+                retry_deletion_btn.click(retry_deletion,inputs=[deletion_manifest],outputs=[case_status])
+
                 search_input.change(
                     load_and_filter_actions,
                     inputs=[search_input],

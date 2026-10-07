@@ -2143,11 +2143,16 @@ def run_task(
     max_workflow_iterations: int = 10,
     log_callback=None,
     force_fallback: bool = False,
+    assistance_callback=None,
+    action_id=None,
 ) -> Dict[str, Any]:
     """
     Execute a high-level task on an Android device (Step 17).
     """
     if USE_PLAN_REUSE:
+        if assistance_callback is not None or action_id is not None:
+            return _run_verified_task(task, device, max_workflow_iterations, log_callback, force_fallback,
+                                      assistance_callback=assistance_callback, action_id=action_id)
         return _run_verified_task(task, device, max_workflow_iterations, log_callback, force_fallback)
 
     _log = log_callback or print
@@ -2214,7 +2219,7 @@ def run_task(
 
 
 
-def _run_verified_task(task, device, max_workflow_iterations=10, log_callback=None, force_fallback=False):
+def _run_verified_task(task, device, max_workflow_iterations=10, log_callback=None, force_fallback=False, assistance_callback=None, action_id=None):
     """Default deployment path; legacy workflow remains opt-in via USE_PLAN_REUSE=0."""
     from replay_engine import ReplayEngine, hydrate_actions
     from deployment_progress import run_with_progress, timeout_setting
@@ -2222,9 +2227,7 @@ def _run_verified_task(task, device, max_workflow_iterations=10, log_callback=No
     from deployment_artifacts import DeploymentImages
     run_images = DeploymentImages(_log)
     def parser_log(message):
-        prefix = "[CLIENT] Image saved ? "
-        if message.startswith(prefix):
-            run_images.track(message[len(prefix):])
+        run_images.track_parser_message(message)
         _log(message)
     state = create_execution_state(device)
     state["task"] = task
@@ -2245,12 +2248,20 @@ def _run_verified_task(task, device, max_workflow_iterations=10, log_callback=No
         page["screenshot"] = shot
         run_images.track(shot)
         _log(f"[CAPTURE] Saved screenshot: {shot}")
+        from deployment_hierarchy import capture_hierarchy
+        from tool.adb_tools import _resolve_adb
+        hierarchy = capture_hierarchy(device, _resolve_adb(), _device_size(state), run_images.track, _log)
+        useful_hierarchy = [e for e in hierarchy if e.get("type") == "input" or (e.get("bbox",[0,0,0,0])[3] > .06 and e.get("content"))]
+        if useful_hierarchy:
+            page.update(elements_data=hierarchy, hierarchy=True)
+            return page
         try:
             page["parser_attempted"] = True
             _log("[PARSER] Submitting screenshot to OmniParser; waiting for remote worker...")
             path = run_with_progress("OmniParser", lambda: omniparser_run(_img_to_b64(shot), log_callback=parser_log),
                                      timeout=timeout_setting("DEPLOYMENT_PARSER_TIMEOUT_SEC", 125), log=_log)
             if path and os.path.isfile(path):
+                run_images.track(path)
                 with open(path, encoding="utf-8") as fh:
                     data = json.load(fh)
                 if isinstance(data, list):
@@ -2331,11 +2342,23 @@ def _run_verified_task(task, device, max_workflow_iterations=10, log_callback=No
         metadata = run_with_progress("Neo4j/step metadata", lambda: db.get_replay_metadata(list(ids)),
                                      timeout=timeout_setting("DEPLOYMENT_DB_TIMEOUT_SEC", 30), log=_log) if ids else {}
         _log(f"[DATABASE] Loaded metadata for {len(metadata)} element(s); building replay catalog.")
-        return hydrate_actions(actions, metadata)
+        hydrated = hydrate_actions(actions, metadata)
+        if action_id:
+            hydrated = [a for a in hydrated if a.get("action_id") == action_id]
+            if not hydrated:
+                raise ValueError("Selected stored test case no longer exists")
+        return hydrated
 
     engine = ReplayEngine(capture, action, lambda: press_home(device), model, load,
                           max_steps=max(1, max_workflow_iterations * 3), log=log_callback or print)
+    engine.start_from_home = True
+    engine.selected_case_id = action_id
+    engine.assistance_callback = assistance_callback
     result = engine.run(task, force_fallback)
+    if result.get("completed"):
+        result["returned_home"] = bool(press_home(device))
+        _log(f"[HOME] Task completed; return Home success={result['returned_home']}.")
     result["image_cleanup"] = run_images.finish(result.get("completed") is True)
+    _log(f"[CLEANUP-SUMMARY] {result['image_cleanup']}")
     (log_callback or print)(f"Deployment result: {result['status']}; metrics={result['metrics']}")
     return result

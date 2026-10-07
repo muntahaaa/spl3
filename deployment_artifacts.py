@@ -7,7 +7,8 @@ class DeploymentImages:
     def __init__(self, log=print, workspace=None):
         root = Path(workspace or Path.cwd()).resolve()
         self.roots = [(root / "log/screenshots/deployment").resolve(),
-                      (root / "labeled_image/img").resolve()]
+                      (root / "labeled_image/img").resolve(),
+                      (root / "labeled_image/json_labeled_data").resolve()]
         self.paths = set()
         self.removed = 0
         self.errors = []
@@ -15,9 +16,19 @@ class DeploymentImages:
         self.lock = threading.Lock()
         self.log = log
 
+    def track_parser_message(self, message):
+        for prefix in ("[CLIENT] Image saved", "[CLIENT] JSON saved"):
+            if message.startswith(prefix):
+                value = message[len(prefix):].strip()
+                # Parser emits a Unicode arrow; strip the separator, not path characters.
+                value = value.lstrip(chr(0x2192) + "?->: ").strip()
+                if value:
+                    self.track(value)
+                return
+
     def track(self, value):
         path = Path(value).resolve()
-        if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"} or not any(path.is_relative_to(root) for root in self.roots):
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".json", ".xml"} or not any(path.is_relative_to(root) for root in self.roots):
             self.log(f"[CLEANUP] Ignoring image outside deployment output directories: {path}")
             return
         with self.lock:

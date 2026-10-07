@@ -29,6 +29,18 @@ class DeploymentArtifactTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.assertTrue(stored.exists())
 
+    def test_parser_unicode_arrow_tracks_image_and_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = self.image(root, "labeled_image/img/current.png")
+            data = self.image(root, "labeled_image/json_labeled_data/current.json")
+            tracker = DeploymentImages(lambda _:None,root)
+            tracker.track_parser_message("[CLIENT] Image saved " + chr(0x2192) + " " + str(image))
+            tracker.track_parser_message("[CLIENT] JSON saved  " + chr(0x2192) + " " + str(data))
+            self.assertEqual(tracker.finish(True)["deleted"],2)
+            self.assertFalse(image.exists())
+            self.assertFalse(data.exists())
+
     def test_failure_preserves_images(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -38,7 +50,7 @@ class DeploymentArtifactTests(unittest.TestCase):
             self.assertEqual(tracker.finish(False)["deleted"], 0)
             self.assertTrue(raw.exists())
 
-    def test_outside_directory_and_json_are_never_deleted(self):
+    def test_outside_directory_is_preserved_and_run_json_is_deleted(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             outside = self.image(root, "other/current.png")
@@ -48,7 +60,7 @@ class DeploymentArtifactTests(unittest.TestCase):
             tracker.track(data)
             tracker.finish(True)
             self.assertTrue(outside.exists())
-            self.assertTrue(data.exists())
+            self.assertFalse(data.exists())
 
     def test_late_parser_image_is_removed_after_success(self):
         with tempfile.TemporaryDirectory() as temp:

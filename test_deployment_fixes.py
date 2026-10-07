@@ -74,3 +74,107 @@ class DeploymentFixTests(unittest.TestCase):
         self.assertEqual([kind for kind,_,_ in world.calls],["react","react_vision"])
 
 if __name__ == "__main__": unittest.main()
+
+
+class ProgressSafetyTests(unittest.TestCase):
+    def test_identical_timer_final_screen_cannot_prove_unexecuted_operations(self):
+        world=World([page("Timer","Start")])
+        engine=world.engine()
+        engine.required_operations=["start","pause","delete"]
+        engine.react_final_screen=world.screens[0]
+        self.assertFalse(engine.check_react_progress("Start timer, stop and delete"))
+        self.assertEqual(world.calls,[])
+
+    def test_ahead_timer_screen_skips_only_tab_navigation(self):
+        home,alarm,timer,running,paused,final=page("Clock"),page("Alarm","Timer"),page("Timer","Start"),page("Timer","Pause"),page("Timer","Delete"),page("Timer","Start")
+        action=recording("Start timer, stop it and delete",[step(home,alarm,"Clock"),step(alarm,timer,"Timer"),step(timer,running,"Start"),step(running,paused,"Pause"),step(paused,final,"Delete")])
+        world=World([home,timer,running,paused,final],actions=[action])
+        result=world.engine().run(action["source_task"])
+        self.assertTrue(result["completed"],result)
+        self.assertEqual([h.get("target") for h in result["history"]],["clock","start","pause","delete"])
+        self.assertEqual(world.home_count,0)
+        self.assertEqual(world.calls,[])
+
+    def test_stopwatch_final_screen_requires_start_and_reset(self):
+        world=World([page("Stopwatch","Start","Reset")])
+        engine=world.engine()
+        engine.required_operations=["start","reset"]
+        engine.history=[{"status":"success","target":"stopwatch"}]
+        self.assertFalse(engine.verify("Start Stopwatch then reset"))
+        self.assertEqual(world.calls,[])
+
+
+class CompletionEvidenceTests(unittest.TestCase):
+    def test_world_clock_cannot_complete_on_alarm_editor(self):
+        world=World([page("1, hour","00, minute","Save","Cancel")])
+        engine=world.engine()
+        self.assertFalse(engine.verify("Go to world clock",True))
+        self.assertEqual(world.calls,[])
+
+    def test_generic_judge_proof_is_rejected(self):
+        world=World([page("World clock","London")],model=[{"complete":True,"confidence":.9,"evidence":"visible proof"}])
+        self.assertFalse(world.engine().verify("Go to world clock",True))
+
+    def test_another_selected_tab_is_not_world_clock(self):
+        screen=page("Alarm","World clock","Timer")
+        screen['elements'][0]['selected']=True
+        engine=World([screen]).engine()
+        self.assertFalse(engine.verify("Go to world clock"))
+
+
+class BackRecoveryTests(unittest.TestCase):
+    def test_missing_target_uses_back_before_retrying_stored_action(self):
+        source,final=page("World clock"),page("London")
+        action=recording("Go to world clock",[step(source,final,"World clock")])
+        world=World([page("Cancel"),source,final])
+        engine=world.engine()
+        engine.start_from_home=True
+        self.assertTrue(engine.replay(action,1))
+        self.assertEqual([c['action'] for c in world.commands],['back','tap'])
+        self.assertEqual(world.calls,[])
+
+
+class CompletionLoopTests(unittest.TestCase):
+    def test_identical_incomplete_evidence_is_judged_once(self):
+        world=World([page("World clock","London")],model=[{"complete":False,"confidence":.99,"missing":"required city"}])
+        engine=world.engine()
+        self.assertFalse(engine.verify("Open London",True))
+        self.assertFalse(engine.verify("Open London",True))
+        self.assertEqual(len(world.calls),1)
+
+    def test_done_loop_stops_without_repeated_capture_or_judge(self):
+        world=World([page("World clock","London")],model=[{"action":"done"},{"complete":False,"confidence":.99,"missing":"not complete"},{"action":"done"}])
+        result=world.engine().run("Open London",True)
+        self.assertFalse(result['completed'])
+        self.assertIn('completion_unconfirmed',result['status'])
+        self.assertEqual(world.captures,1)
+        self.assertEqual(sum(kind.startswith('judge') for kind,_,_ in world.calls),1)
+
+class StalledFinalPageTests(unittest.TestCase):
+    def test_matching_final_content_succeeds_without_model(self):
+        world=World([page("World clock","London")])
+        engine=world.engine(); engine.react_final_screen=page("World clock","London")
+        self.assertTrue(engine.settle_unchanged_screen("Open world clock","unchanged"))
+        self.assertEqual(world.calls,[])
+
+    def test_semantic_match_uses_one_text_comparison(self):
+        world=World([page("World clock","London")],model=[{"complete":True,"confidence":.95,"evidence":"London city entry visible on the World clock page; same requested result"}])
+        engine=world.engine(); engine.react_final_screen=page("World clock","London city")
+        self.assertTrue(engine.settle_unchanged_screen("Open world clock","unchanged"))
+        self.assertEqual(len(world.calls),1)
+        self.assertEqual(world.calls[0][0],"judge_stored_semantic")
+
+    def test_pending_operations_prevent_false_success(self):
+        world=World([page("Timer")]); engine=world.engine()
+        engine.react_final_screen=page("Timer"); engine.required_operations=["start","stop","delete"]
+        self.assertFalse(engine.settle_unchanged_screen("Start stop delete timer","unchanged"))
+        self.assertTrue(engine.failure.startswith("uncertain:"))
+        self.assertEqual(engine.stalled_state_report["pending_operations"],["start","stop","delete"])
+        self.assertEqual(world.calls,[])
+
+    def test_mismatch_reports_missing_content(self):
+        world=World([page("Timer")],model=[{"complete":False,"confidence":.99,"missing":"London city entry absent"}])
+        engine=world.engine(); engine.react_final_screen=page("World clock","London")
+        self.assertFalse(engine.settle_unchanged_screen("Open London","unchanged"))
+        self.assertIn("London city entry absent",engine.failure)
+        self.assertIn("london",engine.stalled_state_report["differences"]["missing"])

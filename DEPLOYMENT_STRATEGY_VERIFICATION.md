@@ -1,0 +1,13 @@
+# Deployment strategy verification
+
+Scope: deployment.py, replay_engine.py, deployment UI and dedicated deployment helper modules. Chain understanding, evolution and their service/job APIs were not edited for this implementation.
+
+Task matching precedes Home and live capture. The selected app is opened through launcher labels, swipe-up and search with bounded attempts. Accessibility XML is read over ADB without app source; labeled hierarchy elements are tried before OmniParser. A unique temporary XML file is used and removed on devices without /dev/tty support. Screenshot evidence remains available for vision.
+
+Stored actions retain their values and match live bounds. Missing targets get two bounded scroll attempts, then interactive assistance. User guidance is included in vision/ReAct prompts with current evidence/history. Skip dispatches no subsequent task actions and recommends adding a recording. Successful recovery can rejoin the remaining stored sequence. Cases start Home; successful cases issue Home again and report the command result separately.
+
+The Gradio execution tab contains an assistance overlay with information and skip choices. The stored-cases tab provides selected-case, all-case and delete controls. Combined runs are sequential, report case outcomes, and continue after failures/skips. Device locks and a shared Gradio execution concurrency group prevent concurrent UI deployments. Selected cases use IDs, preserving duplicate titles. Deletion is blocked during active deployment.
+
+Deletion uses one Neo4j write transaction, protects pages/elements referenced by other high-level cases, and removes exclusively owned graph records plus their vector IDs. Independent Pinecone cleanup failures are reported, recorded in local retry manifests, and retried through a UI control; cross-database atomicity is not claimed. Stored recording files are not deleted by this database operation. Execution screenshots, annotated images, JSON and hierarchy XML are tracked per run and deleted only after completion, including late parser outputs; failed/skipped runs retain evidence.
+
+Automated checks exercise hierarchy parsing, launcher search, explicit assistance/skip, target repair/rejection, task boundaries, shared-data deletion and vector cleanup failure reporting. Existing chain and feature regression tests are included. Real Gradio 4.25.0 UI construction succeeds with external callbacks mocked. No device was connected during verification (`adb devices` returned an empty list), so real launcher navigation and end-to-end device execution remain unverified. No production case deletion was executed.

@@ -119,11 +119,19 @@ def _call_sync(
     # Then the text prompt
     user_content.append({"type": "text", "text": user_prompt})
 
-    # Llama vision must receive output instructions in its user message too.
+    # Llama models benefit from instructions anchored at the end of the user prompt,
+    # ensuring the model maintains focus on JSON output even after lengthy screen payloads.
     selected_model = model_name or config.NVIDIA_MODEL
-    if "llama-3.2" in selected_model.casefold() and images_b64 and system_prompt:
-        user_content[-1]["text"] = system_prompt + "\n\n" + user_prompt
-        system_prompt = ""
+    if "llama" in selected_model.casefold() and system_prompt:
+        tail_instruction = (
+            f"\n\n[OUTPUT INSTRUCTION]\n{system_prompt}\n"
+            "You MUST respond ONLY with a single JSON object. "
+            "Do NOT include conversational prose, explanations, or multiple code blocks. Output raw JSON directly."
+        )
+        user_content[-1]["text"] = user_prompt + tail_instruction
+        if images_b64:
+            system_prompt = ""
+
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -184,6 +192,26 @@ def _parse_json_response(raw):
     cleaned = raw.strip()
     if not cleaned:
         raise ValueError("Model returned empty output")
+
+    # 1. If markdown code fences exist, extract the JSON object from the code fence.
+    # When the model reasons step-by-step and provides candidate/revised JSON blocks,
+    # the last valid JSON dictionary represents the concluded answer.
+    import re
+    fence_pattern = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+    matches = fence_pattern.findall(cleaned)
+    if matches:
+        for block in reversed(matches):
+            b_strip = block.strip()
+            start = b_strip.find("{")
+            if start >= 0:
+                try:
+                    val, _ = json.JSONDecoder().raw_decode(b_strip[start:])
+                    if isinstance(val, dict):
+                        return val
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+    # 2. Direct JSON or JSON surrounded by prose without code fences.
     start = cleaned.find("{")
     if start < 0:
         raise ValueError("Model response contains no JSON object")
@@ -193,7 +221,10 @@ def _parse_json_response(raw):
     trailing = cleaned[start + end:]
     while "{" in trailing:
         extra_start = trailing.index("{")
-        extra, extra_end = json.JSONDecoder().raw_decode(trailing[extra_start:])
+        try:
+            extra, extra_end = json.JSONDecoder().raw_decode(trailing[extra_start:])
+        except json.JSONDecodeError:
+            break
         if extra != value:
             raise ValueError("Model response contains conflicting JSON objects")
         trailing = trailing[extra_start + extra_end:]

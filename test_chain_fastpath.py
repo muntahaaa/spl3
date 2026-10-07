@@ -19,7 +19,7 @@ class ChainFastPathTests(unittest.TestCase):
             factory = Mock()
             exec(compile(ast.Module(body=[assign], type_ignores=[]), filename, 'exec'), {'NvidiaBridge': factory, 'os': os, 'config': SimpleNamespace(NVIDIA_MODEL='configured-model')})
             self.assertEqual(factory.call_args.kwargs['reasoning_effort'], 'low')
-            self.assertEqual(factory.call_args.kwargs['max_tokens_json'], 1536)
+            self.assertEqual(factory.call_args.kwargs['max_tokens_json'], 3072 if filename == 'chain_evolve.py' else 1536)
 
     def merge(self, first, second):
         bridge = SimpleNamespace(call_text=AsyncMock(return_value='Merged exact labels and values'))
@@ -139,3 +139,11 @@ class TripletRecoveryTests(unittest.TestCase):
         with patch('builtins.print'), self.assertRaisesRegex(ValueError, 'truncated'):
             ns['_call_sync'](system_prompt='s', user_prompt='u', images_b64=[], max_tokens=1536, stream=True)
         stream.close.assert_called_once()
+
+class EvolveDescriptionTests(unittest.TestCase):
+    def test_generation_describes_each_page_and_element_without_numeric_identity(self):
+        tree=ast.parse(Path("chain_evolve.py").read_text(encoding="utf-8"))
+        assign=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="_GEN_SYSTEM" for t in n.targets))
+        prompt=ast.literal_eval(assign.value)
+        for text in ("step_descriptions", "source_page_description", "element_description", "target_page_description", "not numeric values", "Ground all statements"):
+            self.assertIn(text,prompt)

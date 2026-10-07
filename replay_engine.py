@@ -105,6 +105,36 @@ def screen_score(expected, live):
     return dice * (.95 + .05 * layout)
 
 
+def page_layout_score(expected, live):
+    """Final-page identity from structure and stable controls, not their values."""
+    if not compatible_apps(expected, live):
+        return 0.0
+    tabs = {"alarm", "world clock", "stopwatch", "timer", "pictures", "albums"}
+    selected = lambda page: {content(e) for e in meaningful(page) if e.get("selected") and content(e) in tabs}
+    a_selected, b_selected = selected(expected), selected(live)
+    if a_selected and b_selected and a_selected.isdisjoint(b_selected):
+        return 0.0
+    def structural(page):
+        result = copy.deepcopy(page)
+        entries = []
+        for e in meaningful(page):
+            if e.get("type") == "empty" or content(e) == "empty space":
+                continue
+            item = copy.deepcopy(e)
+            label = re.sub(r"\d+(?:[.:]\d+)*", "value", content(e))
+            label = re.sub(r"\b(?:am|pm)\b", "period", label)
+            item["content"] = label
+            item["type"] = "input" if e.get("editable") or e.get("type") in {"input","edittext"} else "control"
+            item["selected"] = bool(e.get("selected"))
+            entries.append(item)
+        result["elements"] = entries
+        result.pop("elements_data",None)
+        return result
+    # Stable anchors and relative positions identify the page. Numeric tokens
+    # become structural placeholders, preserving clock/readout locations.
+    return screen_score(structural(expected),structural(live))
+
+
 def screen_difference(expected, live):
     expected_texts = Counter(content(e) for e in meaningful(expected))
     live_texts = Counter(content(e) for e in meaningful(live))
@@ -118,7 +148,13 @@ def target_index(target, live):
     for i, e in enumerate(elements(live)):
         if not box(e) or not content(target) or not content(e):
             continue
-        if target.get("type") and e.get("type") and target["type"] != e["type"]:
+        target_id = target.get("resource_id") or target.get("resource-id")
+        live_id = e.get("resource_id") or e.get("resource-id")
+        if target_id and live_id and target_id == live_id:
+            scores.append((2.0, i))
+            continue
+        # Hierarchy and image-parser type names differ; label identity is primary.
+        if target.get("type") == "input" and e.get("type") not in {"input", "edittext"}:
             continue
         ratio = difflib.SequenceMatcher(None, content(target), content(e)).ratio()
         if ratio < .93:
@@ -134,7 +170,7 @@ def target_index(target, live):
     return scores[0][1]
 
 
-NAVIGATION = {"clock", "gallery", "contacts", "notes", "pictures", "picture", "albums", "album", "world clock", "alarm", "alarms", "settings", "apps", "home", "back"}
+NAVIGATION = {"clock", "gallery", "contacts", "notes", "pictures", "picture", "albums", "album", "world clock", "timer", "alarm", "alarms", "settings", "apps", "home", "back"}
 COMMIT = {"save", "done", "create", "add contact", "delete", "send", "confirm", "ok"}
 
 
@@ -151,7 +187,11 @@ def step_role(step):
     opens_editor = bool(destination_labels & {"hour", "minute", "am", "pm", "set alarm", "first name", "phone", "title"}) and not bool(source_labels & {"hour", "minute", "am", "pm", "set alarm", "first name", "phone", "title"})
     if action == "tap" and label in {"add", "+", "new", "new alarm", "new contact", "new note"} and opens_editor:
         return "navigation"
-    if action == "tap" and label in NAVIGATION:
+    if action == "tap" and (label in NAVIGATION or any(n in label for n in NAVIGATION)):
+        return "navigation"
+    source_app = step.get("source", {}).get("app_name")
+    dest_app = step.get("destination", {}).get("app_name")
+    if dest_app and (not source_app or source_app in ("home", "launcher", "android") or source_app != dest_app):
         return "navigation"
     return "interaction"
 
@@ -261,7 +301,7 @@ def unsuitable_target(element, atomic="tap"):
     return (not bounds or (max(bounds) <= 1 and bounds[3] <= .06)
             or normalize(element.get("type")) == "empty"
             or content(element) == "empty space"
-            or element.get("interactable") is False)
+            or element.get("interactable") is False or element.get("enabled") is False)
 
 
 def repair_step_target(step):
@@ -369,9 +409,9 @@ navigation into Clock. For a changed alarm time stop before choosing old values.
 Never reuse a save/delete/create operation for a different task. No related action:
 action_id null, relation none. Choose only supplied IDs. JSON only.'''
 REACT_PROMPT = '''Operate the smartphone toward the task using one atomic action.
-Return JSON {"action":"tap|text|swipe|long_press|back|done|need_vision",
-"element_id":0,"input_str":"","field":"field label","direction":"up",
-"reason":"brief evidence"}. element_id is the supplied zero-based INDEX.
+Return a JSON object with action (tap, text, swipe, long_press, back, done or need_vision),
+element_id (supplied zero-based INDEX), and reason (concrete task-specific visible evidence).
+For text include input_str and field; for swipe include direction. Do not return placeholder reasons.
 Use done only with visible evidence of the whole goal, including saving forms.
 Use need_vision when the parsed screen is insufficient. Do not repeat successful
 creation/save actions. For text choose the actual input field and its field label;
@@ -382,8 +422,9 @@ Priority: explicit values in CURRENT TASK, then relevant STORED VALUES, then gen
 random but plausible synthetic data for missing fields. Use printable ASCII, single-line values for the ADB input transport. Use valid email/phone formats.
 Only return the requested field keys. Keep the same person's information consistent.
 For a note provide a meaningful title and body. Never replace explicit user values.'''
-JUDGE_PROMPT = '''Verify the WHOLE smartphone task from current evidence. Return JSON
-{"complete":true,"confidence":0.9,"evidence":"visible proof","missing":""}.
+JUDGE_PROMPT = '''Verify the WHOLE smartphone task from current evidence. Return a JSON object with complete (boolean), confidence (number from 0 to 1),
+evidence (concrete visible proof) and missing (unfinished requirements). Assess the evidence; do not copy a template.
+Provide concrete visible task-specific evidence. Never copy example values or use generic visible proof.
 If parsed evidence is insufficient, return need_vision:true with low confidence.
 An open form, a successful ADB command, or a prior save attempt alone is not proof
 of saving. Check requested parameter values exactly, including AM/PM.'''
@@ -487,6 +528,8 @@ class ReplayEngine:
         try:
             self.actions = hydrate_actions(self.load_fn(), {})
         except Exception as exc:
+            if getattr(self,"selected_case_id",None):
+                raise
             self.log(f"Stored actions unavailable; using ReAct: {exc}")
             self.metrics["retrieval_errors"] += 1
             self.actions = []
@@ -590,7 +633,10 @@ class ReplayEngine:
                 role = step_role(prior)
                 params = decoded(prior.get("action_params"), {}) or {}
                 value = params.get("text") or params.get("input_str")
-                if role != "navigation" and not (role == "input" and value and values_present([value], page)):
+                if role == "commit":
+                    safe = False
+                    break
+                if role == "input" and not (value and values_present([value], page)):
                     safe = False
                     break
             if not safe:
@@ -606,7 +652,7 @@ class ReplayEngine:
         if 0 < limit <= len(seq) and (limit < len(seq) or self.prefix_goal_screen is not None) and all(step_role(s) == "navigation" for s in seq[:limit]):
             score = screen_score(seq[limit-1].get("destination", {}), page)
             self.log(f"[ALIGN] Navigation destination: similarity={score:.3f}.")
-            if score >= .90:
+            if score > .70 and not self.pending_operations() and not self.navigation_goal_contradicted(getattr(self,"current_task","")):
                 candidates.append((score, limit))
         candidates.sort(reverse=True)
         if not candidates or (len(candidates) > 1 and candidates[0][0] - candidates[1][0] < .06):
@@ -615,9 +661,86 @@ class ReplayEngine:
         self.log(f"[ALIGN] Accepted stored position {candidates[0][1]+1}, score={candidates[0][0]:.3f}.")
         return candidates[0][1]
 
+    def request_assistance(self, task, missing):
+        callback = getattr(self, "assistance_callback", None)
+        if callback is None:
+            return True  # Noninteractive callers retain ordinary ReAct fallback.
+        self.log(f"[ASSISTANCE] Waiting for user: {missing}. No further device actions until answered.")
+        answer = callback({"task": task, "missing": missing, "history": self.history[-8:]})
+        if not answer or answer.get("skip"):
+            self.failure = "skipped: add a new test case for this workflow"
+            return False
+        self.user_guidance = answer.get("info", "")
+        self.react_use_vision = True
+        return True
+
+    def open_app(self, app, task):
+        if not app:
+            return True
+        label = normalize(app)
+        for attempt in range(3):
+            page = self.observe()
+            targets = [i for i,e in enumerate(elements(page)) if content(e) == label and not unsuitable_target(e)]
+            if len(targets) == 1:
+                return self.act({"action":"tap", "bbox":box(elements(page)[targets[0]])}, "launcher")
+            searches = [e for e in elements(page) if ("search" in content(e) or "search" in normalize(e.get("resource_id"))) and not unsuitable_target(e)]
+            if searches:
+                field = searches[0]
+                if not self.act({"action":"tap","bbox":box(field)}, "launcher"):
+                    break
+                current = self.observe()
+                fields = [e for e in elements(current) if e.get("type") == "input" and not unsuitable_target(e)]
+                target = fields[0] if fields else field
+                if not self.act({"action":"text","bbox":box(target),"input_str":app,"replace":True}, "launcher"):
+                    break
+            elif attempt == 0:
+                if not self.act({"action":"swipe","direction":"up"}, "launcher"):
+                    break
+            else:
+                break
+        self.app_needs_react = True
+        return self.request_assistance(task, f"App {app!r} was not found on Home or launcher search")
+
+    def recover_missing_tab(self, target, app):
+        """Bounded tab recovery: Back, Home, launcher swipe, reopen app."""
+        self.log("[RECOVERY] Tab missing: try Back first.")
+        if self.act({"action":"back"},"recovery"):
+            idx = target_index(target,self.observe())
+            if idx is not None:
+                return idx
+        self.log("[RECOVERY] Tab still missing: return Home and try the app icon first.")
+        if not app or self.remaining <= 0 or not self.home_fn():
+            return None
+        self.metrics["home_attempts"] += 1
+        self.page = None
+        home = self.observe()
+        icons = [e for e in elements(home) if content(e) == normalize(app) and not unsuitable_target(e)]
+        if len(icons) == 1:
+            if not self.act({"action":"tap","bbox":box(icons[0])},"launcher"):
+                return None
+            return target_index(target,self.observe())
+        self.log("[RECOVERY] Last resort: swipe up, tap launcher search, type app name, open matching result.")
+        if not self.act({"action":"swipe","direction":"up"},"recovery"):
+            return None
+        drawer = self.observe()
+        searches = [e for e in elements(drawer) if ("search" in content(e) or "search" in normalize(e.get("resource_id"))) and not unsuitable_target(e)]
+        if not searches or not self.act({"action":"tap","bbox":box(searches[0])},"launcher"):
+            return None
+        current = self.observe()
+        fields = [e for e in elements(current) if e.get("type") == "input" and not unsuitable_target(e)]
+        if not fields or not self.act({"action":"text","bbox":box(fields[0]),"input_str":app,"replace":True},"launcher"):
+            return None
+        results = [e for e in elements(self.observe()) if content(e) == normalize(app) and e.get("type") != "input" and not unsuitable_target(e)]
+        if len(results) != 1 or not self.act({"action":"tap","bbox":box(results[0])},"launcher"):
+            return None
+        return target_index(target,self.observe())
+
     def replay(self, action, limit):
         seq = action["element_sequence"]
         index = self.align(seq, limit)
+        if index is None and getattr(self, "start_from_home", False):
+            index = 0
+            self.log("[RECOVERY] Already started from Home; locate pending stored target in the current app instead of restarting.")
         if index is None:
             self.log("[RECOVERY] Live screen did not match safely. Sending ADB Home, then checking stored step 1.")
             self.metrics["home_attempts"] += 1
@@ -635,7 +758,10 @@ class ReplayEngine:
             index = 0
         self.resume_index = index + 1
         self.log(f"Replay starts at stored step {index+1}")
-        for number, step in enumerate(seq[index:limit], start=index+1):
+        cur_idx = index
+        while cur_idx < limit:
+            step = seq[cur_idx]
+            number = cur_idx + 1
             self.log(f"[REPLAY] Stored step {number}/{limit}: {step.get('atomic_action')} target={content(step.get('target', {}))!r}; remaining task uses stored instructions.")
             atomic = step.get("atomic_action")
             # Initial alignment chooses the start. During replay only resolve the
@@ -646,12 +772,85 @@ class ReplayEngine:
             command = {"action": atomic}
             if atomic in ("tap", "long_press", "text"):
                 idx = target_index(step.get("target", {}), page)
+                # If target is missing or screen differs from expected source, check if the screen is already at a further stored step
+                if idx is None or (step_role(step) == "navigation" and step.get("source") and screen_score(step.get("source", {}), page) < 0.60):
+                    fast_forward_idx = None
+                    for f_idx in range(cur_idx + 1, limit):
+                        f_step = seq[f_idx]
+                        intervening_safe = True
+                        for prior in seq[cur_idx:f_idx]:
+                            p_role = step_role(prior)
+                            p_params = decoded(prior.get("action_params"), {}) or {}
+                            p_val = p_params.get("text") or p_params.get("input_str")
+                            if p_role not in {"navigation", "input"}:
+                                intervening_safe = False
+                                break
+                            if p_role == "input" and not (p_val and values_present([p_val], page)):
+                                intervening_safe = False
+                                break
+                        if not intervening_safe:
+                            break
+                        f_score, f_accepted, f_basis = replay_source_match(f_step, page)
+                        if f_accepted:
+                            fast_forward_idx = f_idx
+                            self.log(f"[REPLAY] Live screen matches further stored step {f_idx+1} ({f_basis}, similarity={f_score:.3f}). Fast-forwarding replay from step {number} to {f_idx+1}.")
+                            break
+                    if fast_forward_idx is not None:
+                        cur_idx = fast_forward_idx
+                        step = seq[cur_idx]
+                        number = cur_idx + 1
+                        atomic = step.get("atomic_action")
+                        params = decoded(step.get("action_params"), {}) or {}
+                        command = {"action": atomic}
+                        idx = target_index(step.get("target", {}), page)
+
+                visual_box = None
+                tab_target = content(step.get("target", {})) in {"alarm","world clock","stopwatch","timer","pictures","albums"}
+                if idx is None and tab_target:
+                    idx = self.recover_missing_tab(step.get("target", {}),action.get("app_name", ""))
+                    page = self.observe()
+                    if self.failure.startswith("skipped"):
+                        return False
                 if idx is None:
-                    self.log("[REPLAY] Target missing or ambiguous in live elements; refusing to guess coordinates.")
+                    self.log(f"[RECOVERY] Locate stored target {content(step.get('target', {}))!r} on the current screenshot; no Home or blind swipe.")
+                    try:
+                        located = self.ask("recover_vision", "Locate only the intended stored element on the current smartphone screenshot. "
+                            "Use medium-depth analysis: compare its label, description, role and nearby controls, including tabs. "
+                            "UI position changes do not mean missing. Do not complete the task or choose another control. "
+                            "Return JSON with found:boolean, element_id:zero-based live index or null, x:normalized number or null, "
+                            "y:normalized number or null, confidence:number, reason:concrete visible evidence. If absent return found:false.",
+                            {"task":getattr(self,"current_task", ""), "stored_target":step.get("target", {}),
+                             "stored_step_description":step.get("description") or step.get("reasoning"),
+                             "stored_page_labels":[content(e) for e in meaningful(step.get("source",{}))],
+                             "live_elements":[{"index":i,"content":content(e),"type":e.get("type")} for i,e in enumerate(elements(page))]}, True)
+                        proof = normalize(located.get("reason", ""))
+                        confidence = float(located.get("confidence",0))
+                        valid = located.get("found") is True and .85 <= confidence <= 1 and proof not in {"", "visible proof", "visual evidence", "brief evidence"}
+                        candidate = located.get("element_id")
+                        if tab_target:
+                            expected_tab = content(step.get("target", {}))
+                            if isinstance(candidate,int) and not isinstance(candidate,bool) and 0 <= candidate < len(elements(page)):
+                                candidate_label = content(elements(page)[candidate])
+                                valid = valid and (candidate_label == expected_tab or (expected_tab in proof and candidate_label not in {"alarm","world clock","stopwatch","timer","pictures","albums"} and not re.search(r"\d",candidate_label)))
+                            else:
+                                valid = valid and expected_tab in proof
+                            if not valid:
+                                self.log("[RECOVERY] Rejecting VLM target: it does not identify the requested tab.")
+                        if valid and isinstance(candidate,int) and not isinstance(candidate,bool) and 0 <= candidate < len(elements(page)) and not unsuitable_target(elements(page)[candidate],atomic):
+                            idx = candidate
+                        elif valid and atomic != "text" and all(isinstance(located.get(k),(int,float)) and not isinstance(located[k],bool) and math.isfinite(located[k]) and 0 <= located[k] <= 1 for k in ("x","y")) and located["y"] > .06:
+                            x,y=located["x"],located["y"]
+                            visual_box=(max(0,x-.001),max(0,y-.001),min(1,x+.001),min(1,y+.001))
+                        self.log(f"[RECOVERY] Visual target accepted={idx is not None or visual_box is not None}; evidence={located.get('reason','none')}.")
+                    except Exception as exc:
+                        self.log(f"[RECOVERY] Visual location failed: {type(exc).__name__}: {exc}")
+                if idx is None and visual_box is None:
                     self.failure = "ambiguous_target"
+                    self.react_rejoin = (action, limit, number-1)
+                    self.request_assistance(getattr(self,"current_task", ""), f"Stored step {number}: {content(step.get('target', {}))}")
                     return False
-                self.log(f"[REPLAY] Target matched to live element index={idx}, bbox={box(elements(page)[idx])}. No model call.")
-                command["bbox"] = box(elements(page)[idx])
+                command["bbox"] = visual_box or box(elements(page)[idx])
+                self.log(f"[REPLAY] Executing resolved stored target: index={idx}, bbox={command.get('bbox')}.")
             if atomic == "text":
                 text = params.get("text") or params.get("input_str")
                 if not valid_value(content(step.get("target", {})), text):
@@ -670,12 +869,13 @@ class ReplayEngine:
             if atomic == "text" and values_present([command["input_str"]], page):
                 self.log("[FORM] Recorded value already visible; skipping duplicate text entry.")
                 self.metrics["already_filled"] += 1
+                cur_idx += 1
                 continue
             if not self.act(command, "replayed"):
                 return False
             self.history[-1]["role"] = step_role(step)
-            # Completion is checked once after the full stored sequence. The
-            # next target-based action will request a fresh observation as needed.
+            self.history[-1]["target"] = content(step.get("target", {}))
+            cur_idx += 1
         self.log(f"[REPLAY] Finished stored step range {index+1}..{limit}; no intermediate completion judges.")
         return True
 
@@ -751,22 +951,92 @@ class ReplayEngine:
             return "filled"
         return "none"
 
+    def pending_operations(self):
+        required = getattr(self, "required_operations", [])
+        position = 0
+        for entry in self.history:
+            if entry.get("status") == "success" and position < len(required) and entry.get("target") == required[position]:
+                position += 1
+        return required[position:]
+
+    def navigation_goal_contradicted(self, task):
+        if "world clock" not in normalize(task):
+            return False
+        labels = [content(e) for e in meaningful(self.observe())]
+        selected = {content(e) for e in meaningful(self.observe()) if e.get("selected")}
+        contradicted = (any("hour" in label for label in labels) and any("minute" in label for label in labels)) or (bool(selected & {"alarm", "stopwatch", "timer"}) and "world clock" not in selected)
+        if contradicted:
+            self.log("[VERIFY] Visible alarm editor or selected tab contradicts the World clock goal.")
+        return bool(contradicted)
+
+    def world_clock_navigation_complete(self, task):
+        # Only the destination-only goal; city/time modification needs its own proof.
+        intent = navigation_intent(task)
+        if intent != navigation_intent("Go to world clock"):
+            return False
+        page = self.observe()
+        if self.pending_operations() or self.navigation_goal_contradicted(task):
+            return False
+        labels = [content(e) for e in meaningful(page)]
+        selected = {content(e) for e in meaningful(page) if e.get("selected")}
+        distinctive = ("world clock" in labels and any("local time zone" in label for label in labels)
+                       and any("hours behind" in label or "hours ahead" in label for label in labels)
+                       and any(re.search(r"\d+[.:]\d+",label) for label in labels))
+        if "world clock" in selected or distinctive:
+            self.evidence = "World Clock destination confirmed by selected tab or local time-zone and time-offset content; current clock time is dynamic."
+            self.log("[VERIFY] " + self.evidence + " No VLM call required.")
+            return True
+        return False
+
+    def stopwatch_reset_complete(self, task):
+        goal = normalize(task)
+        if "stopwatch" not in goal or not re.search(r"\breset\b",goal):
+            return False
+        page = self.observe()
+        labels = [content(e) for e in meaningful(page)]
+        selected = {content(e) for e in meaningful(page) if e.get("selected")}
+        achieved = [entry.get("target") for entry in self.history if entry.get("status") == "success"]
+        start_pos = next((i for i,label in enumerate(achieved) if label == "start"),None)
+        reset_after_start = start_pos is not None and "reset" in achieved[start_pos+1:]
+        zero = any(re.fullmatch(r"0+(?:[.:]0+)+(?:\s*seconds?)?",label) for label in labels)
+        if "stopwatch" in selected and zero and "start" in labels and not ({"stop","pause","resume"} & set(labels)) and reset_after_start and not self.pending_operations():
+            self.evidence = "Stopwatch selected, elapsed time is zero and Start is visible; successful Start then Reset actions recorded."
+            self.log("[VERIFY] " + self.evidence + " No VLM judgment required.")
+            return True
+        return False
+
     def verify(self, task, prefer_vision=False):
+        if self.world_clock_navigation_complete(task) or self.stopwatch_reset_complete(task):
+            return True
+        if self.pending_operations() or self.navigation_goal_contradicted(task):
+            self.log(f"[VERIFY] Completion blocked; outstanding stored operations={self.pending_operations()}.")
+            return False
         self.log("[VERIFY] Checking whole-task completion; save attempts alone are not proof.")
         # Completion does not need tap coordinates, parser IDs, or verbose metadata.
         compact = lambda page: [{k: e[k] for k in ("content", "text", "type", "selected", "value", "editable") if k in e} for e in meaningful(page)]
-        history = [{"action": h.get("action"), "status": h.get("status"),
+        history = [{"action": h.get("action"), "target": h.get("target"), "status": h.get("status"),
                     "input_str": h.get("params", {}).get("input_str")} for h in self.history[-8:]]
         payload = {"task": task, "elements": compact(self.observe()), "history": history, "form_values": self.form_values}
+        judge_prompt = JUDGE_PROMPT
         if self.react_final_screen:
             payload["expected_final_elements"] = compact(self.react_final_screen)
+            payload["parsed_final_similarity"] = page_layout_score(self.react_final_screen,self.observe())
+            if prefer_vision:
+                judge_prompt += ("\nCompare the attached live screenshot with expected_final_elements semantically. "
+                    "The parsed similarity is inconclusive, not proof of failure. Ignore layout and harmless wording differences. "
+                    "Compare active tab and page layout only; ignore numeric values, current times, AM/PM and notification-bar values. Return semantic_similarity (number 0 to 1) "
+                    "alongside complete, confidence, evidence and missing. Complete means the requested goal and relevant stored "
+                    "final state agree; common navigation labels alone are insufficient. Explain concrete matching content or differences.")
+                self.log("[VERIFY] Parsed final similarity is at or below the threshold; requesting VLM semantic comparison of live image and stored final content.")
         if prefer_vision:
             self.log("[VERIFY] Stored JSON did not confirm completion; inspect the fresh screenshot before any further action. Skipping an extra text-only judge.")
             self.react_use_vision = True
         for vision in ((True,) if prefer_vision or not elements(self.observe()) else (False, True)):
             try:
-                result = self.ask("judge_vision" if vision else "judge_text", JUDGE_PROMPT, payload, vision)
+                result = self.ask("judge_vision" if vision else "judge_text", judge_prompt, payload, vision)
                 confidence = float(result.get("confidence", 0))
+                if "semantic_similarity" in result:
+                    self.log(f"[VERIFY] VLM semantic similarity={result.get('semantic_similarity')}; evidence={result.get('evidence','')}; differences={result.get('missing','')}.")
             except Exception as exc:
                 self.log(f"Completion evidence unavailable: {exc}")
                 continue
@@ -777,6 +1047,10 @@ class ReplayEngine:
             if math.isfinite(confidence) and .85 <= confidence <= 1:
                 if result.get("complete") is True:
                     self.evidence = str(result.get("evidence", ""))
+                    if normalize(self.evidence) in {"", "visible proof", "visual evidence", "brief evidence", "task completed", "completed"}:
+                        self.evidence = ""
+                        self.log("[VERIFY] Rejecting generic/template completion evidence.")
+                        return False
                     self.log(f"[VERIFY] Complete={bool(self.evidence)}, confidence={confidence:.3f}, evidence={self.evidence}.")
                     return bool(self.evidence)
                 self.log(f"[VERIFY] Incomplete: {result.get('missing') or result.get('evidence', 'no proof')}; confidence={confidence:.3f}.")
@@ -788,10 +1062,12 @@ class ReplayEngine:
         self.metrics["react_progress_checks"] += 1
         page = self.observe()
         self.log(f"[REACT-PROGRESS] After action #{len(self.history)}: checking the requested final goal.")
+        if self.world_clock_navigation_complete(task) or self.stopwatch_reset_complete(task):
+            return True
         if self.react_final_screen:
-            score = screen_score(self.react_final_screen, page)
-            self.log(f"[REACT-PROGRESS] Relevant stored final screen similarity={score:.3f}; required=0.90. No model call.")
-            if score >= .90:
+            score = page_layout_score(self.react_final_screen, page)
+            self.log(f"[REACT-PROGRESS] Relevant stored final page layout similarity={score:.3f}; required > 0.70. No model call.")
+            if score > .70 and not self.pending_operations() and not self.navigation_goal_contradicted(task):
                 self.evidence = "ReAct reached the requested task's stored final screen"
                 return True
             return self.verify(task, prefer_vision=True)
@@ -811,7 +1087,18 @@ class ReplayEngine:
                 if self.check_react_progress(task):
                     return True
                 continue
-            payload = {"task": task, "elements": [{**e, "index": i} for i, e in enumerate(elements(page))], "history": self.history[-8:], "form_values": self.form_values, "replay_failure": self.failure}
+            rejoin = getattr(self, "react_rejoin", None)
+            if rejoin:
+                stored, limit, index = rejoin
+                pending = stored["element_sequence"][index]
+                if target_index(pending.get("target", {}), page) is not None:
+                    self.react_rejoin = None
+                    remainder = copy.deepcopy(stored)
+                    remainder["element_sequence"] = remainder["element_sequence"][index:limit]
+                    self.log("[REJOIN] Missing target found; resume remaining stored steps without model calls.")
+                    if self.replay(remainder, len(remainder["element_sequence"])):
+                        return self.verify(task, prefer_vision=True)
+            payload = {"task": task, "user_guidance": getattr(self,"user_guidance", ""), "elements": [{**e, "index": i} for i, e in enumerate(elements(page))], "history": self.history[-8:], "form_values": self.form_values, "replay_failure": self.failure}
             vision = self.react_use_vision or not elements(page)
             try:
                 result = self.ask("react_vision" if vision else "react", REACT_PROMPT, payload, vision)
@@ -830,6 +1117,14 @@ class ReplayEngine:
                 result = self.ask("react_vision", REACT_PROMPT, payload, True)
                 vision = True
             atomic = result.get("action")
+            if normalize(result.get("reason", "")) in {"brief evidence", "visible proof", "visual evidence", "field label"}:
+                if self.world_clock_navigation_complete(task) or self.stopwatch_reset_complete(task):
+                    return True
+                self.failure = "uncertain: model returned placeholder action reasoning; no further device action dispatched"
+                self.log("[STOP] " + self.failure)
+                if getattr(self,"assistance_callback",None):
+                    self.request_assistance(task,"Model returned a template response instead of identifying the intended action; provide guidance or skip")
+                return False
             self.log(f"[REACT] Proposed action={atomic}, element index={result.get('element_id')}, reason={result.get('reason', 'not provided')}.")
             if atomic == "done":
                 if self.verify(task):
@@ -845,6 +1140,12 @@ class ReplayEngine:
                     command.update(x_relative=result["x"], y_relative=result["y"])
                 else:
                     self.failure = "invalid_react_target"
+                    if getattr(self,"assistance_callback",None):
+                        if not self.request_assistance(task,"ReAct could not locate a usable app/element target"):
+                            return False
+                        self.remaining -= 1
+                        self.react_use_vision = True
+                        continue
                     return False
             if atomic == "text":
                 field = normalize(result.get("field", ""))
@@ -874,6 +1175,8 @@ class ReplayEngine:
                 return False
             if not self.act(command, "react"):
                 return False
+            if isinstance(result.get("element_id"),int) and not isinstance(result["element_id"],bool) and 0 <= result["element_id"] < len(elements(page)):
+                self.history[-1]["target"] = content(elements(page)[result["element_id"]])
             if atomic == "text":
                 if not values_present([command["input_str"]], self.observe()):
                     self.failure = "input_not_verified"
@@ -885,15 +1188,56 @@ class ReplayEngine:
         self.failure = "budget_exhausted"
         return False
 
+    def _skipped_result(self, action, relation, limit):
+        return {"status":"skipped", "completed":False, "message":"Add a new test case for this workflow", "history":self.history,
+                "metrics":dict(self.metrics), "close_actions":[], "plan":{"action_id":(action or {}).get("action_id"),"relation":relation,"replay_prefix":limit}}
+
     def run(self, task, force_fallback=False):
         action, relation, limit = None, "none", 0
         complete = False
+        self.current_task = task
         self.log(f"[START] Task={task!r}; max actions={self.max_steps}; force ReAct={force_fallback}.")
         try:
             if not force_fallback:
                 action, relation, limit = self.plan(task)
             else:
                 self.log("[PLAN] Forced fallback selected; stored-task matching skipped.")
+            self.required_operations = [content(s.get("target",{})) for s in (action or {}).get("element_sequence",[])[:limit]
+                                        if content(s.get("target",{})) in {"start","stop","pause","reset","delete","save","resume"}]
+            if "stopwatch" in normalize(task) and re.search(r"\bstart\b",normalize(task)) and re.search(r"\breset\b",normalize(task)):
+                if "start" not in self.required_operations:
+                    self.required_operations.insert(0,"start")
+                if "reset" not in self.required_operations:
+                    self.required_operations.append("reset")
+            if getattr(self, "start_from_home", False):
+                self.log("[HOME] Starting task from Home after task matching.")
+                if not self.home_fn():
+                    raise RuntimeError("Could not start task from Home")
+                self.page = None
+                app = (action or {}).get("app_name", "")
+                if not self.open_app(app, task):
+                    raise RuntimeError(self.failure)
+                if getattr(self,"app_needs_react",False) and action and limit:
+                    self.react_rejoin = (action,limit,0)
+                    limit = 0
+                if app and action and limit:
+                    current = self.observe()
+                    first = action["element_sequence"][0]
+                    launched_step = (first.get("atomic_action") == "tap" and
+                        (content(first.get("target", {})) == normalize(app) or
+                         normalize(first.get("destination", {}).get("app_name")) == normalize(app)))
+                    source_labels = {content(e) for e in meaningful(first.get("source",{}))}
+                    if first.get("atomic_action") == "tap" and len(source_labels & {"play store","galaxy store","google","tap for weather info"}) >= 2:
+                        launched_step = True
+                    if launched_step and limit > 1 and (len(source_labels & {"play store","galaxy store","google","tap for weather info"}) >= 2 or target_index(action["element_sequence"][1].get("target", {}), current) is not None):
+                        action = copy.deepcopy(action)
+                        action["element_sequence"] = action["element_sequence"][1:]
+                        limit -= 1
+                        self.log("[LAUNCHER] App entry confirmed by the next stored target; stored app-opening step already satisfied.")
+                    elif launched_step and limit == 1 and page_layout_score(first.get("destination", {}),current) > .70 and not self.navigation_goal_contradicted(task):
+                        complete = True
+                        limit = 0
+                        self.evidence = "App opened from Home and its stored final screen verified"
             if relation == "prefix":
                 self.react_final_screen = self.prefix_goal_screen
             if relation == "equivalent" and action:
@@ -902,15 +1246,15 @@ class ReplayEngine:
                 replay_ok = self.replay(action, limit)
                 if not replay_ok:
                     self.log(f"[FALLBACK] Replay stopped: {self.failure}; preserve successful history for ReAct.")
+                    if self.failure.startswith("skipped"):
+                        return self._skipped_result(action,relation,limit)
                 if replay_ok and (relation == "prefix" or (relation == "equivalent" and limit == len(action["element_sequence"]))):
                     final = self.prefix_goal_screen if relation == "prefix" else (action.get("final_screen") or action["element_sequence"][-1].get("destination", {}))
                     # Verify only the requested goal boundary after replay.
-                    final_step = action["element_sequence"][limit-1]
-                    distinguishable = screen_score(final_step.get("source", {}), final) < .90
                     self.metrics["replay_final_checks"] += 1
-                    final_score = screen_score(final, self.observe())
-                    self.log(f"[VERIFY] Last stored step finished. ONE final-screen comparison: score={final_score:.3f}, required=0.90.")
-                    complete = distinguishable and final_score >= .90
+                    final_score = page_layout_score(final, self.observe())
+                    self.log(f"[VERIFY] Last stored step finished. ONE final-page layout comparison: score={final_score:.3f}, required > 0.70.")
+                    complete = self.world_clock_navigation_complete(task) or (final_score > .70 and not self.pending_operations() and not self.navigation_goal_contradicted(task))
                     if complete:
                         self.evidence = "Stored instructions executed and final screen verified once after the last step"
                         self.log("[VERIFY] Stored final postcondition confirmed using parsed JSON; model judge skipped.")
@@ -922,13 +1266,22 @@ class ReplayEngine:
                 # A save may have succeeded despite a changed result screen. Verify
                 # before allowing ReAct to create a duplicate item.
                 complete = self.verify(task)
-            if not complete:
+            if not complete and not self.failure.startswith("skipped"):
+                if self.failure == "restart_unmatched":
+                    self.react_rejoin = (action,limit,0) if action and limit else None
+                    self.request_assistance(task, "Stored starting screen or target cannot be located")
+                if self.failure.startswith("skipped"):
+                    return self._skipped_result(action, relation, limit)
                 if self.model_backend_error:
                     raise RuntimeError(f"Model request failed: {self.model_backend_error}; ReAct needs the same backend, so no duplicate request is dispatched")
                 complete = self.react(task, action)
         except Exception as exc:
+            if self.failure.startswith("skipped"):
+                return self._skipped_result(action,relation,limit)
             self.failure = f"error: {exc}"
             self.log(self.failure)
+        if self.failure.startswith("skipped"):
+            return self._skipped_result(action,relation,limit)
         self.log(f"[FINISH] status={'completed' if complete else self.failure or 'failed'}, replayed={self.metrics['replayed_steps']}, react={self.metrics['react_steps']}, text calls={self.metrics['text_calls']}, vision calls={self.metrics['vision_calls']}, parser calls={self.metrics['parser_calls']}; evidence={self.evidence or 'none'}.")
         return {"status": "completed" if complete else (self.failure or "failed"), "completed": complete,
                 "message": self.evidence if complete else self.failure, "completion_evidence": self.evidence,
@@ -937,4 +1290,4 @@ class ReplayEngine:
                 "resumed_step": self.resume_index, "metrics": dict(self.metrics),
                 "llm_calls": {k: v for k, v in self.metrics.items() if k in {"plan", "form", "react", "react_vision", "judge_text", "judge_vision"}},
                 "plan": {"action_id": (action or {}).get("action_id"), "relation": relation, "replay_prefix": limit},
-                "history": self.history, "close_actions": []}
+                "history": self.history, "stalled_state_report": getattr(self,"stalled_state_report",None), "close_actions": []}

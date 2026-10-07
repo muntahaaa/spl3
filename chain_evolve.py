@@ -22,7 +22,7 @@ os.environ["LANGCHAIN_PROJECT"]    = "ChainEvolve"
 db = Neo4jDatabase(config.Neo4j_URI, config.Neo4j_AUTH, database=config.Neo4j_DB)
 
 # ── NVIDIA NIM bridge (direct — no Firebase worker needed) ────────────────────
-bridge = NvidiaBridge(max_tokens_json=1536, reasoning_effort="low", stream=True,
+bridge = NvidiaBridge(max_tokens_json=3072, reasoning_effort="low", stream=True,
                       model_name=os.getenv("CHAIN_EVOLVE_MODEL", config.NVIDIA_MODEL))
 
 
@@ -92,6 +92,8 @@ def extract_element_details(chain: List[Dict[str, Any]]) -> str:
             f"  ID: {element.get('element_id', 'N/A')}\n"
             f"  Type: {element.get('element_type', 'Unknown type')}\n"
             f"  Description: {element.get('description', 'Unknown description')}\n"
+            f"  Bounds: {element.get('bounding_box', element.get('bbox', 'Not recorded'))}\n"
+            f"  Resource ID: {element.get('resource_id', 'Not recorded')}\n"
             f"  Action: {action_name}"
         )
     return "\n".join(details)
@@ -124,7 +126,15 @@ _EVAL_SYSTEM = (
     "Return ONLY a JSON object with exactly these keys:\n"
     "  is_templateable (bool), confidence_score (float 0-1), "
     "reason (str), suggested_name (str)\n"
-    "Use brief factual output, no extended reasoning. No preamble, no markdown fences."
+    "Write a moderately detailed action description and descriptions for EVERY recorded source page, target page and interacted element. "
+    "For each page use 2-3 concise sentences covering its purpose, visible stable labels, active tab if known, "
+    "main content regions and relative layout (header, center, bottom navigation). For each element use 1-2 sentences "
+    "covering its visible label, control type, supported role, relative location and neighboring controls. "
+    "Use only supplied evidence; explicitly omit or mark unknown any unsupported layout or selected state. "
+    "Avoid generic phrases such as navigation functionality. Do not identify pages or elements by numeric values, "
+    "clock times, elapsed times, dates, battery level or alarm-time readouts; describe their structural role instead. "
+    "Do not erase explicit task parameters: keep them in task metadata and parameter_fields, separate from layout descriptions. "
+    "No extended reasoning, no preamble, no markdown fences."
 )
 
 
@@ -153,8 +163,9 @@ _GEN_SYSTEM = (
     "  description (str),\n"
     "  preconditions (list[str]),\n"
     "  element_sequence (empty list; code reconstructs exact recorded actions),\n"
-    "  template_pattern (dict with: criteria, parameter_fields)\n"
-    "Use brief factual output, no extended reasoning. No preamble, no markdown fences."
+    "  template_pattern (dict with: criteria, parameter_fields),\n"
+    "  step_descriptions (list of objects: order, source_page_description, element_description, target_page_description)\n"
+    "Provide moderately elaborated descriptions for every recorded source page, target page and interacted element. Pages: 2-3 concise sentences about purpose, stable visible labels, active tab when evidenced, header, main region and bottom navigation. Elements: 1-2 sentences about visible label, control type, role, relative location and neighboring controls. Ground all statements in provided content and bounds; omit unknown details. Avoid generic navigation descriptions. Focus on structural identity, not numeric values, clock times, elapsed time, dates or notification-bar values. Preserve explicit task parameters in task metadata and parameter_fields, separate from layout descriptions. No extended reasoning, preamble or markdown fences."
 )
 
 
@@ -169,7 +180,7 @@ def _build_gen_user_prompt(
         f"Chain operations:\n{chain_operations}\n\n"
         f"Chain element details:\n{element_details}\n\n"
         f"Chain reasoning results:\n{reasoning_results}\n\n"
-        'Generate JSON using these keys: {"action_id":"high_level_action_xxx","name":"task name","description":"brief description","preconditions":[],"element_sequence":[],"template_pattern":{"criteria":{},"parameter_fields":{}}}. Fill metadata from the recorded chain; keep element_sequence empty.'
+        'Generate JSON using these keys: {"action_id":"high_level_action_xxx","name":"task name","description":"detailed grounded workflow description","preconditions":[],"element_sequence":[],"template_pattern":{"criteria":{},"parameter_fields":{}},"step_descriptions":[]}. Fill metadata from the recorded chain; keep element_sequence empty.'
     )
 
 
@@ -192,7 +203,7 @@ async def evaluate_chain_templateability(
     try:
         await wait_for_llm_slot()
         started = time.monotonic()
-        print("    [chain_evolve] Text-only templateability evaluation; reasoning=low, output cap=1536...")
+        print("    [chain_evolve] Text-only templateability evaluation; reasoning=low, output cap=3072...")
         result = await bridge.call_json(
             system_prompt=_EVAL_SYSTEM,
             user_prompt=user_prompt,
@@ -218,6 +229,7 @@ async def generate_action_node(
     Ask the model to generate a high-level action node description.
     Returns the parsed dict or None on failure.
     """
+    chain = sorted(chain, key=_source_step)
     user_prompt = _build_gen_user_prompt(
         task_description=extract_task_description(chain),
         chain_operations=format_chain_operations(chain),
@@ -228,7 +240,7 @@ async def generate_action_node(
     try:
         await wait_for_llm_slot()
         started = time.monotonic()
-        print("    [chain_evolve] Text-only action metadata generation; reasoning=low, sequence rebuilt by code...")
+        print("    [chain_evolve] Text-only action and page/element descriptions; grounded layout detail, output cap=3072; sequence rebuilt by code...")
         result = await bridge.call_json(
             system_prompt=_GEN_SYSTEM,
             user_prompt=user_prompt,
@@ -418,6 +430,19 @@ async def evolve_chain_to_action(start_page_id: str) -> Optional[str]:
         if seq is None:
             print(f"Chain not storable: {why}")
             return None
+        # Store descriptions with the replay steps without changing IDs/actions/values.
+        descriptions = action_data.get("step_descriptions", [])
+        if not isinstance(descriptions,list):
+            descriptions = []
+        by_order = {item["order"]:item for item in descriptions if isinstance(item,dict) and type(item.get("order")) is int}
+        for step in seq:
+            detail = by_order.get(step["order"],{})
+            for key in ("source_page_description","element_description","target_page_description"):
+                value = detail.get(key)
+                if isinstance(value,str) and value.strip():
+                    step[key] = value.strip()
+            if step.get("element_description"):
+                step["description"] = step["element_description"]
         action_data["element_sequence"] = seq
         action_data["action_id"] = f"high_level_action_{uuid.uuid4().hex[:8]}"
         action_data["source_task"] = extract_task_description(chain)
