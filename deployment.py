@@ -34,7 +34,6 @@ from langgraph.prebuilt import create_react_agent
 import config
 from data.State import DeploymentState, ElementMatch
 from data.graph_db import Neo4jDatabase
-from data.vector_db import VectorStore
 from tool.img_tool import *
 from tool.adb_tools import *
 from OmniParser.client import run as omniparser_run
@@ -73,7 +72,6 @@ bridge = NvidiaBridge(
 URI  = config.Neo4j_URI
 AUTH = config.Neo4j_AUTH
 db   = Neo4jDatabase(URI, AUTH, database=config.Neo4j_DB)
-vector_db = VectorStore(api_key=config.PINECONE_API_KEY)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,7 +401,7 @@ def _bbox_center_dist(b1: List[float], b2: List[float]) -> float:
     return float(((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5)
 
 
-def match_element_via_pinecone(
+def match_stored_element(
     element_id: str,
     step_info: Dict[str, Any],
     state: DeploymentState,
@@ -412,7 +410,7 @@ def match_element_via_pinecone(
 ) -> List[Dict[str, Any]]:
     """
     Element-matching strategy:
-      1. Fetch the stored Neo4j/Pinecone details (raw text & type from other_info).
+      1. Fetch the stored element details from Neo4j.
       2. Guard: if element missing everywhere, abort immediately (0 LLM calls).
       3. Fast No-LLM accept: if spatial candidate has text ratio >= TEXT_MATCH_MIN, accept directly.
       4. If strict: skip distance shortcut and semantic fallback (entry check).
@@ -426,7 +424,7 @@ def match_element_via_pinecone(
         _log("  [ACTION MATCHING] ⚠️  No screen elements or screenshot available")
         return []
 
-    # ── 1. Fetch stored details from Neo4j & Pinecone ───────────────────────────
+    # ── 1. Fetch stored details from Neo4j ──────────────────────────────────────
     stored_content = ""
     raw_content = ""
     raw_type = ""
@@ -454,33 +452,9 @@ def match_element_via_pinecone(
     elif isinstance(bbox_raw, list):
         stored_bbox = bbox_raw
 
-    # Fallback to Pinecone if needed
-    if not raw_content or not stored_type or not stored_bbox:
-        _log(f"[ACTION MATCHING] Fetching stored metadata for element {element_id[:8]} from Pinecone...")
-        try:
-            fetch_result = vector_db.index.fetch(ids=[element_id], namespace="element")
-            vec_data = (fetch_result.get("vectors") or {}).get(element_id)
-            if vec_data:
-                stored_meta = vec_data.get("metadata", {})
-                if not raw_content:
-                    raw_content = stored_meta.get("content", "")
-                if not stored_type:
-                    stored_type = stored_meta.get("type", "")
-                if not stored_bbox:
-                    bbox_raw_pc = stored_meta.get("bbox")
-                    if isinstance(bbox_raw_pc, str):
-                        try:
-                            stored_bbox = json.loads(bbox_raw_pc)
-                        except Exception:
-                            stored_bbox = None
-                    elif isinstance(bbox_raw_pc, list):
-                        stored_bbox = bbox_raw_pc
-        except Exception as exc:
-            _log(f"  [ACTION MATCHING] Pinecone fetch error: {exc}")
-
     # Guard (Step 10.2 / Fact D6)
     if not neo4j_element and not raw_content and not stored_bbox:
-        _log(f"  [ACTION MATCHING] ⚠️ Element details missing from both Neo4j and Pinecone for {element_id[:8]}. Aborting match.")
+        _log(f"  [ACTION MATCHING] ⚠️ Element details missing from Neo4j for {element_id[:8]}. Aborting match.")
         return []
 
     stored_content = neo4j_desc or raw_content
@@ -1744,12 +1718,12 @@ def execute_plan_node(state: DeploymentState) -> DeploymentState:
                 if first_tap_step:
                     first_eid = first_tap_step.get("element_id")
                     state = capture_and_parse_screen(state)
-                    m = match_element_via_pinecone(first_eid, first_tap_step, state, strict=True)
+                    m = match_stored_element(first_eid, first_tap_step, state, strict=True)
                     if not m:
                         _log("  ⚠️ Strict entry check: element not found on current screen. Pressing HOME...")
                         press_home(state["device"])
                         state = capture_and_parse_screen(state)
-                        m = match_element_via_pinecone(first_eid, first_tap_step, state, strict=True)
+                        m = match_stored_element(first_eid, first_tap_step, state, strict=True)
 
                     if not m:
                         _log("  ❌ Strict entry check failed after HOME. Degrading to ReAct for full task.")
@@ -1817,7 +1791,7 @@ def execute_plan_node(state: DeploymentState) -> DeploymentState:
                         step_ok = False
                     else:
                         state = capture_and_parse_screen(state)
-                        matches = match_element_via_pinecone(eid, step, state)
+                        matches = match_stored_element(eid, step, state)
                         if not matches:
                             _log(f"  ❌ Could not match element {eid} on screen")
                             step_ok = False
@@ -1933,14 +1907,14 @@ def match_elements_node(state: DeploymentState) -> DeploymentState:
 
 
 def execute_action_node(state: DeploymentState) -> DeploymentState:
-    """Pinecone-primary execution (legacy)."""
+    """Execute a stored action using Neo4j element metadata."""
     _log = state.get("log_callback") or print
 
     if state.get("execution_status") == "no_match":
         return state
 
     _log(f"\n{'='*60}")
-    _log("⚙️  execute_action_node (Pinecone-primary)")
+    _log("⚙️  execute_action_node (Neo4j stored metadata)")
 
     matched_action = state.get("current_action")
     if not matched_action:
@@ -1959,7 +1933,7 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
         return state
 
     action_name = matched_action.get("name", "?")
-    _log(f"🚀 Executing '{action_name}' — {len(element_sequence)} step(s) via Pinecone matching")
+    _log(f"🚀 Executing '{action_name}' — {len(element_sequence)} step(s) via stored-element matching")
     state["total_steps"] = len(element_sequence)
     state["execution_status"] = "running"
     all_steps_ok = True
@@ -1988,7 +1962,7 @@ def execute_action_node(state: DeploymentState) -> DeploymentState:
             all_steps_ok = False
             break
 
-        matches = match_element_via_pinecone(element_id, step_info, state_dict)
+        matches = match_stored_element(element_id, step_info, state_dict)
         if not matches:
             _log(f"  ❌ Step {step_idx+1}: could not identify element on screen")
             all_steps_ok = False

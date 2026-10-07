@@ -15,7 +15,7 @@ human UI-exploration sessions on Android devices.
 │  • Serialises State → ./log/json_state/state_<ts>.json        │
 ├──────────────────────────────────────────────────────────────┤
 │  STEP 3  –  Push to Databases  (Gradio "Store to DB" tab)     │
-│  • Reads JSON → Neo4j (graph) + Pinecone (vectors)            │
+│  • Reads JSON → Neo4j graph storage                           │
 ├──────────────────────────────────────────────────────────────┤
 │  STEP 4  –  Chain Processing  (Gradio tab)                    │
 │  • chain_understand: triplet reasoning + description updates  │
@@ -56,7 +56,6 @@ spl3/
 │   ├── State.py           ← TypedDict definition
 │   ├── data_storage.py    ← state2json + json2db
 │   ├── graph_db.py        ← Neo4j adapter
-│   └── vector_db.py       ← Pinecone adapter
 ├── tool/
 │   ├── adb_tools.py       ← ADB wrappers
 │   └── img_tool.py        ← element crop + feature-extraction client
@@ -82,7 +81,6 @@ spl3/
 | ADB (Android Debug Bridge) | `sudo apt install adb` / install Android SDK |
 | Android device or emulator | USB debugging enabled |
 | Neo4j (local or remote) | Free Community Edition works |
-| Pinecone account | Free tier is enough for testing |
 | Feature-extraction service | Your own CPU-based ResNet50 REST service on port 8001 |
 
 ---
@@ -103,7 +101,6 @@ pip install -r requirements.txt
 # 4. Configure credentials
 #    Open config.py and fill in:
 #      Neo4j_URI, Neo4j_AUTH
-#      PINECONE_API_KEY
 #      Feature_URI   (your ResNet50 service base URL)
 #      CHAIN_FIREBASE_URL
 #      FIREBASE_SECRET  (or service-account-based access token flow)
@@ -351,7 +348,7 @@ The file is written to `./log/json_state/state_<timestamp>.json`.
 
 ### STEP 3 – Push to databases
 
-In the Gradio **③ Store to Neo4j + Pinecone** tab:
+In the Gradio **③ Store to Neo4j** tab:
 
 1. Paste the path to your saved JSON state file
 2. Click **🚀 Store to databases**
@@ -359,7 +356,6 @@ In the Gradio **③ Store to Neo4j + Pinecone** tab:
 This reads the JSON and creates:
 - **Neo4j nodes:**  `Page`  and  `Element`
 - **Neo4j relationships:**  `(Page)-[:HAS_ELEMENT]->(Element)`  and  `(Element)-[:LEADS_TO]->(Page)`
-- **Pinecone vectors:**  ResNet50 embeddings for pages and elements
 
 ### STEP 4 – Chain processing (background jobs)
 
@@ -434,7 +430,6 @@ Run these notebooks with a **T4 GPU** enabled runtime:
 | ML Framework | Hugging Face Transformers, PyTorch |
 | Multimodal Model | Qwen2.5-VL (vision + text) |
 | UI Parser | OmniParser (YOLO + captioning) |
-| Vector Store | Pinecone |
 | Graph Database | Neo4j |
 | Task Queue | Firebase Realtime Database |
 | Device Control | Android ADB |
@@ -453,5 +448,4 @@ Run these notebooks with a **T4 GPU** enabled runtime:
 | `RuntimeError: No active session` | Call **Initialize** in the UI before starting exploration |
 | `JSON file not found` | Ensure the OmniParser output JSON exists under `./labeled_image/json_labeled_data/` |
 | Neo4j connection error | Ensure Neo4j is running and `Neo4j_URI` / `Neo4j_AUTH` in `config.py` are correct |
-| Pinecone error | Check `PINECONE_API_KEY` in `config.py` |
 | Feature service unreachable | Start your ResNet50 service and update `Feature_URI` in `config.py` |

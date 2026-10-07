@@ -21,10 +21,6 @@ Neo4j_AUTH = (
 )
 Neo4j_DB = os.getenv("NEO4J_DB", "graphdb")
 
-# ── Pinecone ──────────────────────────────────
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "vectordb")
-
 # ── Feature-extraction service (ResNet50) ─────
 # Point this at your CPU-based embedding service.
 # Example: "http://localhost:8001"

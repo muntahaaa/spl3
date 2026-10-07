@@ -5,7 +5,7 @@ Steps covered:
     ① Initialization  → device selection, task entry
     ② Exploration     → ADB actions + OmniParser parsing via client.run() after every screenshot
     ③ Save & Export   → state → JSON
-    ④ Store to DB     → JSON → Neo4j + Pinecone
+    ④ Store to DB     → JSON → Neo4j
     ⑤ Chain Processing → chain_understand / chain_evolve
 """
 
@@ -329,7 +329,7 @@ def store_to_db(json_path: str):
         return "Error: provide the JSON state file path."
     try:
         task_id = json2db(json_path.strip())
-        return f"✅ Stored to Neo4j + Pinecone.  Task ID: {task_id}"
+        return f"✅ Stored to Neo4j. Task ID: {task_id}"
     except Exception as exc:
         return f"Error: {exc}"
 
@@ -511,7 +511,7 @@ def build_ui() -> gr.Blocks:
             "**3-step pipeline:** "
             "① Explore (ADB actions + screenshots) → "
             "② Save session to JSON → "
-            "③ Push to Neo4j + Pinecone"
+            "③ Push to Neo4j"
         )
 
 
@@ -604,10 +604,9 @@ def build_ui() -> gr.Blocks:
                 stop_btn.click(stop_and_save, outputs=[logs_box], queue=False)
 
             # ── Tab 3 : Store to DB ───────────────────────────────────────────────
-            with gr.Tab("③ Store to Neo4j + Pinecone", id=3):
+            with gr.Tab("③ Store to Neo4j", id=3):
                 gr.Markdown(
-                    "Load a saved JSON state file and push all pages, elements, and "
-                    "visual embeddings to the graph and vector databases."
+                    "Load a saved JSON state file and push its pages, elements, and actions to Neo4j."
                 )
                 json_path_in = gr.Textbox(
                     label="Path to saved JSON state",
@@ -806,8 +805,6 @@ def build_ui() -> gr.Blocks:
                     run_selected_btn = gr.Button("Run selected test case")
                     delete_case_btn = gr.Button("Delete selected test case")
                 case_status = gr.Textbox(label="Case management result", interactive=False)
-                deletion_manifest = gr.State("")
-                retry_deletion_btn = gr.Button("Retry incomplete vector cleanup")
 
                 with gr.Group():
                     gr.Markdown(
@@ -860,18 +857,18 @@ def build_ui() -> gr.Blocks:
                     yield from stream_case_execution(cases,device,_run_high_level,gr.update)
 
                 def delete_selected(case_id):
-                    from deployment import db, vector_db
+                    from deployment import db
                     from deployment_cases import delete_case
                     try:
                         from deployment_control import deployment_active
                         if deployment_active():
                             raise RuntimeError("Wait for active deployment to finish before deleting a test case")
-                        result = delete_case(db,vector_db,case_id)
+                        result = delete_case(db,case_id)
                         single_update, batch_update = case_selector_updates()
-                        return json.dumps(result,indent=2),single_update,batch_update,load_and_filter_actions(""),result.get("cleanup_manifest", "")
+                        return json.dumps(result,indent=2),single_update,batch_update,load_and_filter_actions("")
                     except Exception as exc:
                         single_update, batch_update = case_selector_updates()
-                        return f"Deletion failed: {exc}",single_update,batch_update,load_and_filter_actions(""),""
+                        return f"Deletion failed: {exc}",single_update,batch_update,load_and_filter_actions("")
 
                 refresh_actions_btn.click(case_selector_updates, outputs=[case_choice,batch_case_choices],queue=False)
                 actions_tab.select(case_selector_updates, outputs=[case_choice,batch_case_choices],queue=False)
@@ -880,15 +877,7 @@ def build_ui() -> gr.Blocks:
                 run_batch_btn.click(run_selected_cases,inputs=[batch_case_choices,cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
                 select_all_cases_btn.click(select_all_stored_cases,outputs=[batch_case_choices],queue=False)
                 clear_case_selection_btn.click(lambda: gr.update(value=[]),outputs=[batch_case_choices],queue=False)
-                delete_case_btn.click(delete_selected,inputs=[case_choice],outputs=[case_status,case_choice,batch_case_choices,actions_df,deletion_manifest])
-                def retry_deletion(manifest):
-                    from deployment import vector_db
-                    from deployment_cases import retry_case_cleanup
-                    try:
-                        return json.dumps(retry_case_cleanup(vector_db,manifest),indent=2)
-                    except Exception as exc:
-                        return f"Cleanup retry failed: {exc}"
-                retry_deletion_btn.click(retry_deletion,inputs=[deletion_manifest],outputs=[case_status])
+                delete_case_btn.click(delete_selected,inputs=[case_choice],outputs=[case_status,case_choice,batch_case_choices,actions_df])
 
                 search_input.change(
                     load_and_filter_actions,

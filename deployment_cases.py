@@ -1,7 +1,5 @@
-"""Delete one stored case while protecting shared recordings; retry vector cleanup."""
+"""Delete one stored case while protecting shared Neo4j recordings."""
 import json
-import uuid
-from pathlib import Path
 
 
 def _decoded(value):
@@ -24,22 +22,7 @@ def _references(action):
     return pages,elements
 
 
-def _cleanup_vectors(vector,result):
-    from data.vector_db import NodeType
-    failed=[]
-    for key,kind in (("pages",NodeType.PAGE),("elements",NodeType.ELEMENT),("actions",NodeType.ACTION)):
-        ids=result.get(key,[])
-        if not ids: continue
-        try:
-            if vector.delete_vectors(ids,kind) is not True: failed.append(kind.value)
-        except Exception:
-            failed.append(kind.value)
-    result["vector_cleanup_failed"]=failed
-    result["status"]="incomplete" if failed else "deleted"
-    return result
-
-
-def delete_case(db,vector,case_id):
+def delete_case(db,case_id):
     if not isinstance(case_id,str) or not case_id.strip():
         raise ValueError("Select a stored test case")
     def transaction(tx):
@@ -87,33 +70,10 @@ def delete_case(db,vector,case_id):
             RETURN a.action_id AS action""",elements=sorted(removable_elements)):
             if row.get("action"): low_actions.append(row["action"])
         result={"case_id":case_id,"pages":sorted(removable_pages),"elements":sorted(removable_elements),"actions":sorted(set(low_actions+[case_id]))}
-        # Write retry intent before graph deletion. Graph transaction is atomic.
-        folder=Path("log/case_deletions");folder.mkdir(parents=True,exist_ok=True)
-        manifest=folder/(uuid.uuid4().hex+".json")
-        result.update(cleanup_manifest=str(manifest.resolve()),graph_deleted=False)
-        manifest.write_text(json.dumps(result,indent=2),encoding="utf-8")
         tx.run("MATCH (e:Element) WHERE e.element_id IN $ids DETACH DELETE e",ids=result["elements"]).consume()
         tx.run("MATCH (p:Page) WHERE p.page_id IN $ids DETACH DELETE p",ids=result["pages"]).consume()
         tx.run("MATCH (a:Action) WHERE a.action_id IN $ids DETACH DELETE a",ids=result["actions"]).consume()
+        result["status"]="deleted"
         return result
     with db.driver.session(database=db.database) as session:
-        result=session.execute_write(transaction)
-    result["graph_deleted"]=True
-    manifest=Path(result["cleanup_manifest"])
-    manifest.write_text(json.dumps(result,indent=2),encoding="utf-8")
-    _cleanup_vectors(vector,result)
-    manifest.write_text(json.dumps(result,indent=2),encoding="utf-8")
-    return result
-
-
-def retry_case_cleanup(vector,manifest):
-    root=Path("log/case_deletions").resolve()
-    path=Path(manifest).resolve()
-    if path.parent != root or path.suffix.lower() != ".json":
-        raise ValueError("Invalid case cleanup manifest")
-    result=json.loads(path.read_text(encoding="utf-8"))
-    if result.get("graph_deleted") is not True:
-        raise ValueError("Graph deletion was not confirmed; vector cleanup cannot be retried")
-    _cleanup_vectors(vector,result)
-    path.write_text(json.dumps(result,indent=2),encoding="utf-8")
-    return result
+        return session.execute_write(transaction)

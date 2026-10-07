@@ -82,12 +82,8 @@ if __name__=='__main__': unittest.main()
 
 
 class CaseDeletionTests(unittest.TestCase):
-    def test_deletion_preserves_shared_pages_elements_and_reports_vector_failures(self):
-        import json
-        import os
-        import sys
+    def test_deletion_preserves_shared_pages_and_elements(self):
         from types import SimpleNamespace
-        from unittest.mock import patch
         from deployment_cases import delete_case
         class Rows(list):
             def single(self): return self[0] if self else None
@@ -114,20 +110,10 @@ class CaseDeletionTests(unittest.TestCase):
             def __exit__(self,*args): pass
             def execute_write(self,fn): return fn(Tx())
         db=SimpleNamespace(driver=SimpleNamespace(session=lambda **kw:Session()),database="test")
-        vector_calls=[]
-        vector=SimpleNamespace(delete_vectors=lambda ids,kind: vector_calls.append((ids,kind.value)) or False)
-        kinds=SimpleNamespace(PAGE=SimpleNamespace(value="page"),ELEMENT=SimpleNamespace(value="element"),ACTION=SimpleNamespace(value="action"))
-        cwd=os.getcwd()
-        with tempfile.TemporaryDirectory() as folder,patch.dict(sys.modules,{"data.vector_db":SimpleNamespace(NodeType=kinds)}):
-            try:
-                os.chdir(folder)
-                result=delete_case(db,vector,"delete-me")
-                manifest=json.loads(Path(result['cleanup_manifest']).read_text())
-            finally:
-                os.chdir(cwd)
+        result=delete_case(db,"delete-me")
         self.assertEqual(result['pages'],['unique-page'])
         self.assertEqual(result['elements'],['unique-element'])
-        self.assertEqual(manifest['vector_cleanup_failed'],['page','element','action'])
+        self.assertEqual(result['status'],'deleted')
         for query,params in calls:
             if "DETACH DELETE" in query:
                 self.assertNotIn('shared-page',params.get('ids',[]))

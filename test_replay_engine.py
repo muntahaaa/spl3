@@ -196,6 +196,23 @@ class ReplayTests(unittest.TestCase):
         live["elements"][1]["bbox"] = live["elements"][0]["bbox"]
         self.assertIsNone(target_index(live["elements"][0], live))
 
+    def test_descriptive_add_target_matches_specific_live_add_control(self):
+        target = {
+            "content": "adding or creating a new item.",
+            "type": "icon",
+            "bbox": [.78, .06, .88, .11],
+        }
+        live = page("All alarms are off", "Add alarm", "More options")
+        live["elements"][1].update({
+            "clickable": True,
+            "resource_id": "com.sec.android.app.clockpackage:id/menu_alarm_add",
+        })
+        self.assertEqual(target_index(target, live), 1)
+
+    def test_descriptive_add_target_rejects_unrelated_controls(self):
+        target = {"content": "creating something new", "type": "icon"}
+        self.assertIsNone(target_index(target, page("More options", "Alarm")))
+
     def test_time_and_numeric_values_are_not_collapsed(self):
         self.assertFalse(values_present(["10:30 PM"], page("10:30 AM")))
         self.assertFalse(values_present(["8"], page("18")))

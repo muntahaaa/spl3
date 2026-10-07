@@ -14,8 +14,6 @@ from PIL import Image
 
 import config as config
 from data.graph_db import Neo4jDatabase
-from data.vector_db import NodeType, VectorData, VectorStore
-from tool.img_tool import element_img, extract_features
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,7 +191,7 @@ def record_action_to_state(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 3 – JSON → Neo4j + Pinecone
+#  STEP 3 – JSON → Neo4j
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def pos2id(x: int, y: int, json_path: str,
@@ -262,7 +260,7 @@ def _load_elements_for_step(step: dict) -> tuple:
 
 def json2db(json_path: str) -> str:
     """
-    Push state JSON → Neo4j + Pinecone.
+    Push state JSON → Neo4j.
     Returns task_id (MD5 of task string).
     """
     with open(json_path, "r", encoding="utf-8") as f:
@@ -277,10 +275,6 @@ def json2db(json_path: str) -> str:
     try:
         db = Neo4jDatabase(uri=config.Neo4j_URI, auth=config.Neo4j_AUTH,
                            database=config.Neo4j_DB)
-
-        vs = VectorStore(api_key=config.PINECONE_API_KEY,
-                         index_name=config.PINECONE_INDEX_NAME,
-                         dimension=2048, batch_size=10)
 
         # ══════════════════════════════════════════════════════════════════════════
         #  FIRST PASS
@@ -312,14 +306,6 @@ def json2db(json_path: str) -> str:
             pages_info.append({"page_id": page_id, "step": step_no})
 
             # ── Page vector ───────────────────────────────────────────────────────
-            if step.get("source_page"):
-                ok = _page2vector(page_id=page_id, page_path=step["source_page"],
-                                  action_type=step.get("recommended_action", ""),
-                                  step_no=step_no,
-                                  timestamp=str(step.get("timestamp", "")), vs=vs)
-                if not ok:
-                    print(f"[json2db] page vector failed for step {step_no}")
-
             # ── ALL Element nodes for this page ───────────────────────────────────
             element_id_map: Dict[int, str] = {}
 
@@ -344,23 +330,6 @@ def json2db(json_path: str) -> str:
                 }
                 db.create_element(elem_props)
                 db.add_element_to_page(page_id, elem_neo4j_id)
-
-                if elem_json_id is not None and step.get("source_page"):
-                    vec_ok = _element2vector(
-                        ID=str(elem_json_id),
-                        element_id=elem_neo4j_id,
-                        elements_json=json.dumps(elements_data),
-                        page_path=step["source_page"],
-                        vs=vs,
-                    )
-                    # BUG-4b FIX: write Pinecone vector id back to Neo4j
-                    if vec_ok:
-                        db.update_node_property(
-                            node_id=elem_neo4j_id,
-                            property_name="visual_embedding_id",
-                            property_value=elem_neo4j_id,   # Pinecone id == UUID
-                            node_type="Element",
-                        )
 
             # ── Action node ───────────────────────────────────────────────────────
             action_uuid = str(uuid4())
@@ -476,33 +445,6 @@ def json2db(json_path: str) -> str:
                 })
                 db.add_element_to_page(fp_page_id, fp_elem_id)
 
-                if fp_json_id is not None and fp.get("screenshot"):
-                    vec_ok = _element2vector(
-                        ID=str(fp_json_id),
-                        element_id=fp_elem_id,
-                        elements_json=json.dumps(fp_elements_data),
-                        page_path=fp["screenshot"],
-                        vs=vs,
-                    )
-                    # BUG-4b FIX
-                    if vec_ok:
-                        db.update_node_property(
-                            node_id=fp_elem_id,
-                            property_name="visual_embedding_id",
-                            property_value=fp_elem_id,
-                            node_type="Element",
-                        )
-
-            success = False
-            if fp.get("screenshot"):
-                success = _page2vector(
-                    page_id=fp_page_id, page_path=fp["screenshot"],
-                    action_type="task_completion", step_no=total_steps,
-                    timestamp=str(int(_time.time())), vs=vs,
-                )
-            if not success:
-                print("[json2db] Warning: final page vector storage failed")
-
         # ══════════════════════════════════════════════════════════════════════════
         #  SECOND PASS – LEADS_TO edges
         # ══════════════════════════════════════════════════════════════════════════
@@ -615,63 +557,3 @@ def _parse_element_number(recommended_action: str) -> Optional[int]:
         return None
     match = re.search(r"['\"]?element_number['\"]?\s*:\s*(\d+)", recommended_action)
     return int(match.group(1)) if match else None
-
-
-def _element2vector(ID: str, element_id: str, elements_json: str,
-                    page_path: str, vs: VectorStore) -> bool:
-    """Crop element → ResNet50 → Pinecone 'element' namespace."""
-    try:
-        page_file = _fetch_to_local(page_path, ".png")
-        if page_file is None:
-            raise FileNotFoundError(f"Screenshot unavailable: {page_path}")
-        img      = element_img(str(page_file), elements_json, int(ID))
-        features = extract_features(img, "resnet50")
-        elements = json.loads(elements_json)
-        target   = next((e for e in elements if e.get("ID") == int(ID)), None)
-        if target is None:
-            raise ValueError(f"Element ID={ID} not found in JSON")
-        vd = VectorData(
-            id=element_id,          # Pinecone id == Neo4j element_id UUID
-            values=features["features"][0],
-            metadata={
-                "original_id": str(ID),
-                "bbox":        target.get("bbox", []),
-                "type":        target.get("type", ""),
-                "content":     target.get("content", ""),
-            },
-            node_type=NodeType.ELEMENT,
-        )
-        return vs.upsert_batch([vd])
-    except Exception as exc:
-        print(f"[_element2vector] ID={ID}: {exc}")
-        return False
-
-
-def _page2vector(page_id: str, page_path: str, action_type: str,
-                 step_no: Optional[int], timestamp: str, vs: VectorStore) -> bool:
-    """Full screenshot → ResNet50 → Pinecone 'page' namespace."""
-    try:
-        if not page_path:
-            raise ValueError("page_path is empty")
-        path_obj = _fetch_to_local(page_path, ".png")
-        if path_obj is None:
-            raise FileNotFoundError(f"Screenshot not found: {page_path}")
-        features     = extract_features(str(path_obj), "resnet50")
-        feature_list = features.get("features", []) if isinstance(features, dict) else []
-        if not feature_list:
-            raise ValueError("extract_features returned no data")
-        vd = VectorData(
-            id=page_id,
-            values=feature_list[0],
-            metadata={
-                "action_type": action_type,
-                "step":        step_no,
-                "timestamp":   timestamp,
-                "source_page": str(path_obj).replace("\\", "/"),
-            },
-            node_type=NodeType.PAGE,
-        )
-        return vs.upsert_batch([vd])
-    except Exception as exc:
-        print(f"[_page2vector] {exc}")
-        return False

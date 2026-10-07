@@ -163,10 +163,15 @@ def control_role(target):
     """Use a stored role or known descriptive intent without rewriting its label."""
     role = normalize(target.get("role", ""))
     label = content(target).rstrip(" .")
-    if role in {"add", "create", "add/create"} or label in {
-        "adding a new item or creating something new",
-        "add a new item", "create a new item",
-    }:
+    words = set(re.findall(r"[a-z]+", label))
+    add_or_create = bool(words & {"add", "adding", "create", "creating", "new"})
+    generic_created_object = bool(words & {
+        "item", "alarm", "contact", "note", "event", "task", "folder", "album", "city"
+    })
+    resource_id = normalize(target.get("resource_id") or target.get("resource-id") or "")
+    if (role in {"add", "create", "add/create"}
+            or (add_or_create and generic_created_object)
+            or bool(re.search(r"(?:^|[_:/-])(?:add|create|new)(?:$|[_:/-])", resource_id))):
         return "add"
     return None
 

@@ -165,12 +165,12 @@ def insert_parsed_result(body: ParsedResultIn):
 @router.post(
     "/store_to_db",
     response_model=StoreToDbOut,
-    summary="Store a saved state JSON into Neo4j + Pinecone",
+    summary="Store a saved state JSON into Neo4j",
     tags=["Storage"],
 )
 def store_to_db(body: StoreToDbIn):
     """
-    Pushes a previously saved `state_*.json` file to Neo4j and Pinecone.
+    Pushes a previously saved `state_*.json` file to Neo4j.
     """
     json_path = body.json_path.strip()
     if not json_path:

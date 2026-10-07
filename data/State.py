@@ -15,7 +15,7 @@ class State(TypedDict):
     3. User calls POST /api/insert_parsed_result    →  current_page_json is set.
     4. Next action resolves element coords from current_page_json.
     5. On stop, state is serialised to JSON via state2json.
-    6. JSON is loaded into Neo4j + Pinecone via json2db.
+    6. JSON is loaded into Neo4j via json2db.
     """
 
     # ── task ──────────────────────────────────

@@ -82,8 +82,6 @@ class Neo4jDatabase:
         properties = dict(properties)   # don't mutate caller's dict
         properties.setdefault("timestamp", int(datetime.now().timestamp()))
 
-        if "visual_embedding_id" in properties:
-            properties["visual_embedding_id"] = str(properties["visual_embedding_id"])
         if "other_info" in properties:
             if isinstance(properties["other_info"], dict):
                 properties["other_info"] = json.dumps(properties["other_info"])
@@ -112,8 +110,6 @@ class Neo4jDatabase:
             raise ValueError(f"Missing required fields: {required_fields}")
 
         properties = dict(properties)
-        if "visual_embedding_id" in properties:
-            properties["visual_embedding_id"] = str(properties["visual_embedding_id"])
         if "other_info" in properties:
             if isinstance(properties["other_info"], dict):
                 properties["other_info"] = json.dumps(properties["other_info"])
@@ -658,28 +654,3 @@ class Neo4jDatabase:
         except Exception as exc:
             print(f"Error getting shortcuts for action '{action_id}': {exc}")
             return []
-
-    def get_page_by_visual_embedding(self, embedding_id: str) -> Optional[Dict[str, Any]]:
-        """Get Page node by visual_embedding_id, or None if not found."""
-        query = """
-        MATCH (p:Page)
-        WHERE p.visual_embedding_id = $embedding_id
-        RETURN p
-        """
-        try:
-            with self.driver.session(database=self.database) as session:
-                result = session.run(query, embedding_id=embedding_id)
-                record = result.single()
-                if record:
-                    page = dict(record["p"])
-                    for field in ("elements_data", "metadata"):
-                        if field in page and isinstance(page[field], str):
-                            try:
-                                page[field] = json.loads(page[field])
-                            except json.JSONDecodeError:
-                                pass
-                    return page
-                return None
-        except Exception as exc:
-            print(f"Error getting page by visual embedding ID {embedding_id}: {exc}")
-            return None
