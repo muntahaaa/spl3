@@ -468,6 +468,38 @@ def load_and_filter_actions(search_query=""):
     return rows
 
 
+def stored_case_choices(actions):
+    """Build stable Gradio choices from stored actions with usable IDs."""
+    choices = []
+    for action in actions or []:
+        action_id = action.get("action_id")
+        if not action_id:
+            continue
+        label = action.get("source_task") or action.get("name") or action_id
+        choices.append((str(label), str(action_id)))
+    return choices
+
+
+def select_stored_cases(actions, selected_ids):
+    """Resolve an explicit multi-case selection without silently running others."""
+    if isinstance(selected_ids, str):
+        selected_ids = [selected_ids]
+    selected_ids = selected_ids or []
+    by_id = {
+        str(action.get("action_id")): action
+        for action in (actions or [])
+        if action.get("action_id")
+    }
+    selected = []
+    seen = set()
+    for action_id in selected_ids:
+        action_id = str(action_id)
+        if action_id in by_id and action_id not in seen:
+            selected.append(by_id[action_id])
+            seen.add(action_id)
+    return selected
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Gradio layout
 # ─────────────────────────────────────────────────────────────────────────────
@@ -772,22 +804,34 @@ def build_ui() -> gr.Blocks:
                 case_choice = gr.Dropdown(label="Select stored test case", choices=[])
                 with gr.Row():
                     run_selected_btn = gr.Button("Run selected test case")
-                    run_all_btn = gr.Button("Run all test cases")
                     delete_case_btn = gr.Button("Delete selected test case")
                 case_status = gr.Textbox(label="Case management result", interactive=False)
                 deletion_manifest = gr.State("")
                 retry_deletion_btn = gr.Button("Retry incomplete vector cleanup")
 
-                def case_choices():
+                with gr.Group():
+                    gr.Markdown(
+                        "### Run multiple stored test cases\n"
+                        "Choose the cases to add to this execution. They will run one by one "
+                        "in the order shown, followed by a combined outcome report."
+                    )
+                    batch_case_choices = gr.CheckboxGroup(
+                        label="Test cases to execute",
+                        choices=[],
+                    )
+                    with gr.Row():
+                        select_all_cases_btn = gr.Button("Select all stored cases")
+                        clear_case_selection_btn = gr.Button("Clear selection")
+                        run_batch_btn = gr.Button("Run selected test cases", variant="primary")
+
+                def case_selector_updates():
                     actions = get_high_level_actions_with_app()
-                    choices = []
-                    for a in actions:
-                        act_id = a.get("action_id")
-                        if not act_id:
-                            continue
-                        label = a.get("source_task") or a.get("name") or act_id
-                        choices.append((label, act_id))
-                    return gr.update(choices=choices)
+                    choices = stored_case_choices(actions)
+                    return gr.update(choices=choices), gr.update(choices=choices, value=[])
+
+                def select_all_stored_cases():
+                    choices = stored_case_choices(get_high_level_actions_with_app())
+                    return gr.update(choices=choices, value=[action_id for _, action_id in choices])
 
                 cases_device = gr.Radio(label="ADB device for stored test cases", choices=_get_devices())
                 cases_device_refresh = gr.Button("Refresh execution devices")
@@ -808,8 +852,11 @@ def build_ui() -> gr.Blocks:
                         return
                     yield from stream_case_execution([selected],device,_run_high_level,gr.update)
 
-                def run_all(device):
-                    cases = [c for c in get_high_level_actions_with_app() if c.get("action_id")]
+                def run_selected_cases(case_ids, device):
+                    cases = select_stored_cases(get_high_level_actions_with_app(), case_ids)
+                    if not cases:
+                        yield "Select one or more stored test cases.", "", gr.update(visible=False), [], "", "", "No cases selected", [], "Select at least one test case, then run again."
+                        return
                     yield from stream_case_execution(cases,device,_run_high_level,gr.update)
 
                 def delete_selected(case_id):
@@ -820,16 +867,20 @@ def build_ui() -> gr.Blocks:
                         if deployment_active():
                             raise RuntimeError("Wait for active deployment to finish before deleting a test case")
                         result = delete_case(db,vector_db,case_id)
-                        return json.dumps(result,indent=2),case_choices(),load_and_filter_actions(""),result.get("cleanup_manifest", "")
+                        single_update, batch_update = case_selector_updates()
+                        return json.dumps(result,indent=2),single_update,batch_update,load_and_filter_actions(""),result.get("cleanup_manifest", "")
                     except Exception as exc:
-                        return f"Deletion failed: {exc}",case_choices(),load_and_filter_actions(""),""
+                        single_update, batch_update = case_selector_updates()
+                        return f"Deletion failed: {exc}",single_update,batch_update,load_and_filter_actions(""),""
 
-                refresh_actions_btn.click(case_choices, outputs=[case_choice],queue=False)
-                actions_tab.select(case_choices, outputs=[case_choice],queue=False)
+                refresh_actions_btn.click(case_selector_updates, outputs=[case_choice,batch_case_choices],queue=False)
+                actions_tab.select(case_selector_updates, outputs=[case_choice,batch_case_choices],queue=False)
                 execution_outputs = [cases_logs,cases_outcome,popup_col,close_actions_df,assistance_token,assistance_question,cases_current,cases_results,cases_report]
                 run_selected_btn.click(run_selected,inputs=[case_choice,cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
-                run_all_btn.click(run_all,inputs=[cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
-                delete_case_btn.click(delete_selected,inputs=[case_choice],outputs=[case_status,case_choice,actions_df,deletion_manifest])
+                run_batch_btn.click(run_selected_cases,inputs=[batch_case_choices,cases_device],outputs=execution_outputs,concurrency_id="deployment",concurrency_limit=1)
+                select_all_cases_btn.click(select_all_stored_cases,outputs=[batch_case_choices],queue=False)
+                clear_case_selection_btn.click(lambda: gr.update(value=[]),outputs=[batch_case_choices],queue=False)
+                delete_case_btn.click(delete_selected,inputs=[case_choice],outputs=[case_status,case_choice,batch_case_choices,actions_df,deletion_manifest])
                 def retry_deletion(manifest):
                     from deployment import vector_db
                     from deployment_cases import retry_case_cleanup

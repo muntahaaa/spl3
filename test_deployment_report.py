@@ -21,6 +21,20 @@ class DeploymentReportTests(unittest.TestCase):
         self.assertIn("Failed: **1**",report)
         self.assertTrue(any("Case 2/3: Open Clock" in event[6] for event in events))
 
+    def test_two_passed_cases_finish_with_an_atomic_table_snapshot(self):
+        cases = self.cases()[:2]
+        def runner(*args, **kwargs):
+            yield "[FINISH] completed", json.dumps({"completed": True}), {"visible": False}, [], "", ""
+
+        events = list(stream_case_execution(cases, "device", runner, lambda **kw: kw))
+        final = events[-1]
+
+        self.assertEqual(final[6], "Execution finished")
+        self.assertEqual([row[2] for row in final[7]], ["✅ Passed", "✅ Passed"])
+        self.assertIn("Passed: **2**", final[8])
+        self.assertIn("Remaining: **0**", final[8])
+        self.assertIsNot(final[7], events[-2][7])
+
     def test_exception_marks_failed_and_continues(self):
         calls=[]
         def runner(task,device,action_id):

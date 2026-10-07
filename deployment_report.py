@@ -84,5 +84,19 @@ def stream_case_execution(cases, device, runner, update, clock=time.monotonic):
         rows[index][3] = round(clock()-started,1)
         rows[index][4] = message
         accumulated += heading + "\n" + logs + f"\n{rows[index][2]}: {message}\n\n"
-        yield accumulated, outcome, update(visible=False), [], "", "", heading + " ? " + rows[index][2], [list(row) for row in rows], report_summary(rows)
-    yield accumulated, outcome, update(visible=False), [], "", "", "Execution finished", rows, report_summary(rows,True)
+        finished = index == len(cases) - 1
+        current = "Execution finished" if finished else heading + " - " + rows[index][2]
+        # Send the last status and its summary together.  A fresh table snapshot
+        # prevents Gradio from retaining an older Pending row while rendering a
+        # report calculated from the subsequently mutated list.
+        yield (
+            accumulated,
+            outcome,
+            update(visible=False),
+            [],
+            "",
+            "",
+            current,
+            [list(row) for row in rows],
+            report_summary(rows, finished),
+        )
