@@ -1,6 +1,5 @@
 Gradio path: http://127.0.0.1:7860/
 Swagger path: http://localhost:7860/docs#/
-Vector DB: https://app.pinecone.io/organizations/-OLKFDfXJSGsshq9f8W5/projects/23cdbbff-0a89-401b-ad30-f812f9bec6d8/indexes/vectordb/browser
 
 
 How to Verify Everything is Working
@@ -27,8 +26,15 @@ Verify in Neo4j: MATCH (a:Action {is_high_level: true}) RETURN a to confirm the 
 Run the full suite from the project root:
 python -B -m unittest discover -s test_case -t . -p "test_*.py"
 Run one file:
-python -B -m unittest test_case.test_replay_engine
+& "C:\Users\HP\anaconda3\envs\spl3\python.exe" -B -m unittest test_case.test_chain_consistency -v
 Run one class:
 python -B -m unittest test_case.test_replay_engine.ReplayTests
 Run one test:
 python -B -m unittest test_case.test_replay_engine.ReplayTests.test_case1_exact_replay
+
+
+Cloudflare starting url:
+powershell 
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel `
+    --protocol http2 `
+    --url "http://127.0.0.1:7860"

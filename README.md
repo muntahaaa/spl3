@@ -1,451 +1,315 @@
-# Android App Task Explorer
+# VisionQA Agent
 
-An end-to-end pipeline for recording, parsing, storing, and reasoning over
-human UI-exploration sessions on Android devices.
+VisionQA Agent records Android UI workflows and reuses them as executable test cases. It controls a connected Android device through ADB, obtains UI information from Android's accessibility hierarchy or OmniParser, stores learned workflows in Neo4j, and uses an NVIDIA vision-language model when deterministic replay cannot safely continue.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  STEP 1  –  Exploration (Gradio UI + ADB + OmniParser)       │
-│  • Initialise device & task                                   │
-│  • Perform actions → screenshot saved automatically           │
-│  • OmniParser runs automatically per screenshot               │
-│  • Labeled image + elements JSON saved locally                │
-├──────────────────────────────────────────────────────────────┤
-│  STEP 2  –  Save State  (Gradio "Stop & save" button)         │
-│  • Serialises State → ./log/json_state/state_<ts>.json        │
-├──────────────────────────────────────────────────────────────┤
-│  STEP 3  –  Push to Databases  (Gradio "Store to DB" tab)     │
-│  • Reads JSON → Neo4j graph storage                           │
-├──────────────────────────────────────────────────────────────┤
-│  STEP 4  –  Chain Processing  (Gradio tab)                    │
-│  • chain_understand: triplet reasoning + description updates  │
-│  • chain_evolve: optional high-level action synthesis         │
-├──────────────────────────────────────────────────────────────┤
-│  STEP 5  –  Action Execution (Deployment engine)              │
-│  • structured execution + reactive fallback                   │
-└──────────────────────────────────────────────────────────────┘
-```
+The project does not require the source code of the Android application being tested.
 
----
+## What the system provides
 
-## Project structure
+- Manual recording of taps, text input, swipes, long presses, and Back actions.
+- Screenshot parsing through a Firebase-connected OmniParser worker.
+- Graph storage of pages, elements, transitions, and high-level actions in Neo4j.
+- Chain understanding and evolution for creating reusable task descriptions.
+- Deterministic replay of exact and semantically related stored tasks.
+- UI-layout-tolerant element matching based on labels, roles, and page structure.
+- Bounded visual/ReAct recovery when stored knowledge is insufficient.
+- Individual and multi-case execution with logs, status, timing, and a combined report.
+- User assistance when an element cannot be recovered safely.
 
-```
-spl3/
-├── main.py                ← entry point (FastAPI + Gradio)
-├── config.py              ← DB credentials, paths
-├── firebase_llm_bridge.py ← Firebase RTDB async LLM bridge
-├── chain_understand.py    ← triplet reasoning + graph enrichment
-├── chain_evolve.py        ← high-level action synthesis
-├── deployment.py          ← execution workflow runner
-├── state_manager.py       ← thread-safe shared session state
-├── ui.py                  ← Gradio layout
-├── api/
-│   ├── api_routes.py      ← REST endpoints
-│   └── chain_routes.py    ← chain job endpoints
-├── chain/
-│   ├── chain_models.py    ← job response models
-│   ├── chain_service.py   ← async chain workers
-│   └── task_store.py      ← in-memory job store
-├── OmniParser/
-│   └── client.py          ← Firebase queue client (auto-parse)
-│   └── omniparser-queue.ipynb ← OmniParser worker notebook
-├── explor_human.py        ← ADB action + screenshot logic
-├── explore_auto.py        ← automated exploration
-├── data/
-│   ├── State.py           ← TypedDict definition
-│   ├── data_storage.py    ← state2json + json2db
-│   ├── graph_db.py        ← Neo4j adapter
-├── tool/
-│   ├── adb_tools.py       ← ADB wrappers
-│   └── img_tool.py        ← element crop + feature-extraction client
-├── log/
-│   ├── screenshots/       ← raw screenshots
-│   └── json_state/        ← serialised session JSON files
-├── labeled_image/
-│   ├── img/               ← OmniParser labeled PNGs
-│   └── json_labeled_data/ ← OmniParser elements JSON
-├── qwen_firebase_worker.ipynb ← Qwen2.5-VL Firebase worker (Colab)
-├── verify_pipeline.py     ← end-to-end pipeline validation
-├── context_chain.md       ← chain_understand/chain_evolve design notes
-└── requirements.txt
+## Architecture
+
+```mermaid
+flowchart LR
+    U[User / Gradio UI] --> O[Recording and deployment orchestration]
+    O --> A[ADB and Android UI hierarchy]
+    A --> D[Connected Android device]
+    O --> F[Firebase queue]
+    F <--> P[Kaggle OmniParser worker]
+    O <--> N[Neo4j]
+    O <--> V[NVIDIA vision-language model]
 ```
 
----
+During deployment, task matching is performed before device capture. When a suitable stored task is found, the system replays its stored actions and uses live UI data to relocate the intended controls. Model reasoning is used for unresolved targets, non-stored portions of a task, and uncertain completion evidence.
 
-## Prerequisites
+## Main components
 
-| Requirement | Notes |
+| Component | Responsibility |
 |---|---|
-| Python 3.10 + | Tested on 3.11 |
-| ADB (Android Debug Bridge) | `sudo apt install adb` / install Android SDK |
-| Android device or emulator | USB debugging enabled |
-| Neo4j (local or remote) | Free Community Edition works |
-| Feature-extraction service | Your own CPU-based ResNet50 REST service on port 8001 |
+| `main.py` | Starts FastAPI, Gradio, and the REST API on port 7860 |
+| `ui.py` | Defines the six-tab user interface |
+| `explor_human.py` | Records ADB actions and captures exploration screens |
+| `OmniParser/client.py` | Submits screenshots to the Firebase OmniParser queue |
+| `data/data_storage.py` | Saves exploration state and imports it into Neo4j |
+| `data/graph_db.py` | Reads and writes graph data |
+| `chain_understand.py` | Adds semantic reasoning to recorded transitions |
+| `chain_evolve.py` | Produces richer page descriptions and high-level actions |
+| `deployment.py` | Coordinates task matching, replay, fallback, and verification |
+| `replay_engine.py` | Aligns screens and elements and executes stored plans |
+| `deployment_hierarchy.py` | Reads Android UI hierarchy with OmniParser fallback |
+| `deployment_report.py` | Streams individual and multi-case results to the UI |
+| `nvidia_llm_bridge.py` | Calls the configured NVIDIA NIM model |
+| `test_case/` | Automated unit and integration-style test modules |
 
----
+## Requirements
+
+- Windows, Linux, or macOS host; the current setup and commands below target Windows.
+- Python 3.10 or newer; Python 3.11 is recommended.
+- Android Platform Tools (`adb`).
+- Android device or emulator with USB debugging enabled.
+- Neo4j database.
+- NVIDIA API key for model-assisted reasoning.
+- Firebase Realtime Database and its service-account file for OmniParser requests.
+- A running OmniParser worker, currently provided by `OmniParser/omniparser-queue.ipynb` in a Kaggle GPU environment.
+
+The optional CPU feature service in `feature_service.py` is not required by the active deployment workflow.
 
 ## Installation
 
-```bash
-# 1. Clone / copy the project
-cd human_explorer
+### 1. Create a Python environment
 
-# 2. Create a virtual environment (CPU-only)
+From the project directory in PowerShell:
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies (CPU only – no CUDA needed)
-pip install -r requirements.txt
-
-# 4. Configure credentials
-#    Open config.py and fill in:
-#      Neo4j_URI, Neo4j_AUTH
-#      Feature_URI   (your ResNet50 service base URL)
-#      CHAIN_FIREBASE_URL
-#      FIREBASE_SECRET  (or service-account-based access token flow)
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
----
+If PowerShell blocks activation, use the environment's interpreter directly:
 
-## Chain reasoning and evolution context
+```powershell
+& ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
+```
 
-### Overview
+### 2. Install and verify ADB
 
-ChainEvolve is a graph-driven multimodal UI reasoning system that observes UI interaction flows, understands their semantic meaning with an LLM, and converts repeated low-level UI operations into reusable high-level task abstractions.
+Install Android SDK Platform Tools, enable **Developer options** and **USB debugging** on the phone, and connect it with a data-capable USB cable.
 
-It combines:
+```powershell
+adb devices
+```
 
-- Neo4j for structured UI memory
-- Firebase as an asynchronous inference bridge
-- Multimodal LLM reasoning using screenshots + textual UI metadata
-- Graph-based workflow abstraction and procedural memory generation
+The device must appear with the status `device`. If it shows `unauthorized`, unlock the phone and approve the debugging request.
 
-### Core idea
+### 3. Start Neo4j
 
-Instead of storing raw clicks and page transitions only, the system learns:
-
-- what each interaction means
-- what the user is trying to accomplish
-- how UI states change
-- how multiple low-level steps form reusable workflows
-
-Example high-level actions:
+Create or start a Neo4j database and retain its URI, database name, username, and password. A local URI commonly looks like:
 
 ```text
-Create Alarm
-Login to Application
-Send Email
-Search Contact
+neo4j://127.0.0.1:7687
 ```
 
-### System architecture
+### 4. Configure environment variables
+
+Create a `.env` file in the project root. Use your own values:
+
+```dotenv
+NEO4J_URI=neo4j://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=replace_with_your_password
+NEO4J_DB=graphdb
+
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+NVIDIA_API_KEY=replace_with_your_nvidia_key
+NVIDIA_MODEL=meta/llama-3.2-11b-vision-instruct
+CHAIN_UNDERSTAND_MODEL=meta/llama-3.2-11b-vision-instruct
+CHAIN_EVOLVE_MODEL=meta/llama-3.2-11b-vision-instruct
+
+NVIDIA_REQUEST_TIMEOUT_SEC=200
+NVIDIA_REASONING_EFFORT=medium
+SCREENSHOT_SETTLE_SEC=2.0
+```
+
+Optional directories can be overridden with:
+
+```dotenv
+SCREENSHOT_DIR=./log/screenshots
+JSON_STATE_DIR=./log/json_state
+```
+
+Never commit `.env`, API keys, database passwords, or Firebase service-account files. Rotate any credential that has previously been committed or shared.
+
+### 5. Configure OmniParser
+
+The current OmniParser client expects its Firebase Admin service-account file at:
 
 ```text
-UI Interaction Recording
-  ↓
-Graph Storage (Neo4j)
-  ↓
-Multimodal LLM Reasoning
-  ↓
-Semantic Graph Enrichment
-  ↓
-Workflow Abstraction
-  ↓
-Reusable High-Level Actions
+OmniParser/omniparser-queue-firebase-adminsdk-fbsvc-f46bd6f7ca.json
 ```
 
-### Graph structure
+Use credentials belonging to your Firebase project. The local client uploads screenshots to Firebase, and the Kaggle worker reads each request and returns the labeled image and parsed element JSON.
 
-```text
-(Page)-[:HAS_ELEMENT]->(Element)-[:LEADS_TO]->(Page)
-```
+To start the worker:
 
-### Chain retrieval
+1. Upload `OmniParser/omniparser-queue.ipynb` to Kaggle.
+2. Enable a GPU runtime.
+3. Provide the same Firebase project credentials to the notebook.
+4. Run all required cells.
+5. Wait until the worker reports that it is waiting for tasks.
+6. Keep the Kaggle session running while recording or executing tasks.
 
-The system retrieves a navigation chain starting from a page:
+## Run the application
 
-```python
-chain = db.get_chain_from_start(start_page_id)
-```
+Start Neo4j and the Kaggle OmniParser worker first. Then run:
 
-A chain consists of triplets:
-
-```python
-{
-  source_page,
-  element,
-  target_page,
-  action
-}
-```
-
-### Multimodal UI understanding (chain_understand.py)
-
-Inputs:
-
-- Source page description
-- Target page description
-- UI element metadata
-- Screenshots of pages
-
-Processing:
-
-- screenshots are loaded, resized, converted to base64, and sent to the LLM
-- the LLM receives both visual context and structured textual context
-
-The LLM generates:
-
-- context
-- user intent
-- state change
-- task relation
-- enhanced descriptions
-
-### Firebase-based inference bridge flow
-
-```text
-Main Application
-      ↓
-Firebase Task Queue
-      ↓
-Colab/Qwen-VL Runtime (T4 GPU supported)
-      ↓
-Inference Result
-      ↓
-Neo4j Graph Update
-```
-
-### Graph enrichment
-
-After reasoning, the system updates Neo4j nodes with richer semantic descriptions and merges overlapping page descriptions for coherence.
-
-### Workflow abstraction (chain_evolve.py)
-
-The system evaluates whether a chain is reusable and, if so, produces a high-level action node with preconditions, element sequence, and template pattern for reuse.
-
----
-
-## Running the project
-
-```bash
+```powershell
 python main.py
 ```
 
-This starts **one** Uvicorn server on port **7860** that serves both:
+Open:
 
-| URL | Purpose |
-|---|---|
-| `http://localhost:7860/` | Gradio UI |
-| `http://localhost:7860/api/` | REST API |
-| `http://localhost:7860/docs` | Swagger / interactive API docs |
+- Gradio interface: <http://127.0.0.1:7860/>
+- REST API: <http://127.0.0.1:7860/api/>
+- API documentation: <http://127.0.0.1:7860/docs>
 
----
+## User workflow
 
-## Step-by-step usage
+### 1. Initialization
 
-### STEP 1 – Exploration (OmniParser auto-parse)
+1. Open **Initialization**.
+2. Refresh and select the ADB device.
+3. Enter the application name and task description.
+4. Select **Initialize**.
 
-**In the Gradio UI:**
+### 2. Exploration
 
-1. Open `http://localhost:7860`
-2. Go to **① Initialization** tab
-   - Click **Refresh devices** → select your device
-   - Enter a task description → click **Initialize**
-3. Go to **② Exploration** tab
-  - Click **▶ Start session** — the first screenshot is taken 
-  - Start **omniparser-queue.ipynb** into a T4 GPU supported environment
-  - First screenshot is sent to OmniParser
-  - The labeled image + elements JSON are saved automatically
-4. Choose an action and click **⚡ Perform action**
-  - A new screenshot is captured and automatically parsed again
-5. Repeat until the task is complete
+1. Open **Exploration** and select **Start session**.
+2. Wait for the initial screenshot and OmniParser labels.
+3. Choose an action: tap, text, long press, short swipe, long swipe, or Back.
+4. Supply the displayed element ID, text, or direction when required.
+5. Select **Perform action** and verify the new labeled screen.
+6. Repeat until the workflow is complete.
+7. Select **Stop & save to JSON** and retain the generated state-file path.
 
----
-
-### OmniParser outputs
-
-Each screenshot is parsed automatically. Outputs are stored in:
-
-- Labeled images: `./labeled_image/img/<task_id>.png`
-- Elements JSON: `./labeled_image/json_labeled_data/<task_id>.json`
-
----
-
-### Parsed elements JSON format
-
-Your parsing tool must produce a JSON file that is an **array** of element
-objects.  Each object must have these fields:
-
-```json
-[
-  {
-    "ID":      1,
-    "bbox":    [0.05, 0.10, 0.90, 0.18],
-    "type":    "text",
-    "content": "Welcome Screen"
-  },
-  {
-    "ID":      2,
-    "bbox":    [0.15, 0.45, 0.85, 0.55],
-    "type":    "button",
-    "content": "Sign In"
-  },
-  {
-    "ID":      3,
-    "bbox":    [0.10, 0.60, 0.90, 0.70],
-    "type":    "input",
-    "content": "Username field"
-  }
-]
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `ID` | integer | Unique element identifier within this screen |
-| `bbox` | `[x1, y1, x2, y2]` | Relative coordinates (0.0 – 1.0). Top-left = (x1, y1), bottom-right = (x2, y2) |
-| `type` | string | Element type: `button`, `text`, `input`, `image`, `icon`, `checkbox`, `list_item`, … |
-| `content` | string | Visible text or description of the element |
-
-> **bbox note:**  values are *relative* to the screen dimensions.  
-> Example: a button occupying the middle 80 % of the screen at 45 % height  
-> → `[0.10, 0.44, 0.90, 0.50]`
-
----
-
-### Checking session status
-
-```bash
-curl http://localhost:7860/api/session/status
-```
-
-Response:
-
-```json
-{
-  "has_session":         true,
-  "step":                3,
-  "device":              "emulator-5554",
-  "task":                "Navigate to Settings",
-  "parsed_result_ready": false,
-  "pending_screenshot":  "./log/screenshots/human_exploration/human_exploration_step_4_20240101_120000.png",
-  "history_count":       3
-}
-```
-
-`parsed_result_ready: false` means a parsed result is missing for the last
-captured screenshot.
-
----
-
-### STEP 2 – Save session to JSON
-
-In the Gradio **② Exploration** tab, click **🛑 Stop & save to JSON**.
-
-The file is written to `./log/json_state/state_<timestamp>.json`.
-
----
-
-### STEP 3 – Push to databases
-
-In the Gradio **③ Store to Neo4j** tab:
-
-1. Paste the path to your saved JSON state file
-2. Click **🚀 Store to databases**
-
-This reads the JSON and creates:
-- **Neo4j nodes:**  `Page`  and  `Element`
-- **Neo4j relationships:**  `(Page)-[:HAS_ELEMENT]->(Element)`  and  `(Element)-[:LEADS_TO]->(Page)`
-
-### STEP 4 – Chain processing (background jobs)
-
-In the **④ Chain Processing** tab:
-
-1. Provide the start page ID from Neo4j
-2. Click **🧠 Start chain_understand** or **🚀 Start chain_evolve**
-3. Copy the **Job ID** and click **🔄 Poll status** to track progress
-
-Jobs are tracked in an in-memory store and return status + results when done.
-
----
-
-### STEP 5 – Action execution strategy (deployment engine)
-
-The deployment engine executes high-level tasks on Android devices using a hybrid strategy:
+Generated exploration data is written under:
 
 ```text
-User Task
-  ↓
-Task Matching
-  ↓
-Screen Capture + UI Parsing
-  ↓
-Element Matching
-  ↓
-Shortcut Discovery
-  ↓
-Execution Template Generation
-  ↓
-Action Execution
-  ↓
-Task Completion Verification
+log/json_state/
+log/screenshots/
+labeled_image/img/
+labeled_image/json_labeled_data/
 ```
 
-If any structured step fails, it falls back to a reactive LLM-driven UI agent:
+### 3. Store to Neo4j
 
-```text
-Fallback → Reactive LLM-driven UI agent
-```
+1. Open **Store to Neo4j**.
+2. Paste the saved JSON state path.
+3. Select **Store to databases**.
+4. Confirm the success message.
 
-Key execution modes:
+The import creates graph entities for pages, elements, actions, and their relationships.
 
-- **Structured execution**: matches tasks to known high-level actions, uses shortcuts/templates, and executes deterministic steps (faster, reliable, lower LLM cost).
-- **Reactive fallback**: captures the screen, sends screenshot + UI JSON to the LLM, and executes the next atomic action until completion.
+### 4. Chain processing
 
-Core execution components:
+1. Open **Chain Processing**.
+2. Enter the chain's start page ID.
+3. Run `chain_understand` to analyze the recorded transitions.
+4. Run `chain_evolve` to enrich descriptions and produce reusable task knowledge.
+5. Use **Poll status** until the background job reports `Done` or `Error`.
 
-- `FirebaseLLMBridge`: async LLM calls via Firebase RTDB
-- `Neo4jDatabase`: actions, shortcuts, page flows, UI metadata
-- `OmniParser`: screen parsing and element extraction
-- `ADB Tools`: tap/swipe/text/back device actions
-- `LangGraph Workflow`: orchestration state machine
+Job state is held in memory. Restarting the application clears outstanding job records.
 
----
+### 5. High-Level Execution
 
-## Notebook execution (GPU)
+1. Open **High-Level Execution**.
+2. Enter a natural-language task.
+3. Select the connected device.
+4. Select **Run high-level task**.
+5. Follow matching, replay, recovery, and verification in the process log.
+6. If the assistance dialog appears, answer its specific question or skip the task and record a new case.
+7. Review the final outcome.
 
-Run these notebooks with a **T4 GPU** enabled runtime:
+The execution policy is:
 
-- `qwen_firebase_worker.ipynb`
-- `OmniParser/omniparser-queue.ipynb`
+1. Match the requested task against stored actions.
+2. Start the phone from Home and open the required application.
+3. Align the live UI with stored screens and replay usable stored steps.
+4. Recover moved or changed controls using hierarchy data, parsed labels, and bounded visual reasoning.
+5. Use ReAct only for portions not safely covered by stored knowledge.
+6. Verify the whole requested task before reporting success.
+7. Return to Home and delete run-scoped screenshots and XML files after successful completion.
 
----
+### 6. Stored Test Cases
 
-## Component stack
+The **Stored test cases** tab supports:
 
-| Component | Tool/Technology |
+- Searching and refreshing stored cases.
+- Running one selected case.
+- Deleting a selected case and its related task data.
+- Selecting multiple cases and running them sequentially.
+- Viewing the currently executing case, detailed logs, per-case status, duration, outcome, and combined report.
+
+Use one deployment at a time because all executions control the same selected Android device.
+
+## Execution outcomes
+
+| Outcome | Meaning |
 |---|---|
-| Frontend | Gradio (Python) |
-| Backend | FastAPI (Python) |
-| ML Framework | Hugging Face Transformers, PyTorch |
-| Multimodal Model | Qwen2.5-VL (vision + text) |
-| UI Parser | OmniParser (YOLO + captioning) |
-| Graph Database | Neo4j |
-| Task Queue | Firebase Realtime Database |
-| Device Control | Android ADB |
-| Workflow Orchestration | LangGraph |
-| Image Processing | Pillow (PIL) |
-| Version Control | Git, GitHub |
-| Environment | VS Code, Jupyter/Colab (T4 GPU) |
+| Passed / completed | The requested final state was confirmed |
+| Failed / error | Execution encountered an unrecoverable problem |
+| Skipped | The user chose to stop and add a new test case |
+| Uncertain | The task may have finished, but available evidence was insufficient |
+| Waiting for user | Execution is paused for a specific answer |
 
----
+## Run tests
+
+Run the complete test suite from the repository root:
+
+```powershell
+python -m unittest discover -s test_case -p "test_*.py" -v
+```
+
+Run one module, for example:
+
+```powershell
+python -m unittest test_case.test_chain_consistency -v
+```
+
+The latest recorded testing summary and known limitations are documented in [`test_case/TESTING_REPORT.md`](test_case/TESTING_REPORT.md). Tests primarily use mocks and fixtures; live Android, Firebase, Neo4j, and model behavior should also be verified in the target environment.
+
+## Temporary public demonstration
+
+The application can be exposed from the Windows host using a Cloudflare Quick Tunnel. The Android phone remains physically connected to and controlled by the host computer.
+
+Start the application, then open a second PowerShell window:
+
+```powershell
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel `
+    --protocol http2 `
+    --url "http://127.0.0.1:7860"
+```
+
+Share the generated `trycloudflare.com` URL only with trusted users and stop the tunnel with `Ctrl+C` after the demonstration. Quick Tunnels are intended for temporary testing, and an unprotected URL can be opened by anyone who receives it.
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Problem | Resolution |
 |---|---|
-| `No devices found` | Check USB cable, enable USB debugging, run `adb devices` in terminal |
-| `RuntimeError: No active session` | Call **Initialize** in the UI before starting exploration |
-| `JSON file not found` | Ensure the OmniParser output JSON exists under `./labeled_image/json_labeled_data/` |
-| Neo4j connection error | Ensure Neo4j is running and `Neo4j_URI` / `Neo4j_AUTH` in `config.py` are correct |
-| Feature service unreachable | Start your ResNet50 service and update `Feature_URI` in `config.py` |
+| No device appears | Run `adb devices`, reconnect the cable, enable USB debugging, and approve the phone prompt |
+| Device is `unauthorized` | Unlock the phone and accept the RSA authorization dialog |
+| UI hierarchy capture fails | The system logs the accessibility failure and falls back to OmniParser |
+| OmniParser waits or times out | Confirm the Kaggle worker and Firebase project are active and use matching credentials |
+| Neo4j connection error | Start Neo4j and verify `NEO4J_URI`, credentials, and `NEO4J_DB` |
+| NVIDIA request times out | Verify the API key, Internet connection, model name, and timeout setting |
+| Stored cases are empty | Store an exploration chain and complete chain processing first |
+| Deployment waits for user | Answer the specific assistance question or skip and record a new case |
+| Public URL is slow | Confirm localhost is fast and use Cloudflare with `--protocol http2` |
+| Port 7860 is occupied | Stop the conflicting process before starting `main.py` |
+
+## Security and operational notes
+
+- Do not expose ADB, Neo4j, Firebase credentials, or internal service ports publicly.
+- Do not commit `.env` or Firebase Admin JSON files.
+- A successful ADB command proves only that the command was sent; final task success requires UI evidence.
+- Keep the phone unlocked and avoid manual interaction during automated execution.
+- Keep Neo4j, Kaggle OmniParser, the application, and the device connection active for the duration of a run.
+- Quick Tunnel URLs are temporary and change when the tunnel restarts.
+
+## Additional documentation
+
+- [`test_case/TESTING_REPORT.md`](test_case/TESTING_REPORT.md) — test strategy, results, and known failures.
+- [`DEPLOYMENT_VERIFICATION.md`](DEPLOYMENT_VERIFICATION.md) — deployment implementation and verification details.
+- [`DEPLOYMENT_STRATEGY_VERIFICATION.md`](DEPLOYMENT_STRATEGY_VERIFICATION.md) — replay and recovery strategy checks.
+- [`CHAIN_UNDERSTAND_VERIFICATION.md`](CHAIN_UNDERSTAND_VERIFICATION.md) — chain-understanding compatibility and model configuration.
+- [`data/CYPHER_QUERIES.md`](data/CYPHER_QUERIES.md) — useful Neo4j queries.
