@@ -1,5 +1,5 @@
 import unittest
-from test_replay_engine import World,page,step,recording
+from test_case.test_replay_engine import World,page,step,recording
 
 class VisualRecoveryTests(unittest.TestCase):
     def test_changed_label_located_visually_without_home(self):

@@ -1,6 +1,6 @@
 import unittest
 from replay_engine import page_layout_score,screen_score
-from test_replay_engine import page,World
+from test_case.test_replay_engine import page,World
 
 class PageLayoutTests(unittest.TestCase):
     def test_changed_time_and_am_pm_keep_same_layout(self):

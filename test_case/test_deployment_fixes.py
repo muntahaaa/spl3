@@ -1,7 +1,7 @@
 import copy
 import unittest
 from replay_engine import bounded_task_prefix, hydrate_actions, replay_source_match
-from test_replay_engine import World, page, step, recording
+from test_case.test_replay_engine import World, page, step, recording
 
 class DeploymentFixTests(unittest.TestCase):
     def timer_recording(self):

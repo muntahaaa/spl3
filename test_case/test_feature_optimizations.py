@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from PIL import Image
 import feature_service as service
-from test_replay_integration import load_functions
+from test_case.test_replay_integration import load_functions
 
 class FeatureOptimizationTests(unittest.TestCase):
     def test_memory_upload_does_not_close_caller_stream(self):

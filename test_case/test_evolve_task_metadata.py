@@ -1,7 +1,7 @@
 import json
 import unittest
 from typing import List,Dict,Any
-from test_replay_integration import load_functions
+from test_case.test_replay_integration import load_functions
 
 class TaskMetadataTests(unittest.TestCase):
     def extract(self,chain):

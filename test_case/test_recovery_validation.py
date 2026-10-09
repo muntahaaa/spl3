@@ -1,6 +1,6 @@
 import unittest
 from replay_engine import recovered_target_valid, target_index
-from test_replay_engine import World,page,step,recording
+from test_case.test_replay_engine import World,page,step,recording
 
 class RecoveryValidationTests(unittest.TestCase):
     def candidate(self,label,typ="text"):

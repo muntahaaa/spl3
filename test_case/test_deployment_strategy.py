@@ -7,7 +7,7 @@ import unittest
 from deployment_control import Assistance, answer_request
 from deployment_hierarchy import parse_hierarchy
 from deployment_artifacts import DeploymentImages
-from test_replay_engine import World, page
+from test_case.test_replay_engine import World, page
 
 class DeploymentStrategyTests(unittest.TestCase):
     def test_hierarchy_bounds_ids_and_blank_search_field(self):
@@ -56,7 +56,7 @@ class DeploymentStrategyTests(unittest.TestCase):
         self.assertEqual(world.calls,[])
 
     def test_react_rejoins_remaining_stored_steps_without_action_planner(self):
-        from test_replay_engine import step,recording
+        from test_case.test_replay_engine import step,recording
         source, final=page('Albums'),page('Albums','Camera')
         action=recording('Switch to Albums',[step(source,final,'Albums')])
         world=World([source,final])

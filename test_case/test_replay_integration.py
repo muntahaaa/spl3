@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from test_replay_engine import World, page
-import test_replay_engine as fixtures
+from test_case.test_replay_engine import World, page
+from test_case import test_replay_engine as fixtures
 
 
 def load_functions(path, names, namespace):
@@ -110,7 +110,7 @@ class IntegrationTests(unittest.TestCase):
         paths = [root/name for name in ["20261004_235028_015.json", "20261004_235104_056.json", "20261004_235135_529.json"]]
         if not all(p.exists() for p in paths):
             self.skipTest("Recorded Gallery JSON fixtures are not present")
-        from test_replay_engine import recording
+        from test_case.test_replay_engine import recording
         screens = [{"screenshot": "recorded.png", "elements": json.loads(p.read_text())} for p in paths]
         steps = []
         for i, target_id in enumerate((25, 21)):

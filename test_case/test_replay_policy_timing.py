@@ -12,8 +12,8 @@ from unittest.mock import Mock, patch
 import replay_engine
 from replay_engine import ReplayEngine, screen_score
 from deployment_progress import run_with_progress
-from test_replay_engine import World, page, step, recording
-from test_replay_integration import load_functions
+from test_case.test_replay_engine import World, page, step, recording
+from test_case.test_replay_integration import load_functions
 
 
 class ReplayPolicyTests(unittest.TestCase):

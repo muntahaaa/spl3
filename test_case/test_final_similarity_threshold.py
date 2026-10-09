@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import patch
-from test_replay_engine import World,page,step,recording
+from test_case.test_replay_engine import World,page,step,recording
 
 class FinalSimilarityTests(unittest.TestCase):
     def replay_result(self,score):

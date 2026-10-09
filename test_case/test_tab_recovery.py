@@ -1,5 +1,5 @@
 import unittest
-from test_replay_engine import World,page
+from test_case.test_replay_engine import World,page
 
 class TabRecoveryTests(unittest.TestCase):
     def test_back_finds_tab_without_home_or_swipe(self):

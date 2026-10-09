@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
-from test_replay_integration import load_functions
+from test_case.test_replay_integration import load_functions
 
 
 class ChainConsistencyTests(unittest.TestCase):
@@ -120,7 +120,7 @@ class ChainConsistencyTests(unittest.TestCase):
 class ModelJsonFormattingTests(unittest.TestCase):
     def test_preamble_and_fences_accept_one_complete_object(self):
         import json
-        from test_replay_integration import load_functions
+        from test_case.test_replay_integration import load_functions
         namespace = {"json": json}
         load_functions("nvidia_llm_bridge.py", {"_parse_json_response"}, namespace)
         parse = namespace["_parse_json_response"]
@@ -133,7 +133,7 @@ class ModelJsonFormattingTests(unittest.TestCase):
     def test_llama_collage_preserves_both_screen_panels(self):
         import base64, io
         from PIL import Image, ImageDraw
-        from test_replay_integration import load_functions
+        from test_case.test_replay_integration import load_functions
         namespace = {"base64": base64, "io": io, "Image": Image, "ImageDraw": ImageDraw}
         load_functions("chain_understand.py", {"_combine_triplet_images"}, namespace)
         images = []

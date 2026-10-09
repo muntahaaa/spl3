@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
-from test_replay_integration import load_functions
+from test_case.test_replay_integration import load_functions
 
 
 class ChainFastPathTests(unittest.TestCase):

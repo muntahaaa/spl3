@@ -22,3 +22,13 @@ Directly run chain_evolve.py as a script — its run_test() function prints step
 confidence score and suggested name
 ✓ Chain evolution succeeded! High-level action node ID: <id>
 Verify in Neo4j: MATCH (a:Action {is_high_level: true}) RETURN a to confirm the action node exists with its full description and MATCH (a:Action)-[:COMPOSED_OF]->(e:Element) RETURN a.name, e.element_id to verify element relationships
+
+
+Run the full suite from the project root:
+python -B -m unittest discover -s test_case -t . -p "test_*.py"
+Run one file:
+python -B -m unittest test_case.test_replay_engine
+Run one class:
+python -B -m unittest test_case.test_replay_engine.ReplayTests
+Run one test:
+python -B -m unittest test_case.test_replay_engine.ReplayTests.test_case1_exact_replay

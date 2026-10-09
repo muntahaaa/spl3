@@ -1,6 +1,6 @@
 import copy
 import unittest
-from test_replay_engine import World,page,step,recording
+from test_case.test_replay_engine import World,page,step,recording
 
 class TextBindingTests(unittest.TestCase):
     def action(self):

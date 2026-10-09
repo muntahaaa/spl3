@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from replay_engine import ReplayEngine
-from test_replay_engine import World
-import test_replay_engine as fixtures
-from test_replay_integration import load_functions
+from test_case.test_replay_engine import World
+from test_case import test_replay_engine as fixtures
+from test_case.test_replay_integration import load_functions
 
 
 class ProgressLoggingTests(unittest.TestCase):
